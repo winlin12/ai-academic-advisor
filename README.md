@@ -2,16 +2,6 @@
 
 A local-first AI academic planning assistant that helps students reason about degree requirements, prerequisites, semester plans, workload balance, and graduation paths.
 
-This repo is designed for your setup:
-
-```text
-MacBook Air / VS Code / JetBrains / Continue.dev
-        ↓ Tailscale
-Windows PC + RTX GPU running Ollama
-        ↓
-FastAPI planner backend
-```
-
 ## Project Goal
 
 Build a mobile/web-friendly AI academic advisor that can answer questions like:

@@ -17,7 +17,7 @@ def health():
 async def ollama_health():
     client = OllamaClient()
     ok, detail = await client.health()
-    return {"ok": ok, "detail": detail}
+    return {"ok": ok, "detail": detail, "ollama_url": client.base_url}
 
 
 @router.get("/catalog/courses")
