@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.pytest_cache/
+.ruff_cache/
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+
+# Data
+*.sqlite
+*.db
+
+# Build artifacts
+dist/
+build/

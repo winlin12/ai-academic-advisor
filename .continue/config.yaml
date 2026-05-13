@@ -1,0 +1,20 @@
+name: AI Academic Advisor Local
+version: 0.0.1
+schema: v1
+
+models:
+  - name: PC Ollama Chat
+    provider: ollama
+    model: qwen2.5-coder:7b
+    apiBase: http://100.x.y.z:11434
+    roles:
+      - chat
+      - edit
+      - apply
+
+  - name: PC Ollama Autocomplete
+    provider: ollama
+    model: qwen2.5-coder:7b
+    apiBase: http://100.x.y.z:11434
+    roles:
+      - autocomplete

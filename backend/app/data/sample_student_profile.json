@@ -1,0 +1,14 @@
+{
+  "name": "Demo Student",
+  "degree_program": "MS Computer Science",
+  "completed_courses": ["CS251"],
+  "remaining_courses": ["CS381", "CS502", "CS536", "CS541", "CS551", "CS577", "CS587"],
+  "start_term": "fall",
+  "start_year": 2026,
+  "semesters_to_plan": 5,
+  "max_credits_per_semester": 6,
+  "preferences": {
+    "avoid_too_many_project_heavy_courses": true,
+    "target_graduation": "Spring 2028"
+  }
+}

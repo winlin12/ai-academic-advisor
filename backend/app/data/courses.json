@@ -1,0 +1,82 @@
+[
+  {
+    "code": "CS251",
+    "title": "Data Structures and Algorithms",
+    "credits": 3,
+    "prereqs": [],
+    "offered_terms": ["fall", "spring"],
+    "requirement_tags": ["required", "foundations"],
+    "workload_score": 4,
+    "notes": "Seed example course."
+  },
+  {
+    "code": "CS381",
+    "title": "Introduction to Analysis of Algorithms",
+    "credits": 3,
+    "prereqs": ["CS251"],
+    "offered_terms": ["fall", "spring"],
+    "requirement_tags": ["required", "theory-heavy"],
+    "workload_score": 5,
+    "notes": "Seed example course."
+  },
+  {
+    "code": "CS502",
+    "title": "Compilers",
+    "credits": 3,
+    "prereqs": ["CS251"],
+    "offered_terms": ["spring"],
+    "requirement_tags": ["systems", "project-heavy"],
+    "workload_score": 5,
+    "notes": "Seed example course inspired by a typical compiler course."
+  },
+  {
+    "code": "CS536",
+    "title": "Data Communication and Computer Networks",
+    "credits": 3,
+    "prereqs": ["CS251"],
+    "offered_terms": ["fall"],
+    "requirement_tags": ["systems", "exam-heavy"],
+    "workload_score": 4,
+    "notes": "Seed example course."
+  },
+  {
+    "code": "CS541",
+    "title": "Database Systems",
+    "credits": 3,
+    "prereqs": ["CS251"],
+    "offered_terms": ["fall"],
+    "requirement_tags": ["systems", "project-heavy"],
+    "workload_score": 4,
+    "notes": "Seed example course."
+  },
+  {
+    "code": "CS551",
+    "title": "Cloud Computing",
+    "credits": 3,
+    "prereqs": ["CS536"],
+    "offered_terms": ["spring"],
+    "requirement_tags": ["systems", "project-heavy"],
+    "workload_score": 4,
+    "notes": "Seed example course."
+  },
+  {
+    "code": "CS577",
+    "title": "Natural Language Processing",
+    "credits": 3,
+    "prereqs": ["CS381"],
+    "offered_terms": ["fall"],
+    "requirement_tags": ["ai", "project-heavy"],
+    "workload_score": 4,
+    "notes": "Seed example course."
+  },
+  {
+    "code": "CS587",
+    "title": "Deep Learning",
+    "credits": 3,
+    "prereqs": ["CS381"],
+    "offered_terms": ["spring"],
+    "requirement_tags": ["ai", "project-heavy"],
+    "workload_score": 5,
+    "notes": "Seed example course."
+  }
+]
