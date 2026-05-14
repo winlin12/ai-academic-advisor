@@ -1,0 +1,45 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap");
+
+:root {
+  --bg-1: #fff8ef;
+  --bg-2: #ffe8cf;
+  --ink: #1c1917;
+  --muted: #57534e;
+  --card: rgba(255, 255, 255, 0.72);
+  --stroke: rgba(120, 53, 15, 0.16);
+  --shadow: 0 18px 45px rgba(120, 53, 15, 0.16);
+  --brand: #ea580c;
+  --brand-2: #f97316;
+}
+
+body {
+  min-height: 100vh;
+  color: var(--ink);
+  background:
+    radial-gradient(circle at 15% 12%, #fff5e6 0%, rgba(255, 245, 230, 0) 38%),
+    radial-gradient(circle at 90% 20%, #fde6c8 0%, rgba(253, 230, 200, 0) 34%),
+    linear-gradient(150deg, var(--bg-1) 0%, var(--bg-2) 100%);
+  font-family: "Space Grotesk", "Avenir Next", "Segoe UI", sans-serif;
+}
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--stroke);
+  border-radius: 1.25rem;
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(8px);
+}
+
+.mesh-bg {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: -1;
+  background:
+    radial-gradient(circle at 80% 85%, rgba(251, 146, 60, 0.18) 0%, rgba(251, 146, 60, 0) 34%),
+    radial-gradient(circle at 10% 78%, rgba(249, 115, 22, 0.12) 0%, rgba(249, 115, 22, 0) 40%);
+}

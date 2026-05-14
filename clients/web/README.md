@@ -1,11 +1,28 @@
-# Web Client Placeholder
+# AI Academic Advisor Web UI
 
-Suggested future stack:
+## Install
 
-- Next.js or Vite
-- Semester plan dashboard
-- Advisor chat panel
-- Profile editor
-- Course catalog editor
+```bash
+npm install
+npm run dev
+```
 
-For now, build and validate the backend first.
+Open:
+
+http://localhost:3000
+
+## Features
+
+- Dashboard layout
+- Semester cards
+- Student profile panel
+- Advisor chat mockup
+- Tailwind styling
+- Mock data
+
+## Next Steps
+
+1. Connect FastAPI backend
+2. Replace mock data
+3. Add real advisor chat
+4. Add responsive mobile layout
