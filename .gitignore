@@ -18,7 +18,8 @@ __pycache__/
 /data/
 /data/**
 /backend/app/data/purdue_2025_26/
-
+/purdueio/data/
+/purdueio/data/** 
 # Build artifacts
 dist/
 build/
