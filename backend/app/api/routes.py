@@ -1,11 +1,28 @@
 from fastapi import APIRouter, HTTPException
 
-from app.models.schemas import ExplainPlanRequest, PlanResponse, StudentProfile
+from app.models.schemas import (
+    AcademicFacetResponse,
+    AcademicProgramDetail,
+    AcademicProgramSummary,
+    ExplainPlanRequest,
+    PlanResponse,
+    StudentProfile,
+)
+from app.services.academic_db import (
+    fetch_academic_facets,
+    fetch_program_detail,
+    fetch_program_summaries,
+    search_courses,
+)
 from app.services.catalog import load_catalog
-from app.services.ollama_client import OllamaClient
+from app.services.ollama_client import LocalModelEndpointError, OllamaClient
 from app.services.planner import generate_plan
 
 router = APIRouter()
+
+
+def academic_db_unavailable(exc: Exception) -> HTTPException:
+    return HTTPException(status_code=503, detail=f"Academic database unavailable: {exc}")
 
 
 @router.get("/health")
@@ -15,14 +32,81 @@ def health():
 
 @router.get("/health/ollama")
 async def ollama_health():
-    client = OllamaClient()
+    try:
+        client = OllamaClient()
+    except LocalModelEndpointError as exc:
+        return {
+            "ok": False,
+            "detail": str(exc),
+            "local_only": True,
+            "compute_warning": "Local models can use substantial CPU/GPU, memory, and battery.",
+        }
+
     ok, detail = await client.health()
-    return {"ok": ok, "detail": detail, "ollama_url": client.base_url}
+    return {
+        "ok": ok,
+        "detail": detail,
+        "ollama_url": client.base_url,
+        "model": client.model,
+        "local_only": client.local_only,
+        "compute_warning": "Local models can use substantial CPU/GPU, memory, and battery.",
+    }
 
 
 @router.get("/catalog/courses")
 def list_courses():
     return {"courses": [course.model_dump() for course in load_catalog()]}
+
+
+@router.get("/academic/facets", response_model=AcademicFacetResponse)
+def academic_facets():
+    try:
+        return fetch_academic_facets()
+    except Exception as exc:  # noqa: BLE001
+        raise academic_db_unavailable(exc) from exc
+
+
+@router.get("/academic/programs", response_model=list[AcademicProgramSummary])
+def academic_programs(
+    query: str | None = None,
+    catalog_year: int | None = None,
+    school: str | None = None,
+    limit: int = 120,
+):
+    try:
+        return fetch_program_summaries(
+            query=query,
+            catalog_year=catalog_year,
+            school=school,
+            limit=limit,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise academic_db_unavailable(exc) from exc
+
+
+@router.get("/academic/programs/{program_id}", response_model=AcademicProgramDetail)
+def academic_program_detail(program_id: str):
+    try:
+        program = fetch_program_detail(program_id)
+    except Exception as exc:  # noqa: BLE001
+        raise academic_db_unavailable(exc) from exc
+
+    if program is None:
+        raise HTTPException(status_code=404, detail="Academic program not found")
+    return program
+
+
+@router.get("/academic/courses/search")
+def academic_course_search(
+    query: str | None = None,
+    subject: str | None = None,
+    limit: int = 80,
+):
+    try:
+        courses = search_courses(query=query, subject=subject, limit=limit)
+        return {"courses": [course.model_dump() for course in courses]}
+    except Exception as exc:  # noqa: BLE001
+        raise academic_db_unavailable(exc) from exc
 
 
 @router.post("/plan/generate", response_model=PlanResponse)
@@ -33,7 +117,10 @@ def plan_generate(profile: StudentProfile):
 
 @router.post("/advisor/explain-plan")
 async def explain_plan(req: ExplainPlanRequest):
-    client = OllamaClient()
+    try:
+        client = OllamaClient()
+    except LocalModelEndpointError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     system_prompt = """
 You are an AI academic planning assistant.
@@ -41,6 +128,8 @@ You are not an official academic advisor.
 You must not invent courses, prerequisites, requirements, or policies.
 Explain only from the supplied structured plan.
 Always recommend verifying important decisions with an official advisor.
+You are running on a local or student-owned model endpoint, so keep answers concise
+unless the student asks for depth.
 """.strip()
 
     user_prompt = f"""

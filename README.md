@@ -32,7 +32,7 @@ Backend Layer
   - SQLite later
 
 AI Layer
-  - Ollama running on GPU PC
+  - Local/self-hosted Ollama-compatible model endpoint
   - Qwen Coder / Llama / Gemma-style local models
   - RAG over course catalog and degree rules later
 
@@ -53,9 +53,13 @@ Edit `backend/.env`:
 ```env
 OLLAMA_BASE_URL=http://100.x.y.z:11434
 OLLAMA_MODEL=qwen2.5-coder:7b
+OLLAMA_LOCAL_ONLY=true
 ```
 
-Use your PC's Tailscale IP.
+Use your Mac, LAN machine, or GPU PC's Tailscale IP. The backend defaults to
+local-only model endpoints and rejects public cloud LLM hosts so test calls do
+not accidentally spend API money. Local models can use substantial CPU/GPU,
+memory, power, and battery; students should opt into that knowingly.
 
 Install and run:
 

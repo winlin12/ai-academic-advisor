@@ -12,6 +12,83 @@ class Course(BaseModel):
     notes: str | None = None
 
 
+class AcademicFacetResponse(BaseModel):
+    catalog_years: list[int] = Field(default_factory=list)
+    schools: list[str] = Field(default_factory=list)
+    subjects: list[str] = Field(default_factory=list)
+
+
+class AcademicCourseResult(BaseModel):
+    id: str
+    subject: str
+    number: str
+    code: str
+    title: str
+    credit_hours: float | None = None
+    description: str | None = None
+
+
+class AcademicProgramSummary(BaseModel):
+    id: str
+    catalog_year: int
+    school: str | None = None
+    program_title: str
+    degree_code: str | None = None
+    variant: str | None = None
+    source_url: str
+    parser_status: str
+    block_count: int = 0
+    course_count: int = 0
+    linked_course_count: int = 0
+
+
+class RequirementCourseOption(BaseModel):
+    id: str
+    sort_order: int
+    course_code_text: str
+    course_id: str | None = None
+    course_title: str | None = None
+    credits_text: str | None = None
+    raw_text: str | None = None
+
+
+class RequirementRuleOption(BaseModel):
+    id: str
+    option_index: int
+    sort_order: int
+    label: str | None = None
+    courses: list[RequirementCourseOption] = Field(default_factory=list)
+
+
+class RequirementRuleDetail(BaseModel):
+    id: str
+    sort_order: int
+    rule_type: str
+    choose_count: int | None = None
+    raw_text: str | None = None
+    options: list[RequirementRuleOption] = Field(default_factory=list)
+
+
+class RequirementBlockDetail(BaseModel):
+    id: str
+    sort_order: int
+    title: str | None = None
+    credits_text: str | None = None
+    rules: list[RequirementRuleDetail] = Field(default_factory=list)
+
+
+class AcademicProgramDetail(BaseModel):
+    id: str
+    catalog_year: int
+    school: str | None = None
+    program_title: str
+    degree_code: str | None = None
+    variant: str | None = None
+    source_url: str
+    parser_status: str
+    blocks: list[RequirementBlockDetail] = Field(default_factory=list)
+
+
 class StudentProfile(BaseModel):
     name: str = "Student"
     degree_program: str = "Computer Science"
