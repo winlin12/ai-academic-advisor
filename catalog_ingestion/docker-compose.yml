@@ -1,0 +1,58 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: catalog-ingestion-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: catalog_ingestion
+      POSTGRES_USER: catalog
+      POSTGRES_PASSWORD: catalog
+    ports:
+      - "5433:5432"
+    volumes:
+      - catalog-pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U catalog -d catalog_ingestion"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Ingestion CLI. Built on Microsoft's Playwright image so Chromium + all system
+  # libraries are present without installing anything on the host. Run commands with:
+  #   podman compose run --rm ingestion <command> [args]
+  # e.g.
+  #   podman compose run --rm ingestion db-init
+  #   podman compose run --rm ingestion discover-years
+  #   podman compose run --rm ingestion sync-courses --year 2026-2027 --subject CS --max-courses 5
+  ingestion:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: catalog-ingestion:latest
+    container_name: catalog-ingestion-app
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Inside the compose network postgres is reachable by service name on 5432.
+      DATABASE_URL: postgresql+psycopg://catalog:catalog@postgres:5432/catalog_ingestion
+      CATALOG_BASE_URL: https://catalog.purdue.edu
+      CATALOG_USER_AGENT: "PurdueAcademicPlannerBot/1.0 (student hobby project; not affiliated with Purdue; contact: bingdaddycompany@gmail.com)"
+      # robots.txt specifies a 120s crawl-delay for all bots. Respect it for real runs.
+      CRAWL_DELAY_SECONDS: "120"
+      MAX_CRAWL_PAGES: "500"
+      FETCHER_BACKEND: playwright
+      PAGE_CACHE_DIR: /data/page_cache
+      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
+      PURDUEAPI_ODATA_URL: https://api.purdue.io/odata
+      LOG_LEVEL: INFO
+    volumes:
+      # Editable source so host edits to the parsers/ingest code take effect on next run.
+      - ./src:/app/src
+      # Persist the raw-HTML disk cache across runs (audit trail + avoids refetching).
+      - catalog-page-cache:/data/page_cache
+    working_dir: /app
+
+volumes:
+  catalog-pg-data:
+  catalog-page-cache:

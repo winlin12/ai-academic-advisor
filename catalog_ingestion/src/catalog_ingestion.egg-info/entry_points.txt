@@ -1,0 +1,2 @@
+[console_scripts]
+catalog-ingest = catalog_ingestion.cli:app
