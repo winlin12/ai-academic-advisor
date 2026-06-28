@@ -476,12 +476,54 @@ def validate_cmd(
         rprint(f"Report written to {output}")
 
 
+@app.command("import-courses")
+def import_courses_cmd(
+    year: str = typer.Option(..., "--year", help="Catalog year label, e.g. '2026-2027'"),
+    subject: Optional[str] = typer.Option(None, "--subject", help="Subject code, e.g. 'CS'"),
+    all_subjects: bool = typer.Option(False, "--all-subjects", help="Import every subject"),
+):
+    """Load courses from PurdueIO into the catalog course tables (primary course source).
+
+    PurdueIO is the canonical course catalog; the scrape is reserved for degree
+    requirements. This also links any scraped requirement options to courses by code.
+    """
+    _setup_logging(get_settings().log_level)
+    settings = get_settings()
+
+    from catalog_ingestion.db.session import get_session
+    from catalog_ingestion.db.models import CatalogYear
+    from catalog_ingestion.ingest.purdueapi_import import import_courses_to_catalog
+
+    if not subject and not all_subjects:
+        rprint("[red]Specify --subject SUBJ or --all-subjects[/red]")
+        raise typer.Exit(1)
+    subject_codes = [subject.upper()] if subject else None
+
+    with get_session() as session:
+        db_year = session.query(CatalogYear).filter_by(label=year).first()
+        if not db_year:
+            rprint(f"[red]Catalog year {year!r} not found. Run 'discover-years' first.[/red]")
+            raise typer.Exit(1)
+        rprint(f"Loading courses from PurdueIO ({settings.purdueapi_odata_url}) ...")
+        result = import_courses_to_catalog(
+            session,
+            catalog_year=db_year,
+            odata_url=settings.purdueapi_odata_url,
+            subject_codes=subject_codes,
+        )
+
+    rprint(
+        f"[green]Courses loaded:[/green] {result['inserted']} new, "
+        f"{result['updated']} updated, {result['relinked']} requirement links resolved"
+    )
+
+
 @app.command("import-purdueapi")
 def import_purdueapi(
     entity: str = typer.Option("all", "--entity", help="subjects|courses|terms|all"),
     subject: Optional[str] = typer.Option(None, "--subject"),
 ):
-    """Import data from PurdueAPI OData endpoint into staging tables."""
+    """Import data from PurdueAPI OData endpoint into staging tables (cross-reference)."""
     _setup_logging(get_settings().log_level)
     settings = get_settings()
 

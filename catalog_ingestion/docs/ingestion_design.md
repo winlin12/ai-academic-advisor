@@ -241,6 +241,26 @@ labeled "Prerequisites:" section, `parse_course_page` extracts it and
 `parse_prerequisite_text` builds the AND/OR tree. Sourcing prerequisites for Purdue will
 require the scheduling system or a supplementary source — a documented gap, not a bug.
 
+## Course source: PurdueIO, not scraping (corrected division of labour)
+
+The catalog scrape exists to obtain **degree requirements**, which exist nowhere else.
+**Courses come from PurdueIO** (`https://api.purdue.io/odata`), the canonical source for
+Purdue's course catalog (subject, number, title, credit hours, description). This matches
+the original project design.
+
+- `catalog-ingest import-courses --year 2026-2027 --all-subjects` loads PurdueIO courses
+  into the real `subjects`/`courses` tables (keyed by `course_code = SUBJECT NUMBER`,
+  deduplicated by code) and then links scraped `requirement_options` to those courses by
+  code. One run loaded ~10,300 courses for 2026-2027.
+- The OData API rejects `$top` (MaxTop=0) and returns all rows via server-driven paging
+  (`@odata.nextLink`); the importer never sends `$top`.
+- `sync-courses` (the Playwright course scraper) is now a **fallback**, only useful if you
+  want the catalog's own course descriptions. It is not the primary course source.
+- PurdueIO has no Acalog `coid`, so requirement→course linking is by `course_code`
+  (`requirement_options.course_code_raw`), exactly as the original `requirementsync` did.
+- PurdueIO is term-based, not catalog-year versioned, so its course set maps to the
+  current catalog year; historical years reuse the same course definitions by code.
+
 ## Known Limitations (First Pass)
 
 1. **navoid values for archived years** — only catoid=19 navoids are confirmed from live research.

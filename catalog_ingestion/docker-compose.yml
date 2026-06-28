@@ -53,6 +53,29 @@ services:
       - catalog-page-cache:/data/page_cache
     working_dir: /app
 
+  # FastAPI web server (the app's backend). Reads the catalog_ingestion database over
+  # the compose network and serves the /academic/*, /catalog/*, /plan/*, /advisor/*
+  # endpoints. The Next.js client (clients/web) calls this at http://localhost:8000.
+  backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    image: ai-academic-advisor-backend:latest
+    container_name: catalog-ingestion-backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ACADEMIC_DATABASE_URL: postgresql://catalog:catalog@postgres:5432/catalog_ingestion
+      # Ollama (optional, for /advisor/explain-plan) runs on the host, not in the pod.
+      OLLAMA_BASE_URL: http://host.containers.internal:11434
+    ports:
+      - "8000:8000"
+    volumes:
+      # Editable app code so backend edits take effect on container restart.
+      - ../backend/app:/srv/app
+
 volumes:
   catalog-pg-data:
   catalog-page-cache:
