@@ -91,6 +91,30 @@ curl -X POST http://localhost:8000/plan/generate \
   -d @app/data/sample_student_profile.json
 ```
 
+## Advisor (RAG)
+
+The advisor at `POST /advisor/ask` answers free-text questions by semantic retrieval: it
+embeds the question, pulls the most similar catalog chunks from the pgvector `academic_rules`
+table, and grounds the local model on those. Retrieved chunks are returned as `sources` so
+answers stay citable.
+
+That table starts empty, so populate it once from the ingested catalog (re-run when the
+catalog changes; it's idempotent):
+
+```bash
+ollama pull nomic-embed-text            # embedding model (separate from the chat model)
+python -m app.services.rag.ingest_catalog --dry-run   # preview chunks, no model calls
+python -m app.services.rag.ingest_catalog             # embed courses + program rules
+```
+
+Then ask:
+
+```bash
+curl -X POST http://localhost:8000/advisor/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question": "I want to major in CS — what should I take first?"}'
+```
+
 ## Current Scope
 
 Version 0.1 focuses on deterministic planning first:

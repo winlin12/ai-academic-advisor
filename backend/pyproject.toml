@@ -19,6 +19,10 @@ dev = [
     "ruff>=0.6.0"
 ]
 
+[project.scripts]
+# Load the relational catalog into the pgvector academic_rules table the advisor retrieves from.
+ingest-catalog = "app.services.rag.ingest_catalog:main"
+
 [tool.ruff]
 line-length = 100
 

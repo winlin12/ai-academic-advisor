@@ -1,6 +1,9 @@
 services:
   postgres:
-    image: postgres:16-alpine
+    # pgvector/pgvector:pg16 == official Postgres 16 + the `vector` extension preinstalled.
+    # Same PG16 on-disk format as postgres:16-alpine, so the catalog-pg-data volume is reused
+    # as-is (no dump/restore). Required for CREATE EXTENSION vector to succeed.
+    image: pgvector/pgvector:pg16
     container_name: catalog-ingestion-postgres
     restart: unless-stopped
     environment:

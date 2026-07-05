@@ -1,3 +1,5 @@
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 
@@ -128,3 +130,35 @@ class PlanResponse(BaseModel):
 class ExplainPlanRequest(BaseModel):
     question: str
     plan: dict
+
+
+class AdvisorAskRequest(BaseModel):
+    """A free-text question for the local advisor model.
+
+    The advisor answers via semantic retrieval: the question is embedded and the most similar
+    catalog chunks are pulled from pgvector to ground the reply (see ``rag.pipeline``).
+    """
+
+    question: str = Field(min_length=1)
+
+
+class AdvisorSource(BaseModel):
+    """One retrieved chunk that grounded an advisor answer, surfaced so the UI can cite sources.
+
+    ``similarity`` is cosine similarity (≈1 = highly relevant); ``metadata`` carries whatever
+    tags were stored with the chunk (type, code, program, ...).
+    """
+
+    id: int
+    similarity: float
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    content: str
+
+
+class AdvisorAskResponse(BaseModel):
+    """The advisor's answer plus the retrieved chunks it was grounded on."""
+
+    answer: str
+    model: str
+    context_char_count: int
+    sources: list[AdvisorSource] = Field(default_factory=list)

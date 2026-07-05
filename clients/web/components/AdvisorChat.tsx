@@ -1,22 +1,35 @@
 import { useState } from "react";
 
-import { explainPlan, PlanResponse } from "@/lib/api";
+import { askAdvisor, type AdvisorSource } from "@/lib/api";
 
 type ChatMessage = {
   role: "user" | "assistant";
   content: string;
+  sources?: AdvisorSource[];
 };
 
-type Props = {
-  plan: PlanResponse;
-};
+// A short, human-readable label for a retrieved chunk, from whatever tags it carries.
+function sourceLabel(source: AdvisorSource): string {
+  const meta = source.metadata as {
+    type?: string;
+    code?: string;
+    program?: string;
+    block?: string;
+  };
+  if (meta.type === "course" && meta.code) return meta.code;
+  if (meta.type === "requirement" && meta.program) {
+    return meta.block ? `${meta.program} — ${meta.block}` : meta.program;
+  }
+  return `Source ${source.id}`;
+}
 
-export default function AdvisorChat({ plan }: Props) {
+export default function AdvisorChat() {
   const [prompt, setPrompt] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
       role: "assistant",
-      content: "Ask about your current plan and I will explain it.",
+      content:
+        "Ask me anything about your degree, e.g. \"I want to major in CS, what should I take my second semester freshman year?\"",
     },
   ]);
   const [loading, setLoading] = useState(false);
@@ -37,10 +50,14 @@ export default function AdvisorChat({ plan }: Props) {
     setLoading(true);
 
     try {
-      const response = await explainPlan(trimmedPrompt, plan);
+      const response = await askAdvisor(trimmedPrompt);
       setMessages((prev) => [
         ...prev,
-        { role: "assistant", content: response.answer || "No response received." },
+        {
+          role: "assistant",
+          content: response.answer || "No response received.",
+          sources: response.sources,
+        },
       ]);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unknown error");
@@ -70,6 +87,31 @@ export default function AdvisorChat({ plan }: Props) {
               {message.role === "assistant" ? "Advisor" : "You"}
             </p>
             {message.content}
+            {message.sources && message.sources.length > 0 && (
+              <div className="mt-3 space-y-2 border-t border-orange-900/10 pt-3 text-left">
+                <p className="text-[0.65rem] font-semibold uppercase tracking-wide opacity-60">
+                  Sources
+                </p>
+                {message.sources.map((source) => (
+                  <div
+                    key={source.id}
+                    className="rounded-lg border border-orange-900/10 bg-white/70 p-2 text-xs text-stone-700"
+                  >
+                    <p className="font-semibold text-stone-800">
+                      {sourceLabel(source)}{" "}
+                      <span className="font-normal opacity-60">
+                        {Math.round(source.similarity * 100)}% match
+                      </span>
+                    </p>
+                    <p className="mt-1 opacity-80">
+                      {source.content.length > 180
+                        ? `${source.content.slice(0, 180)}…`
+                        : source.content}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         ))}
         {loading && (

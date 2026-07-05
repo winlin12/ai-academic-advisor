@@ -1,2 +1,5 @@
 # DB backup snapshots (make backup)
 catalog_db_backup.sql.gz
+
+# Scrape run logs (make sync-programs)
+logs/

@@ -1,9 +1,13 @@
+import psycopg
 from fastapi import APIRouter, HTTPException
 
 from app.models.schemas import (
     AcademicFacetResponse,
     AcademicProgramDetail,
     AcademicProgramSummary,
+    AdvisorAskRequest,
+    AdvisorAskResponse,
+    AdvisorSource,
     ExplainPlanRequest,
     PlanResponse,
     StudentProfile,
@@ -15,8 +19,9 @@ from app.services.academic_db import (
     search_courses,
 )
 from app.services.catalog import load_catalog
-from app.services.ollama_client import LocalModelEndpointError, OllamaClient
+from app.services.ollama_client import EmbeddingError, LocalModelEndpointError, OllamaClient
 from app.services.planner import generate_plan
+from app.services.rag.pipeline import answer_question
 
 router = APIRouter()
 
@@ -148,3 +153,45 @@ Explain the plan clearly. Focus on prerequisites, semester sequencing, warnings,
         raise HTTPException(status_code=502, detail=f"Ollama request failed: {exc}") from exc
 
     return {"answer": answer}
+
+
+@router.post("/advisor/ask", response_model=AdvisorAskResponse)
+async def advisor_ask(req: AdvisorAskRequest):
+    """Answer a free-text student question via semantic (pgvector) retrieval.
+
+    The question is embedded, the top-k most similar ``academic_rules`` chunks are pulled by
+    cosine distance, and the local model is grounded on just those. The retrieved chunks come
+    back as ``sources`` so the answer stays inspectable and citable. The catalog must first be
+    loaded into ``academic_rules`` (``python -m app.services.rag.ingest_catalog``), otherwise
+    retrieval returns nothing and the model will say it has no rule on file.
+
+    Error ladder: 400 (non-local endpoint), 503 (database), 502 (embedding/model transport).
+    """
+    try:
+        client = OllamaClient()
+    except LocalModelEndpointError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        result = await answer_question(req.question, client=client)
+    except EmbeddingError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except psycopg.Error as exc:
+        raise academic_db_unavailable(exc) from exc
+    except Exception as exc:  # httpx / model transport failure
+        raise HTTPException(status_code=502, detail=f"Ollama request failed: {exc}") from exc
+
+    return AdvisorAskResponse(
+        answer=result["answer"],
+        model=result["model"],
+        context_char_count=result["context_char_count"],
+        sources=[
+            AdvisorSource(
+                id=m["id"],
+                similarity=m["similarity"],
+                metadata=m.get("metadata") or {},
+                content=m["content"],
+            )
+            for m in result["matches"]
+        ],
+    )

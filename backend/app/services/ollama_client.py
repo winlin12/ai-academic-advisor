@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ipaddress
+import re
 from urllib.parse import urlparse
 
 import httpx
@@ -10,14 +11,26 @@ from app.core.config import settings
 
 TAILSCALE_CGNAT = ipaddress.ip_network("100.64.0.0/10")
 
+# Reasoning models served by Ollama (e.g. lfm2.5, deepseek-r1) emit their chain of thought
+# in a leading <think>...</think> block. Strip it so callers get just the final answer.
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
+def strip_reasoning(text: str) -> str:
+    return _THINK_BLOCK_RE.sub("", text).strip()
+
 
 class LocalModelEndpointError(ValueError):
     pass
 
 
+class EmbeddingError(RuntimeError):
+    """Raised when the embedding endpoint returns a malformed or wrong-sized vector."""
+
+
 def _is_local_hostname(hostname: str) -> bool:
     lowered = hostname.lower().strip()
-    if lowered in {"localhost", "host.docker.internal"}:
+    if lowered in {"localhost", "host.docker.internal", "host.containers.internal"}:
         return True
     if lowered.endswith(".localhost") or lowered.endswith(".local"):
         return True
@@ -89,4 +102,39 @@ USER:
             resp.raise_for_status()
             data = resp.json()
 
-        return data.get("response", "")
+        return strip_reasoning(data.get("response", ""))
+
+    async def embed(self, text: str, *, task_type: str = "search_document") -> list[float]:
+        """Turn one text chunk into an embedding vector via the local embedding model.
+
+        ``nomic-embed-text`` is an *asymmetric* retrieval model: it expects a task prefix so
+        that a stored passage and a question about that passage land close together in vector
+        space. We prepend ``search_document:`` when embedding catalog text for storage and
+        ``search_query:`` when embedding a student's question. Everything else — base URL,
+        the local-only endpoint guard, the JSON transport — is shared with ``generate``; only
+        the model (``rag_embed_model``) and endpoint (``/api/embeddings``) differ.
+        """
+        prefix = f"{task_type}: " if task_type else ""
+        payload = {
+            "model": settings.rag_embed_model,
+            "prompt": f"{prefix}{text}",
+        }
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(f"{self.base_url}/api/embeddings", json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+
+        vector = data.get("embedding")
+        if not isinstance(vector, list) or not vector:
+            raise EmbeddingError(
+                f"Embedding model '{settings.rag_embed_model}' returned no vector. "
+                f"Is it pulled? Try: ollama pull {settings.rag_embed_model}"
+            )
+        if len(vector) != settings.rag_embed_dimensions:
+            raise EmbeddingError(
+                f"Embedding model '{settings.rag_embed_model}' returned {len(vector)} dims, "
+                f"but rag_embed_dimensions is {settings.rag_embed_dimensions}. Fix the config "
+                f"and the VECTOR(n) column so all three agree."
+            )
+        return vector
