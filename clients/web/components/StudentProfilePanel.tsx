@@ -1,43 +1,96 @@
+"use client";
+
+import { StudentProfile } from "@/lib/api";
+
 type Props = {
-  profile: {
-    name: string;
-    degree: string;
-    targetGraduation: string;
-  };
-  onRegenerate?: () => void;
+  profile: StudentProfile;
+  busy?: boolean;
+  onRegenerate: () => void;
+  onEditProfile: () => void;
+  onStartOver: () => void;
 };
 
-export default function StudentProfilePanel({ profile, onRegenerate }: Props) {
+export default function StudentProfilePanel({
+  profile,
+  busy = false,
+  onRegenerate,
+  onEditProfile,
+  onStartOver,
+}: Props) {
+  const targetGraduation = profile.preferences?.target_graduation;
+
+  const fields: Array<{ label: string; value: string }> = [
+    { label: "Name", value: profile.name },
+    { label: "Degree", value: profile.degree_program },
+    {
+      label: "Starts",
+      value: `${capitalize(profile.start_term)} ${profile.start_year}`,
+    },
+    {
+      label: "Credit cap",
+      value: `${profile.max_credits_per_semester} / semester`,
+    },
+    {
+      label: "Completed",
+      value: `${profile.completed_courses.length} course${
+        profile.completed_courses.length === 1 ? "" : "s"
+      }`,
+    },
+    ...(targetGraduation
+      ? [{ label: "Target graduation", value: String(targetGraduation) }]
+      : []),
+  ];
+
   return (
-    <div className="card p-6 text-center">
-      <p className="text-xs font-semibold uppercase tracking-[0.2em] text-orange-700">
-        Student
-      </p>
-      <h2 className="mb-5 mt-2 text-2xl font-bold text-stone-900">Profile</h2>
+    <div className="card card-accent p-6">
+      <p className="kicker">Student</p>
+      <h2 className="font-display mt-1 text-2xl font-semibold uppercase tracking-wide text-[var(--ink)]">
+        Profile
+      </h2>
 
-      <div className="space-y-4">
-        <div className="rounded-xl border border-orange-900/10 bg-white/70 p-3">
-          <p className="text-xs uppercase tracking-wide text-stone-500">Name</p>
-          <p className="mt-1 font-semibold text-stone-900">{profile.name}</p>
-        </div>
+      <dl className="mt-5 space-y-3">
+        {fields.map((field) => (
+          <div
+            key={field.label}
+            className="flex items-baseline justify-between gap-3 border-b border-[var(--stroke)] pb-2 last:border-b-0"
+          >
+            <dt className="text-xs uppercase tracking-wide text-[var(--muted)]">
+              {field.label}
+            </dt>
+            <dd className="text-right text-sm font-semibold text-[var(--ink)]">
+              {field.value}
+            </dd>
+          </div>
+        ))}
+      </dl>
 
-        <div className="rounded-xl border border-orange-900/10 bg-white/70 p-3">
-          <p className="text-xs uppercase tracking-wide text-stone-500">Degree</p>
-          <p className="mt-1 font-semibold text-stone-900">{profile.degree}</p>
-        </div>
-
-        <div className="rounded-xl border border-orange-900/10 bg-white/70 p-3">
-          <p className="text-xs uppercase tracking-wide text-stone-500">Target Graduation</p>
-          <p className="mt-1 font-semibold text-stone-900">{profile.targetGraduation}</p>
-        </div>
+      <div className="mt-6 space-y-2">
+        <button
+          onClick={onRegenerate}
+          disabled={busy}
+          className="btn-gold w-full px-4 py-2.5 text-sm"
+        >
+          Regenerate plan
+        </button>
+        <button
+          onClick={onEditProfile}
+          disabled={busy}
+          className="btn-ghost w-full px-4 py-2.5 text-sm"
+        >
+          Edit profile
+        </button>
+        <button
+          onClick={onStartOver}
+          disabled={busy}
+          className="w-full rounded-lg px-4 py-2 text-xs font-medium text-[var(--muted)] transition hover:text-red-400 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          Start over
+        </button>
       </div>
-
-      <button
-        onClick={onRegenerate}
-        className="mt-6 w-full rounded-xl bg-gradient-to-r from-orange-600 to-orange-500 px-4 py-3 font-semibold text-white shadow-[0_10px_20px_rgba(234,88,12,0.3)] transition hover:brightness-110"
-      >
-        Regenerate Plan
-      </button>
     </div>
   );
+}
+
+function capitalize(value: string) {
+  return value.charAt(0).toUpperCase() + value.slice(1);
 }

@@ -83,6 +83,19 @@ services:
       # Editable app code so backend edits take effect on container restart.
       - ../backend/app:/srv/app
 
+  # Browser-based DB client (TODO Priority 6): full table browsing/editing at
+  # http://localhost:8081. No depends_on so `docker compose up -d adminer` never
+  # touches an already-running postgres (e.g. mid-crawl) — Adminer connects lazily.
+  # Login: server "postgres", user/password/database "catalog"/"catalog"/"catalog_ingestion".
+  adminer:
+    image: adminer:latest
+    container_name: catalog-ingestion-adminer
+    restart: unless-stopped
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+    ports:
+      - "8081:8080"
+
 volumes:
   catalog-pg-data:
   catalog-page-cache:

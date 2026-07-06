@@ -1,6 +1,6 @@
-# AI Academic Advisor
+# BoilerAdvisor
 
-A local-first AI academic planning assistant that helps students reason about degree requirements, prerequisites, semester plans, workload balance, and graduation paths.
+A local-first AI academic planning assistant for Purdue students: reason about degree requirements, prerequisites, semester plans, workload balance, and graduation paths.
 
 ## What it does
 
@@ -27,7 +27,7 @@ Ask questions like:
 
 ```bash
 git clone <repo>
-cd ai-academic-advisor
+cd ai-academic-advisor   # repo directory name predates the BoilerAdvisor rename
 ```
 
 There are two ways to run Postgres + the backend API: all in Docker (simplest, no Python setup) or the backend natively (needed for live-reload while editing backend code). **Pick one — don't run both at once, they'll fight over port 8000.**
@@ -110,23 +110,27 @@ python -m app.services.rag.ingest_catalog
 ## Using the App
 
 **Web UI** (http://localhost:3000) — current state, not aspirational:
-- Shows a plan for one hardcoded demo profile (`demoProfile` in [`clients/web/app/page.tsx`](clients/web/app/page.tsx)) — there is no sign-up/profile-creation form yet, and no major/program picker despite the backend supporting `program_id`
-- "Regenerate Plan" reruns the planner from scratch on that same hardcoded profile
+- **Onboarding, no demo profile**: first visit lands on a profile setup form (name, degree, start term/year, credit cap, completed courses + courses to schedule via catalog search). There is no hardcoded default student. A major/program *picker* is still pending (degree name is free text until the program crawl fills the `programs` table).
+- **Plans persist**: creating a profile calls `POST /v1/students`, and every accepted edit/revision/regeneration is autosaved through `POST /v1/students/{id}/plans`. The student id lives in `localStorage`; a reload fetches the newest saved plan from the database. A status chip shows Saved / Saving / Save failed / Not saved (DB down).
 - Ask the AI advisor free-text questions (RAG-grounded, cites sources)
 - Revise the plan with free-text feedback (“less theory-heavy”, “cap at 6 credits”) — the model proposes reorder/defer/avoid-tag/credit-cap edits, the deterministic planner re-validates them
-- **No direct plan editing**: there's no way to move, add, or remove a single course in a specific semester. Regenerate (from scratch) and feedback-driven revise (via the LLM's limited knob set) are the only two ways to change a plan today.
-- **No persistence from the UI**: the backend has `POST /students` and `POST /students/{id}/plans` to save profiles/plans, but the web client never calls them — nothing survives a page reload.
-- **No database browsing UI**: there's no admin page or table browser. Use `make psql` / `make counts` from a terminal (see [Database Shell](#database-shell)) or point an external SQL client at `localhost:5433`.
+- **Direct plan editing**: move a course to another semester (per-course dropdown), remove it (×), or add one via a debounced catalog search box on each semester card. Edits go through `POST /v1/plan/edit` — pure deterministic validation (prereqs, term offerings, credit caps), no LLM involved — and warnings/credit totals update instantly.
+- **Database browsing** at http://localhost:3000/admin: read-only table browser (row counts + paged row contents) backed by `GET /v1/admin/*`. For full editing, `make adminer` starts [Adminer](https://www.adminer.org/) at http://localhost:8081. `make psql` / `make counts` still work from a terminal (see [Database Shell](#database-shell)).
+- **Design**: Purdue-inspired black & gold theme (Boilermaker Gold `#CFB991` on warm black), top navigation between Planner and Database views.
 
-**API** (http://localhost:8000/docs):
-- `POST /plan/generate` — generate a degree plan
-- `POST /advisor/ask` — ask a question with sources
-- `POST /advisor/revise-plan` — revise a plan with feedback
-- `GET /academic/courses/search` — search the catalog
-- `GET /academic/programs/{id}` — view requirements for a major
-- `POST /students`, `GET /students/{id}`, `POST /students/{id}/plans` — profile/plan persistence (built, but currently unused by the web client)
+**API** (http://localhost:8000/docs) — all product routes live under `/v1`, grouped into tagged domain routers (`academic`, `planning`, `advisor`, `students`); health probes stay unversioned:
+- `GET /health`, `GET /health/ollama` — liveness / local-model status
+- `POST /v1/plan/generate` — generate a degree plan (deterministic)
+- `POST /v1/plan/edit` — move/add/remove one course, deterministically re-validated (no LLM)
+- `POST /v1/advisor/ask` — ask a question with sources (RAG)
+- `POST /v1/advisor/revise-plan` — revise a plan with free-text feedback (LLM proposes, planner disposes)
+- `POST /v1/advisor/explain-plan` — explain a structured plan
+- `GET /v1/academic/courses/search` — search the real catalog
+- `GET /v1/academic/programs/{id}` — view requirements for a major
+- `POST /v1/students`, `GET /v1/students/{id}`, `POST /v1/students/{id}/plans` — profile/plan persistence (used by the web client for onboarding and plan autosave)
+- `GET /v1/admin/tables`, `GET /v1/admin/tables/{table}` — read-only table counts and paged row browsing (whitelisted tables only; backs the `/admin` page)
 
-⚠️ The API surface is rough right now: routes are a flat, untagged list mixing RPC-style (`/plan/generate`, `/advisor/ask`) and REST-style (`/academic/programs/{id}`, `/students/{id}`) naming with no versioning; `/catalog/courses` is a vestigial endpoint that reads a bundled JSON fixture instead of the real database and duplicates `/academic/courses/search`. See [`TODO.md`](TODO.md) for the cleanup plan.
+The old flat, untagged router and the vestigial `/catalog/courses` fixture route are gone (TODO Priority 5): routers now live one-per-domain under [`backend/app/api/routers/`](backend/app/api/routers/), and the bundled fixture survives only as the planner's documented offline fallback.
 
 ## How it Works
 
@@ -178,9 +182,12 @@ pytest -xvs tests/test_planner.py   # run specific tests
 cd catalog_ingestion
 make psql                      # SQL prompt
 make counts                    # row counts per table
+make adminer                   # browser DB client at http://localhost:8081
 make backup                    # save to backup.sql.gz
 make restore                   # load from backup.sql.gz
 ```
+
+For read-only browsing without leaving the app, use http://localhost:3000/admin.
 
 ## Troubleshooting
 

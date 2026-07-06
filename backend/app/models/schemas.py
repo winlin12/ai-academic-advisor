@@ -1,7 +1,7 @@
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class Course(BaseModel):
@@ -29,6 +29,12 @@ class AcademicCourseResult(BaseModel):
     title: str
     credit_hours: float | None = None
     description: str | None = None
+
+
+class AcademicCourseSearchResponse(BaseModel):
+    """Envelope for ``GET /v1/academic/courses/search`` so the result list is schema-typed."""
+
+    courses: list[AcademicCourseResult] = Field(default_factory=list)
 
 
 class AcademicProgramSummary(BaseModel):
@@ -158,9 +164,72 @@ class SavePlanRequest(BaseModel):
     feedback: str | None = None
 
 
+class AdminTableInfo(BaseModel):
+    """One browsable table and its current row count (admin visibility, read-only)."""
+
+    name: str
+    row_count: int
+
+
+class AdminTablesResponse(BaseModel):
+    tables: list[AdminTableInfo] = Field(default_factory=list)
+
+
+class AdminTableRowsResponse(BaseModel):
+    """One page of rows from a whitelisted table, serialised as plain JSON objects.
+
+    ``columns`` is the union of keys across the returned page (JSONB rows don't carry
+    the table's schema), so the UI can render a stable grid without a second query.
+    """
+
+    table: str
+    columns: list[str] = Field(default_factory=list)
+    rows: list[dict[str, Any]] = Field(default_factory=list)
+    total: int
+    limit: int
+    offset: int
+
+
 class ExplainPlanRequest(BaseModel):
-    question: str
-    plan: dict
+    """Ask the local model to explain an already-generated plan.
+
+    ``plan`` is the full structured :class:`PlanResponse` (not a raw ``dict``) so malformed
+    client payloads are rejected at the FastAPI boundary instead of being interpolated
+    verbatim into the model prompt.
+    """
+
+    question: str = Field(min_length=1)
+    plan: PlanResponse
+
+
+class ExplainPlanResponse(BaseModel):
+    answer: str
+
+
+PlanEditOperation = Literal["move", "add", "remove"]
+
+
+class PlanEditRequest(BaseModel):
+    """One deterministic, direct manipulation of an existing plan — no LLM involved.
+
+    ``target_semester`` is a zero-based index into ``plan.semesters`` (the layout being
+    edited), required for ``move``/``add`` and ignored for ``remove``. ``profile`` is
+    optional context: when present, its ``completed_courses`` seed the prerequisite check
+    and ``max_credits_per_semester`` drives credit-cap warnings; without it the edit still
+    applies but validation can only reason from the plan itself.
+    """
+
+    plan: PlanResponse
+    operation: PlanEditOperation
+    course_code: str = Field(min_length=1)
+    target_semester: int | None = Field(default=None, ge=0)
+    profile: StudentProfile | None = None
+
+    @model_validator(mode="after")
+    def _require_target_for_placement(self) -> "PlanEditRequest":
+        if self.operation in ("move", "add") and self.target_semester is None:
+            raise ValueError("target_semester is required for 'move' and 'add' operations")
+        return self
 
 
 class PlanEditProposal(BaseModel):

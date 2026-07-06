@@ -1,4 +1,4 @@
-# AI Academic Advisor — Data Stack Runbook
+# BoilerAdvisor — Data Stack Runbook
 
 Everything you need to **run the database (and backend API) yourself**. The stack runs
 under rootless **podman** — no `sudo`, no host installs. All commands are run from this

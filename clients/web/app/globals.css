@@ -1,45 +1,169 @@
+/* @import must precede every other rule (including expanded @tailwind output) or the
+   browser silently drops it and the fonts never load. Keep it first. */
+@import url("https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap");
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
-@import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap");
-
+/* BoilerAdvisor design tokens — Purdue's palette on a warm near-black.
+   Gold is reserved for identity and action (headings, CTAs, active states);
+   surfaces stay dark and quiet so the plan content carries the hierarchy. */
 :root {
-  --bg-1: #fff8ef;
-  --bg-2: #ffe8cf;
-  --ink: #1c1917;
-  --muted: #57534e;
-  --card: rgba(255, 255, 255, 0.72);
-  --stroke: rgba(120, 53, 15, 0.16);
-  --shadow: 0 18px 45px rgba(120, 53, 15, 0.16);
-  --brand: #ea580c;
-  --brand-2: #f97316;
+  --gold: #cfb991; /* Boilermaker Gold — identity, borders, labels */
+  --gold-bright: #ddb945; /* Field — primary actions */
+  --gold-soft: #ebd99f; /* Dust — hover states */
+  --gold-aged: #8e6f3e; /* Aged — subdued rules and dividers */
+  --ink: #f4efe4; /* primary text (warm off-white) */
+  --muted: #a89f8d; /* secondary text */
+  --bg-0: #0b0a08; /* page background */
+  --bg-1: #161310; /* raised panels */
+  --stroke: rgba(207, 185, 145, 0.18);
+  --stroke-strong: rgba(207, 185, 145, 0.35);
 }
 
 body {
   min-height: 100vh;
   color: var(--ink);
-  background:
-    radial-gradient(circle at 15% 12%, #fff5e6 0%, rgba(255, 245, 230, 0) 38%),
-    radial-gradient(circle at 90% 20%, #fde6c8 0%, rgba(253, 230, 200, 0) 34%),
-    linear-gradient(150deg, var(--bg-1) 0%, var(--bg-2) 100%);
+  background-color: var(--bg-0);
   font-family: "Space Grotesk", "Avenir Next", "Segoe UI", sans-serif;
 }
 
-.card {
-  background: var(--card);
-  border: 1px solid var(--stroke);
-  border-radius: 1.25rem;
-  box-shadow: var(--shadow);
-  backdrop-filter: blur(8px);
-}
-
+/* Faint gold glows anchoring the corners — atmosphere, never legibility. */
 .mesh-bg {
   position: fixed;
   inset: 0;
   pointer-events: none;
   z-index: -1;
   background:
-    radial-gradient(circle at 80% 85%, rgba(251, 146, 60, 0.18) 0%, rgba(251, 146, 60, 0) 34%),
-    radial-gradient(circle at 10% 78%, rgba(249, 115, 22, 0.12) 0%, rgba(249, 115, 22, 0) 40%);
+    radial-gradient(ellipse 60% 40% at 85% -5%, rgba(207, 185, 145, 0.1) 0%, transparent 60%),
+    radial-gradient(ellipse 50% 35% at 0% 100%, rgba(142, 111, 62, 0.12) 0%, transparent 55%);
+}
+
+/* The one surface primitive. Cards are dark panels with a hairline gold stroke;
+   `card-accent` adds the gold top rule used to mark a section's lead card. */
+.card {
+  background: linear-gradient(165deg, rgba(255, 255, 255, 0.045) 0%, rgba(255, 255, 255, 0.015) 100%),
+    var(--bg-1);
+  border: 1px solid var(--stroke);
+  border-radius: 1rem;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.55);
+}
+
+.card-accent {
+  border-top: 3px solid var(--gold);
+}
+
+/* Kicker: the small uppercase gold label that opens every section. */
+.kicker {
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--gold);
+}
+
+.font-display {
+  font-family: "Barlow Condensed", "Oswald", "Arial Narrow", sans-serif;
+}
+
+/* Buttons: gold = primary act, ghost = secondary, danger reserved for removal. */
+.btn-gold {
+  border-radius: 0.65rem;
+  background: linear-gradient(180deg, var(--gold-soft) 0%, var(--gold-bright) 55%, #c9a53a 100%);
+  color: #131007;
+  font-weight: 600;
+  box-shadow: 0 10px 26px rgba(221, 185, 69, 0.22);
+  transition: filter 150ms ease, transform 150ms ease;
+}
+
+.btn-gold:hover:not(:disabled) {
+  filter: brightness(1.08);
+  transform: translateY(-1px);
+}
+
+.btn-gold:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.btn-ghost {
+  border-radius: 0.65rem;
+  border: 1px solid var(--stroke-strong);
+  color: var(--gold);
+  font-weight: 600;
+  transition: background-color 150ms ease, border-color 150ms ease;
+}
+
+.btn-ghost:hover:not(:disabled) {
+  background: rgba(207, 185, 145, 0.08);
+  border-color: var(--gold);
+}
+
+.btn-ghost:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+/* Form fields on dark: visible resting border, gold focus ring. */
+.field {
+  width: 100%;
+  border-radius: 0.65rem;
+  border: 1px solid var(--stroke);
+  background: rgba(0, 0, 0, 0.35);
+  padding: 0.55rem 0.8rem;
+  color: var(--ink);
+  outline: none;
+  transition: border-color 150ms ease, box-shadow 150ms ease;
+}
+
+.field::placeholder {
+  color: rgba(168, 159, 141, 0.6);
+}
+
+.field:focus {
+  border-color: var(--gold);
+  box-shadow: 0 0 0 3px rgba(207, 185, 145, 0.18);
+}
+
+.field:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+select.field option {
+  background: var(--bg-1);
+  color: var(--ink);
+}
+
+/* The Boilermaker stripe — a thin gold/black diagonal rule (a nod to the Boilermaker
+   Special) used under the nav and as a section divider. */
+.boiler-stripe {
+  height: 4px;
+  background: repeating-linear-gradient(
+    -45deg,
+    var(--gold) 0 10px,
+    #0b0a08 10px 20px
+  );
+  opacity: 0.85;
+}
+
+/* Dark, quiet scrollbars for the chat + admin table overflow areas. */
+.scroll-dark {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(207, 185, 145, 0.35) transparent;
+}
+
+.scroll-dark::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.scroll-dark::-webkit-scrollbar-thumb {
+  background: rgba(207, 185, 145, 0.3);
+  border-radius: 4px;
+}
+
+.scroll-dark::-webkit-scrollbar-track {
+  background: transparent;
 }

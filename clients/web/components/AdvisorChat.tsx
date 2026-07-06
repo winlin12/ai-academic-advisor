@@ -1,3 +1,5 @@
+"use client";
+
 import { useState } from "react";
 
 import {
@@ -110,22 +112,22 @@ export default function AdvisorChat({ profile, plan, onPlanRevised }: AdvisorCha
   }
 
   return (
-    <div className="card flex h-[42rem] flex-col p-6 text-center">
-      <p className="text-xs font-semibold uppercase tracking-[0.2em] text-orange-700">
-        Copilot
-      </p>
-      <h2 className="mb-4 mt-2 text-2xl font-bold text-stone-900">Advisor Chat</h2>
+    <div className="card card-accent flex h-[42rem] flex-col p-5">
+      <p className="kicker">Copilot</p>
+      <h2 className="font-display mb-4 mt-1 text-2xl font-semibold uppercase tracking-wide text-[var(--ink)]">
+        Advisor Chat
+      </h2>
 
       {canRevise && (
-        <div className="mb-4 flex rounded-full border border-orange-900/10 bg-white/60 p-1 text-xs font-semibold">
+        <div className="mb-4 flex rounded-full border border-[var(--stroke)] bg-black/30 p-1 text-xs font-semibold">
           {(["ask", "revise"] as Mode[]).map((value) => (
             <button
               key={value}
               onClick={() => setMode(value)}
               className={
                 mode === value
-                  ? "flex-1 rounded-full bg-gradient-to-r from-orange-600 to-orange-500 px-3 py-1.5 text-white shadow"
-                  : "flex-1 rounded-full px-3 py-1.5 text-stone-600 transition hover:text-stone-900"
+                  ? "btn-gold flex-1 !rounded-full px-3 py-1.5"
+                  : "flex-1 rounded-full px-3 py-1.5 text-[var(--muted)] transition hover:text-[var(--ink)]"
               }
             >
               {value === "ask" ? "Ask a question" : "Revise my plan"}
@@ -134,42 +136,48 @@ export default function AdvisorChat({ profile, plan, onPlanRevised }: AdvisorCha
         </div>
       )}
 
-      <div className="mb-4 flex-1 space-y-3 overflow-y-auto rounded-2xl border border-orange-900/10 bg-white/60 p-3 text-center">
+      <div className="scroll-dark mb-4 flex-1 space-y-3 overflow-y-auto rounded-xl border border-[var(--stroke)] bg-black/25 p-3">
         {messages.map((message, index) => (
           <div
             key={`${message.role}-${index}`}
             className={
               message.role === "assistant"
-                ? "rounded-2xl border border-orange-900/10 bg-gradient-to-br from-amber-100 to-orange-100 p-4 text-sm text-stone-800 shadow-[0_8px_20px_rgba(120,53,15,0.1)]"
-                : "rounded-2xl bg-stone-900 p-4 text-sm text-stone-100 shadow-[0_8px_20px_rgba(28,25,23,0.22)]"
+                ? "rounded-xl border border-[var(--stroke)] bg-[rgba(207,185,145,0.07)] p-4 text-sm text-[var(--ink)]"
+                : "ml-4 rounded-xl border border-[var(--stroke-strong)] bg-[rgba(221,185,69,0.12)] p-4 text-sm text-[var(--ink)]"
             }
           >
-            <p className="mb-1 text-xs font-semibold uppercase tracking-wide opacity-70">
+            <p
+              className={
+                message.role === "assistant"
+                  ? "mb-1 text-[0.65rem] font-semibold uppercase tracking-widest text-[var(--gold)]"
+                  : "mb-1 text-[0.65rem] font-semibold uppercase tracking-widest text-[var(--gold-soft)]"
+              }
+            >
               {message.role === "assistant" ? "Advisor" : "You"}
             </p>
             {message.content}
             {message.proposal && proposalSummary(message.proposal) && (
-              <p className="mt-2 border-t border-orange-900/10 pt-2 text-left text-xs font-medium text-orange-800">
+              <p className="mt-2 border-t border-[var(--stroke)] pt-2 text-xs font-medium text-[var(--gold)]">
                 Plan updated — {proposalSummary(message.proposal)}
               </p>
             )}
             {message.sources && message.sources.length > 0 && (
-              <div className="mt-3 space-y-2 border-t border-orange-900/10 pt-3 text-left">
-                <p className="text-[0.65rem] font-semibold uppercase tracking-wide opacity-60">
+              <div className="mt-3 space-y-2 border-t border-[var(--stroke)] pt-3">
+                <p className="text-[0.65rem] font-semibold uppercase tracking-widest text-[var(--muted)]">
                   Sources
                 </p>
                 {message.sources.map((source) => (
                   <div
                     key={source.id}
-                    className="rounded-lg border border-orange-900/10 bg-white/70 p-2 text-xs text-stone-700"
+                    className="rounded-lg border border-[var(--stroke)] bg-black/30 p-2 text-xs text-[var(--muted)]"
                   >
-                    <p className="font-semibold text-stone-800">
+                    <p className="font-semibold text-[var(--gold)]">
                       {sourceLabel(source)}{" "}
-                      <span className="font-normal opacity-60">
+                      <span className="font-normal text-[var(--muted)]">
                         {Math.round(source.similarity * 100)}% match
                       </span>
                     </p>
-                    <p className="mt-1 opacity-80">
+                    <p className="mt-1">
                       {source.content.length > 180
                         ? `${source.content.slice(0, 180)}…`
                         : source.content}
@@ -181,34 +189,34 @@ export default function AdvisorChat({ profile, plan, onPlanRevised }: AdvisorCha
           </div>
         ))}
         {loading && (
-          <div className="rounded-2xl border border-orange-900/10 bg-gradient-to-br from-amber-100 to-orange-100 p-4 text-sm text-stone-700">
-            Thinking...
+          <div className="rounded-xl border border-[var(--stroke)] bg-[rgba(207,185,145,0.07)] p-4 text-sm text-[var(--muted)]">
+            Thinking…
           </div>
         )}
         {error && (
-          <div className="rounded-xl border border-red-400/40 bg-red-100 p-4 text-sm text-red-900">
+          <div className="rounded-xl border border-red-500/30 bg-red-500/10 p-4 text-sm text-red-300">
             {error}
           </div>
         )}
       </div>
 
-      <div className="rounded-2xl border border-orange-900/15 bg-white/75 p-3">
+      <div>
         <textarea
           rows={3}
           placeholder={
             reviseMode
-              ? "Tell me how to adjust the plan, e.g. \"less theory-heavy\" or \"cap me at 6 credits\"..."
-              : "Ask your advisor..."
+              ? "Tell me how to adjust the plan, e.g. \"less theory-heavy\" or \"cap me at 6 credits\"…"
+              : "Ask your advisor…"
           }
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
-          className="w-full resize-none rounded-xl border border-orange-900/15 bg-white/70 p-3 text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-orange-500 focus:ring-2 focus:ring-orange-200"
+          className="field resize-none text-sm"
         />
 
         <button
           onClick={handleSend}
           disabled={loading || !prompt.trim()}
-          className="mt-3 w-full rounded-xl bg-gradient-to-r from-orange-600 to-orange-500 px-4 py-3 font-semibold text-white shadow-[0_10px_20px_rgba(234,88,12,0.28)] transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60"
+          className="btn-gold mt-3 w-full px-4 py-3"
         >
           {reviseMode ? "Revise plan" : "Send"}
         </button>

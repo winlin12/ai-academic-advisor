@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import router
+from app.api.routes import api_v1_router, system_router
 from app.services.rag import store
 
 logger = logging.getLogger(__name__)
@@ -24,10 +24,18 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(
-    title="AI Academic Advisor",
-    version="0.1.0",
-    description="Local-first academic planning assistant backend.",
+    title="BoilerAdvisor",
+    version="0.3.0",
+    description="Local-first Purdue academic planning assistant backend.",
     lifespan=lifespan,
+    openapi_tags=[
+        {"name": "system", "description": "Health and runtime probes (unversioned)."},
+        {"name": "academic", "description": "Read-only catalog data: facets, programs, course search."},
+        {"name": "planning", "description": "Deterministic planner: generate and directly edit plans. No LLM."},
+        {"name": "advisor", "description": "Local-LLM routes: RAG ask, explain-plan, revise-plan."},
+        {"name": "students", "description": "Student profile and saved-plan persistence."},
+        {"name": "admin", "description": "Read-only database browsing for the admin page."},
+    ],
 )
 
 app.add_middleware(
@@ -41,13 +49,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(router)
+# Health probes stay at the root so infra checks never chase API versions; all product
+# routes live under /v1 (see app/api/routes.py).
+app.include_router(system_router)
+app.include_router(api_v1_router)
 
 
-@app.get("/")
+@app.get("/", tags=["system"])
 def root():
     return {
-        "name": "AI Academic Advisor",
+        "name": "BoilerAdvisor",
         "status": "running",
         "docs": "/docs",
+        "api_prefix": "/v1",
     }

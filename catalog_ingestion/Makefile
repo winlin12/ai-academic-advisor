@@ -1,4 +1,4 @@
-# Runbook for the AI Academic Advisor data stack (rootless podman).
+# Runbook for the BoilerAdvisor data stack (rootless podman).
 # Run all targets from this directory:  make <target>
 #
 #   make up            # start the database + backend API
@@ -13,7 +13,7 @@
 ENGINE     := $(shell command -v podman >/dev/null 2>&1 && echo podman || echo docker)
 COMPOSE    := $(ENGINE) compose
 PG         := catalog-ingestion-postgres
-CONTAINERS := catalog-ingestion-backend catalog-ingestion-postgres
+CONTAINERS := catalog-ingestion-backend catalog-ingestion-postgres catalog-ingestion-adminer
 VOLUMES    := catalog_ingestion_catalog-pg-data catalog_ingestion_catalog-page-cache
 YEAR       ?= 2026-2027
 
@@ -24,7 +24,7 @@ YEAR       ?= 2026-2027
 
 .DEFAULT_GOAL := help
 
-.PHONY: help up down stop status logs psql api db-init load-years load-courses \
+.PHONY: help up down stop status logs psql api adminer db-init load-years load-courses \
         sync-program sync-programs validate counts backup restore reset
 
 help: ## List available commands
@@ -54,6 +54,10 @@ logs: ## Follow the backend logs (Ctrl-C to exit)
 ## --- inspect the database --------------------------------------------------
 psql: ## Open a psql shell into the database
 	$(ENGINE) exec -it $(PG) psql -U catalog -d catalog_ingestion
+
+adminer: ## Start the Adminer DB browser (http://localhost:8081, server "postgres", user/pass "catalog")
+	$(COMPOSE) up -d --no-deps adminer
+	@echo "Adminer: http://localhost:8081  (System: PostgreSQL, Server: postgres, User: catalog, Password: catalog, DB: catalog_ingestion)"
 
 counts: ## Print row counts for the main tables
 	@$(ENGINE) exec $(PG) psql -U catalog -d catalog_ingestion -At -c "\

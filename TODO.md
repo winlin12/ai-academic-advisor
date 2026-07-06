@@ -1,6 +1,6 @@
-# TODO — AI Academic Advisor
+# TODO — BoilerAdvisor
 
-Working notes and next steps. Last updated 2026-07-05.
+Working notes and next steps. Last updated 2026-07-06 (renamed from "AI Academic Advisor" to **BoilerAdvisor** the same day).
 
 ## Current State
 
@@ -9,38 +9,39 @@ Working notes and next steps. Last updated 2026-07-05.
 - ✅ Deterministic planner: validates prerequisites, term offerings, credit caps
 - ✅ RAG advisor: answers questions about courses with sources
 - ✅ LFM2 agent: proposes plan revisions, deterministic planner validates
-- ✅ Database persistence: `students`/`plans` tables + API routes exist (`POST /students`, `POST /students/{id}/plans`)
-- ✅ Web UI: asks questions, generates a plan, revises it with feedback
-- ✅ API: `/plan/generate`, `/advisor/ask`, `/advisor/revise-plan`
+- ✅ Web UI: onboarding profile form (no hardcoded demo profile), plan generation, direct editing (move/remove per course, add via debounced catalog search), advisor ask/revise chat
+- ✅ **Plan persistence, wired end-to-end**: onboarding calls `POST /v1/students`; every accepted edit/revision/regeneration autosaves via `POST /v1/students/{id}/plans`; a reload restores the newest saved plan (student id in `localStorage`). Save-status chip surfaces Saved/Saving/failed/DB-down.
+- ✅ **Database browsing**: read-only `/admin` page (table counts + paged rows via `GET /v1/admin/*`, whitelisted tables only) and an Adminer container (`make adminer` → http://localhost:8081) for full editing.
+- ✅ **Purdue black & gold UI** ("BoilerAdvisor"): design tokens in `globals.css`, top navigation (Planner / Database), onboarding hero, dark theme throughout. Root cause of the old "unstyled" look: Tailwind was never compiling — `tailwind.config.ts` + `postcss.config.mjs` didn't exist; they do now.
+- ✅ API: versioned `/v1` prefix with tagged domain routers (`academic`, `planning`, `advisor`, `students`, `admin`); `/v1/plan/generate`, `/v1/plan/edit`, `/v1/advisor/ask`, `/v1/advisor/revise-plan`
+- ✅ Direct plan editing: `POST /v1/plan/edit` (`services/plan_editor.py`) — deterministic move/add/remove with placement-preserving re-validation, no LLM
 
 **What's missing / rough:**
-- ❌ Degree programs: 0 rows (data lost on machine move — must re-crawl)
-- ❌ Program requirements: 0 rows (depends on programs)
+- ⏳ Degree programs: **crawl in progress** (2026-07-06; ~32h run). Counts below are a snapshot mid-crawl.
 - ❌ Graduate programs: not ingested yet
 - ❌ Prerequisite rules: 0 rows (Purdue doesn't publish; need separate source)
-- ❌ **No direct plan editing.** You cannot move, add, or remove a single course in a specific semester. The only two ways to change a plan are full regenerate (from the hardcoded demo profile) or LLM-mediated free-text revision, which is limited to the knobs in `PlanEditProposal` (reorder / defer / avoid-tags / credit cap) — see [Priority 2](#priority-2-direct-plan-editing).
-- ❌ **No database browsing/admin UI.** The only way to look inside the DB is `make psql` or `make counts` from a terminal — there's no pgAdmin/Adminer container and no admin route in the API. See [Priority 6](#priority-6-database-browsing--admin-visibility).
-- ⚠️ **API surface is inconsistent.** One flat, untagged `APIRouter` mixes RPC-style routes (`/plan/generate`, `/advisor/ask`) with REST-style ones (`/academic/programs/{id}`, `/students/{id}`), with no versioning. `/catalog/courses` is a vestigial route that reads a bundled JSON fixture (`app/services/catalog.py`) instead of the real database, duplicating `/academic/courses/search`. `ExplainPlanRequest.plan` is an untyped `dict` instead of `PlanResponse`. The `students`/`plans` persistence routes are implemented but the web client never calls them. See [Priority 5](#priority-5-api-surface-cleanup).
-- ⚠️ **UI is a single hardcoded demo profile**, one flat orange/stone color theme, no navigation between views, and a profile panel that only ever displays 3 read-only fields (name/degree/target graduation) with a single "Regenerate Plan" button. See [Priority 3](#priority-3-web-ui-program-picker) and [Priority 7](#priority-7-ui-visual-pass).
+- ⚠️ **No program/major picker in the UI** — degree program is free text until the crawl fills `programs`; then build the picker (Priority 3).
+- ⚠️ **"Edit profile" creates a new student row** — there's no `PUT /v1/students/{id}`, so editing re-creates the student and re-points `localStorage`. Old rows accumulate harmlessly; add an update route to fix properly.
+- ⚠️ Saved-plan history is write-only from the UI — every save appends a `plans` row, but the UI only ever loads the newest one. No history browser/restore yet (rows are visible in `/admin`).
 
-**Database state** (`make counts` to verify):
+**Database state** (`make counts` to verify — snapshot taken mid-crawl 2026-07-06):
 
 | Table | Rows | Status |
 |-------|------|--------|
 | courses | 10,575 | ✅ Full 2026-2027 import |
 | subjects | 208 | ✅ Ready |
-| programs | 0 | ⚠️ **Needs crawl** |
-| requirement_groups | 0 | ⚠️ **Blocked on programs** |
-| requirement_options | 0 | ⚠️ **Blocked on programs** |
+| programs | 10+ | ⏳ **Crawl running** (~959 total expected) |
+| requirement_groups | 316+ | ⏳ Filling as programs land |
+| requirement_options | 764+ | ⏳ Filling as programs land |
 | colleges | 0 | ⚠️ Side-effect of program crawl |
 | departments | 0 | Not implemented |
-| academic_rules (RAG) | 10,575 | ✅ All courses embedded |
+| academic_rules (RAG) | 10,575 | ✅ All courses embedded (requirement chunks pending crawl) |
 
-**Impact:** Program-driven plans and major-specific RAG answers don't work yet.
+**Impact:** Program-driven plans and major-specific RAG answers unlock as the crawl completes (then re-run the RAG ingest for requirement chunks).
 
 ---
 
-## Priority 1: Re-crawl Degree Programs (Blocker)
+## Priority 1: Re-crawl Degree Programs (⏳ in progress 2026-07-06)
 
 **Why:** Without programs and requirements, major-specific questions fail. The data was lost when the machine changed. This unblocks many web features.
 
@@ -68,91 +69,80 @@ cd catalog_ingestion && make counts  # should show programs > 0
 
 ---
 
-## Priority 2: Direct Plan Editing
+## Priority 2: Direct Plan Editing (✅ done 2026-07-06, including persistence)
 
-**Why:** Right now a generated plan can only be replaced wholesale (regenerate) or nudged indirectly through the LLM's limited proposal knobs (reorder/defer/avoid-tags/credit-cap via `/advisor/revise-plan`). There is no way to grab one course and move it to a different semester, drop a single course, or manually add one — which is the single most-requested "edit my plan" interaction.
+**Why:** A generated plan could only be replaced wholesale (regenerate) or nudged indirectly through the LLM's limited proposal knobs. Now a student can grab one course and move/add/remove it directly — and it sticks.
 
-**Scope:** ~6-8 hours.
+**Done:**
+1. ✅ `POST /v1/plan/edit` (`backend/app/services/plan_editor.py` + `api/routers/planning.py`) takes `{plan, operation: "move"|"add"|"remove", course_code, target_semester, profile?}`, applies the edit, and re-validates the layout placement-preservingly (prereqs via `planner.prereqs_satisfied`, term offerings, credit caps) — no LLM involved. Tests in `backend/tests/test_plan_editor.py`.
+2. ✅ Each `CoursePill` has a "Move to..." semester dropdown and a remove (×) affordance; `SemesterCard` shows all warnings (not just the first).
+3. ✅ Per-semester "Add course" debounced search box (`clients/web/components/AddCourseSearch.tsx`, reuses `GET /v1/academic/courses/search`).
+4. ✅ Edits persist: the web client creates the student at onboarding (`POST /v1/students`, id in `localStorage`) and autosaves every accepted edit/revision/regeneration through `POST /v1/students/{id}/plans` (`persistPlan` in `clients/web/app/page.tsx`); a reload fetches `GET /v1/students/{id}` and restores `plans[0]`. Failures degrade to a visible status chip, never a blocked edit.
 
-**Steps:**
-1. Add a small, deterministic edit API (e.g. `POST /plan/edit` taking `{plan, op: "move"|"add"|"remove", course_code, target_semester}`) that re-runs the planner's validation (prereqs, term offerings, credit caps) against the edited layout and returns updated warnings — no LLM involved, this is just direct manipulation.
-2. In `SemesterCard`, make each `CoursePill` support drag-and-drop (or a simple "move to..." dropdown) between semesters, plus a remove (×) affordance.
-3. Add an "Add course" search box per semester (reuse `GET /academic/courses/search`).
-4. Wire edits through the existing (currently unused) `POST /students/{id}/plans` so an edited plan actually persists — see [Priority 5](#priority-5-api-surface-cleanup) for cleaning up that route first if needed.
-
-**Test:** Can drag CS381 from semester 2 to semester 3, see credit totals and warnings update immediately, and reload the page without losing the edit.
+**Test:** Move CS536 from semester 1 to semester 2, see credit totals and warnings update immediately; reload the page and the moved layout comes back from the DB. Verified end-to-end 2026-07-06.
 
 ---
 
-## Priority 3: Web UI Program Picker
+## Priority 3: Web UI Program Picker (profile form ✅ done; picker blocked on Priority 1)
 
-**Why:** The web UI hardcodes a demo profile. Users need to pick their actual major.
+**Why:** ~~The web UI hardcodes a demo profile.~~ Done 2026-07-06: the hardcoded `demoProfile` is gone — first visit shows a profile setup form (`clients/web/components/ProfileSetup.tsx`: name, degree text, start term/year, credit cap, completed/remaining courses via catalog-search chips). What's still missing is picking a real *program* so requirements drive the plan.
 
-**Scope:** ~4 hours once programs are loaded.
+**Scope:** ~3 hours once programs are loaded.
 
 **Steps:**
-1. Replace hardcoded `demoProfile` in `clients/web/app/page.tsx` with a program selector
+1. In `ProfileSetup`, replace the free-text degree field with a program selector
 2. Call `GET /academic/facets` to list colleges/majors
 3. Fetch requirements with `GET /academic/programs/{id}`
-4. Build a stepper: college → major → term → completed courses
-5. Feed the real profile into `generatePlan()`
+4. Set `program_id` on the profile so the backend derives `remaining_courses` from real requirement rows (the plumbing already exists in `planner_catalog.py`)
 
 **Test:** Can create a CS major profile and see CS-specific plans.
 
 ---
 
-## Priority 4: Course Search & Editing
+## Priority 4: Course Search & Editing (steps 1+3 ✅ done 2026-07-06)
 
 **Why:** Entering completed courses should be fast.
 
-**Scope:** ~3 hours.
+**Done:**
+1. ✅ Searchable course input in the profile form (`clients/web/components/CourseChipInput.tsx`, debounced `GET /academic/courses/search`; Enter adds the raw typed code so it works offline too)
+3. ✅ Selected courses render as removable chips
 
-**Steps:**
-1. Add a searchable course input to the profile editor (debounced `GET /academic/courses/search`)
-2. Allow bulk import from transcript (copy-paste list of codes)
-3. Display selected courses as chips; allow removal
-
----
-
-## Priority 5: API Surface Cleanup
-
-**Why:** The API "looks horrible" in its current state — one flat, untagged `APIRouter` (`backend/app/api/routes.py`) mixing RPC-style verbs (`/plan/generate`, `/advisor/ask`, `/advisor/revise-plan`) with REST resources (`/academic/programs/{id}`, `/students/{id}`), no versioning, and at least one dead/duplicate route.
-
-**Scope:** ~4-5 hours.
-
-**Steps:**
-1. Group routes with FastAPI `tags=[...]` (or split into per-domain routers: `academic`, `planning`, `advisor`, `students`) so `/docs` reads as organized sections instead of one long list.
-2. Remove or redirect `/catalog/courses` (`app/services/catalog.py`, a bundled JSON fixture) — it duplicates `/academic/courses/search` against the real DB and is confusing dead weight.
-3. Type `ExplainPlanRequest.plan` as `PlanResponse` instead of a bare `dict` (schemas.py:161-163).
-4. Decide whether `/students` + `/students/{id}/plans` are worth wiring into the UI (see [Priority 2](#priority-2-direct-plan-editing)) or removing if the direction changes — right now they're implemented but orphaned.
-5. Consider a consistent `/v1` prefix before more routes accumulate.
+**Remaining:**
+2. Bulk import from transcript (copy-paste list of codes)
 
 ---
 
-## Priority 6: Database Browsing & Admin Visibility
+## Priority 5: API Surface Cleanup (✅ done 2026-07-06)
 
-**Why:** There's currently no way to see or navigate the database outside a terminal — no pgAdmin/Adminer, no admin page, no table browser. `make psql` / `make counts` work but require dropping to a shell.
-
-**Scope:** ~1-2 hours for a browser-based DB client; more if building custom admin views.
-
-**Steps (pick one):**
-1. **Fastest:** add an [Adminer](https://www.adminer.org/) (or pgAdmin) service to `catalog_ingestion/docker-compose.yml` pointed at the `postgres` service, exposed on its own port — gives full table browsing/editing for free.
-2. **More integrated:** build a minimal `/admin` page in `clients/web` backed by a few read-only API routes (list students, list saved plans, program/requirement counts) — less powerful than Adminer but stays inside the app's own auth boundary if one is ever added.
-
-**Test:** Can view `students`, `plans`, `programs`, and `courses` row contents without opening a terminal.
+**Done:**
+1. ✅ Split the flat router into per-domain tagged routers under `backend/app/api/routers/` (`system`, `academic`, `planning`, `advisor`, `students`), aggregated in `api/routes.py`; `/docs` now reads as organized sections.
+2. ✅ Removed `/catalog/courses` — the bundled fixture (`app/services/catalog.py`) survives only as the planner's documented offline fallback, no longer an API route.
+3. ✅ `ExplainPlanRequest.plan` is typed as `PlanResponse` (and the response as `ExplainPlanResponse`); course search returns a typed `AcademicCourseSearchResponse`.
+4. ✅ Kept `/students` + `/students/{id}/plans`: they're the persistence target for Priority 2 step 4 — and as of 2026-07-06 the web client actually uses them (onboarding + plan autosave).
+5. ✅ All product routes live under `/v1`; health probes stay unversioned at the root for infra checks.
 
 ---
 
-## Priority 7: UI Visual Pass
+## Priority 6: Database Browsing & Admin Visibility (✅ done 2026-07-06 — both options)
 
-**Why:** The UI currently reads as messy/bland — a single flat orange/stone gradient theme applied uniformly everywhere, no visual hierarchy beyond a 3-column grid, no navigation between views, and `StudentProfilePanel` only ever renders 3 static read-only fields with one "Regenerate Plan" button.
+**Done:**
+1. ✅ **Adminer** service in `catalog_ingestion/docker-compose.yml` (`make adminer` → http://localhost:8081; no `depends_on`, so starting it never touches a running postgres/crawl). Full table browsing/editing.
+2. ✅ **`/admin` page** in `clients/web` backed by read-only API routes: `GET /v1/admin/tables` (row counts) and `GET /v1/admin/tables/{table}` (paged rows). Strict table whitelist in `backend/app/services/admin_db.py` (`academic_rules` drops its pgvector column), rows serialized via `to_jsonb`, no write routes at all. Tests in `backend/tests/test_admin_db.py`.
 
-**Scope:** ~4-6 hours; depends on how far the redesign goes.
+**Test (passes):** Can view `students`, `plans`, `programs`, and `courses` row contents without opening a terminal.
 
-**Steps:**
-1. Establish a real design system (spacing/type scale, a second accent color for distinguishing warnings/success/info beyond amber-vs-emerald pills) rather than one repeated gradient class.
-2. Add actual navigation/structure once there's more than one view (profile creation, plan, admin — Priorities 2, 3, 6) instead of everything crammed into a single page's 3-column grid.
-3. Make `StudentProfilePanel` reflect real, editable profile data once Priority 3 lands, instead of 3 hardcoded display fields.
+---
+
+## Priority 7: UI Visual Pass (✅ done 2026-07-06 — Purdue black & gold)
+
+**Root cause found:** the old UI looked "unstyled defaults" because **Tailwind was never compiling** — the app had no `tailwind.config.ts`/`postcss.config.mjs`, so every utility class was dead text and pages rendered as browser-default HTML. Both files exist now; if the UI ever regresses to plain HTML, check them first.
+
+**Done:**
+1. ✅ Design system in `globals.css`: Purdue palette (Boilermaker Gold `#CFB991`, Field `#DDB945`, Dust `#EBD99F`, Aged `#8E6F3E` on warm black), Barlow Condensed display type + Space Grotesk body, and reusable primitives (`.card`, `.card-accent`, `.kicker`, `.btn-gold`, `.btn-ghost`, `.field`, `.boiler-stripe`). Gold is reserved for identity/action; amber = warnings, emerald = success.
+2. ✅ Navigation: sticky black top bar (`components/NavBar.tsx`) with Planner/Database links and the gold "boiler stripe" rule; footer disclaimer. Views: onboarding hero, planner (3-column), `/admin`.
+3. ✅ `StudentProfilePanel` shows the real profile (name/degree/start/credit cap/completed count/target graduation) with Regenerate / Edit profile / Start over actions.
+
+**Possible future polish:** plan-history browser, drag-and-drop course moves, mobile layout audit, dark/light toggle.
 
 ---
 
@@ -267,6 +257,13 @@ make psql                           # SQL prompt
 - PurdueIO importer
 - Can import additional years (fast)
 
+### 5. BoilerAdvisor Rebrand, Persistence Wiring, Admin UI, Purdue Theme (✅ Done 2026-07-06)
+- Renamed app to **BoilerAdvisor** (FastAPI title, web title/nav, docs)
+- Web client wired to `students`/`plans` persistence: onboarding creates the student, edits autosave, reloads restore the newest plan
+- Hardcoded demo profile removed — onboarding profile form with catalog-search course chips
+- Read-only `/admin` DB browser (+ `GET /v1/admin/*` routes) and Adminer container (`make adminer`)
+- Purdue black & gold redesign; fixed Tailwind never compiling (missing configs)
+
 ---
 
 ## Development Commands
@@ -277,12 +274,21 @@ cd backend && pytest                      # run all tests
 pytest -xvs tests/test_planner.py        # specific test file
 ```
 
+**Frontend:**
+```bash
+cd clients/web
+npm run dev                               # http://localhost:3000
+npm run build                             # production build + typecheck
+```
+
 **Database:**
 ```bash
 cd catalog_ingestion
 make psql                                 # SQL prompt
 make counts                               # row counts by table
+make adminer                              # Adminer at http://localhost:8081
 ```
+Read-only browsing also at http://localhost:3000/admin.
 
 **Debugging:**
 - API docs at http://localhost:8000/docs
@@ -300,3 +306,6 @@ make counts                               # row counts by table
 - **Prerequisite gap:** Purdue doesn't publish prerequisites in Acalog; real prereqs in Banner/myPurduePlan (separate sourcing needed)
 - **Fixed (2026-07-05):** `planner.next_term` now correctly crosses year boundaries (fall 2026 → spring 2027)
 - **Removed:** `clients/web/lib/mockData.ts` and unused `explainPlan()` client code
+- **Tailwind requires its config files:** `clients/web/tailwind.config.ts` + `postcss.config.mjs` are what make Tailwind compile at all. The app shipped for weeks without them and every utility class silently rendered as unstyled HTML. Config changes need a dev-server restart.
+- **CSS `@import` must be first:** the Google Fonts import in `globals.css` has to precede the `@tailwind` directives, or browsers drop it after Tailwind expands (fonts silently fall back).
+- **Laptop sleep pauses the crawl:** Docker Desktop's VM suspends with the host, so the `sync-programs` container stops fetching while the Mac sleeps and resumes on wake (tenacity retries + the page cache absorb the interrupted request). For the full ~32 h run, prefer an always-on host — the Makefile auto-detects podman vs. Docker, so the stack runs unchanged on a Linux server (`make backup` → copy → `make restore`, then restart `make sync-programs`, ideally copying the page-cache volume too).

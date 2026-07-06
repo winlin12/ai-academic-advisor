@@ -1,7 +1,8 @@
-# Project Structure
+# Project Structure — BoilerAdvisor
 
 A file-by-file map of this repo. See [`README.md`](README.md) for setup/usage and
-[`TODO.md`](TODO.md) for what's missing and planned next.
+[`TODO.md`](TODO.md) for what's missing and planned next. (The repo directory is still
+named `ai-academic-advisor`; the product was renamed **BoilerAdvisor** on 2026-07-06.)
 
 The project has three independent parts that talk to each other over HTTP/Postgres:
 
@@ -49,16 +50,25 @@ bundled fixture when that DB is unavailable.
 
 | File | Description |
 |------|-------------|
-| `main.py` | FastAPI app entrypoint. Registers CORS (allows `localhost:3000`), mounts the single `router` from `api/routes.py`, and on startup best-effort creates the pgvector RAG schema (swallows errors so the app still boots if the DB is down). |
+| `main.py` | FastAPI app entrypoint. Registers CORS (allows `localhost:3000`), mounts `system_router` unversioned (health probes) and `api_v1_router` under `/v1`, declares the OpenAPI tag metadata, and on startup best-effort creates the pgvector RAG schema (swallows errors so the app still boots if the DB is down). |
 | `core/config.py` | `Settings` (pydantic-settings) — loads `backend/.env` by absolute path so it works regardless of CWD; holds `ollama_base_url`, `academic_database_url`, RAG knobs, etc. |
-| `api/routes.py` | **All** HTTP routes in one flat, untagged `APIRouter`: health checks, `/catalog/courses` (legacy fixture route), `/academic/*` (facets/programs/course search — real DB), `/plan/generate`, `/students*` (profile/plan persistence), `/advisor/*` (ask, explain-plan, revise-plan). See `TODO.md` Priority 5 for planned cleanup. |
-| `models/schemas.py` | All Pydantic request/response models: `Course`, `StudentProfile`, `PlanResponse`/`SemesterPlan`/`PlannedCourse`, academic-DB models (`AcademicProgramDetail`, `RequirementBlockDetail`, ...), persistence models (`StudentRecord`, `SavedPlan`), advisor models (`AdvisorAskRequest/Response`, `RevisePlanRequest/Response`, `PlanEditProposal`). |
+| `api/routes.py` | Route aggregation only: composes the per-domain routers (including `admin`) into `api_v1_router` (prefix `/v1`) and re-exports `system_router` for unversioned mounting. The old flat router is gone (TODO Priority 5). |
+| `api/deps.py` | Cross-router helpers: `academic_db_unavailable` (503 mapping) and `resolve_for_planning` (profile/catalog resolution with the 404/503 error ladder), so routers stay leaf modules with no dependencies on each other. |
+| `api/routers/system.py` | `GET /health`, `GET /health/ollama` — mounted unversioned so infra checks never chase API versions. |
+| `api/routers/academic.py` | `/v1/academic/*` (facets, programs, program detail, course search — real DB), tag `academic`. The vestigial `/catalog/courses` fixture route was removed here. |
+| `api/routers/planning.py` | `/v1/plan/generate` and `/v1/plan/edit` (deterministic direct editing — see `services/plan_editor.py`), tag `planning`. Never touches Ollama. |
+| `api/routers/advisor.py` | `/v1/advisor/*` (ask, explain-plan, revise-plan), tag `advisor` — the only routes that spend local model compute. |
+| `api/routers/students.py` | `/v1/students*` profile/plan persistence, tag `students`. Used by the web client for onboarding + plan autosave (TODO Priority 2 step 4). |
+| `api/routers/admin.py` | `/v1/admin/*` read-only DB visibility for the web `/admin` page (TODO Priority 6): `GET /admin/tables` (row counts), `GET /admin/tables/{table}` (paged rows). Deliberately has no write routes; unknown tables 404. |
+| `models/schemas.py` | All Pydantic request/response models: `Course`, `StudentProfile`, `PlanResponse`/`SemesterPlan`/`PlannedCourse`, academic-DB models (`AcademicProgramDetail`, `RequirementBlockDetail`, ...), persistence models (`StudentRecord`, `SavedPlan`), admin models (`AdminTableInfo`, `AdminTablesResponse`, `AdminTableRowsResponse`), advisor models (`AdvisorAskRequest/Response`, `RevisePlanRequest/Response`, `PlanEditProposal`), plan-edit models (`PlanEditRequest` with the `move`/`add`/`remove` Literal and a validator requiring `target_semester` for placements), and typed envelopes (`ExplainPlanRequest/Response` — `plan` is a structured `PlanResponse`, not a `dict` — and `AcademicCourseSearchResponse`). |
 | `services/catalog.py` | Loads the bundled 8-course `data/courses.json` fixture. This is the **offline fallback** catalog used when the academic DB is unreachable or a course code isn't found there — not dead code, but not the primary data source either. |
 | `services/academic_db.py` | Read-only queries against the real `catalog_ingestion` Postgres DB (`catalog_years → programs → requirement_groups → requirement_options → courses`), mapped onto the API's response models. Powers `/academic/*`. |
 | `services/planner.py` | The deterministic planner core: given a profile + a catalog (list of `Course`), greedily schedules remaining courses across semesters respecting credit caps, warns on issues. `next_term()` advances fall→spring→summer→fall, crossing year boundaries correctly. Pure/no I/O — this is the "source of truth" the LLM proposals are always re-validated against. |
 | `services/planner_catalog.py` | Bridges `planner.py` to the real database: builds a `Course` catalog from DB rows instead of the fixture, and when `StudentProfile.program_id` is set, derives `remaining_courses` from that program's actual requirement rows (with choose-N selection logic) instead of trusting client-supplied course codes. Falls back to the fixture catalog on DB errors for profiles without a `program_id`. |
+| `services/plan_editor.py` | Deterministic direct-edit engine behind `POST /v1/plan/edit` (TODO Priority 2). Applies one `move`/`add`/`remove` to a plan layout and re-validates it *placement-preservingly* — prereqs via `planner.prereqs_satisfied` (never re-implemented), term offerings, credit caps — surfacing violations as warnings instead of reflowing the student's manual placement. Course facts come from the DB (`fetch_courses_by_codes`) with the fixture as offline fallback; no LLM involved. |
 | `services/advisor_agent.py` | The "AI proposes, planner disposes" revise-plan agent. Sends the profile + baseline plan + free-text feedback to the local LLM, gets back a structured `PlanEditProposal` (reorder/defer/avoid-tags/credit-cap — never a raw schedule), applies it, and re-validates through `planner.py` with a retry loop if the result is worse than the baseline. |
-| `services/students_db.py` | Thin JSONB store/fetch for the `students` and `plans` Postgres tables (profiles and plans stored exactly as the API serializes them). Backs the `/students*` routes — currently unused by the web client (see `TODO.md`). |
+| `services/students_db.py` | Thin JSONB store/fetch for the `students` and `plans` Postgres tables (profiles and plans stored exactly as the API serializes them). Backs the `/students*` routes, which the web client now uses for onboarding + plan autosave. |
+| `services/admin_db.py` | Read-only browsing service behind `/v1/admin/*` (TODO Priority 6): explicit `BROWSABLE_TABLES` whitelist (anything else raises `UnknownTableError` → 404), rows serialized as JSONB via `to_jsonb` (Postgres handles UUID/timestamp conversion), `academic_rules`' pgvector `embedding` column stripped, `ctid`-ordered pagination clamped to 200 rows/page. No write paths exist. |
 | `services/ollama_client.py` | HTTP client for a local/self-hosted Ollama endpoint. `is_local_model_endpoint()` guards against accidentally pointing at a public/cloud host (allows localhost, private LAN ranges, and Tailscale's `100.64.0.0/10`) so a misconfigured `.env` can't spend cloud money. Also exposes `embed()` for the RAG pipeline. |
 | `services/rag/__init__.py` | Documents the RAG module's layering: `store.py` (Postgres/pgvector only) → `pipeline.py` (composes store + `ollama_client.embed`) — kept decoupled so either side can be swapped independently. |
 | `services/rag/store.py` | The only module that talks to pgvector directly: schema creation (`ensure_schema`), upsert, and cosine-similarity search over the `academic_rules` table. Works with plain `list[float]` vectors and dict rows — knows nothing about Ollama. |
@@ -74,6 +84,8 @@ bundled fixture when that DB is unavailable.
 |------|-------------|
 | `test_planner.py` | Exercises `generate_plan()` against the bundled fixture catalog — semester generation, credit caps, warnings. |
 | `test_planner_catalog.py` | Tests the planner↔DB bridge with DB calls monkeypatched: code normalization, row→`Course` mapping, choose-N selection, and the fixture fallback when the DB is down. |
+| `test_plan_editor.py` | Tests the direct-edit engine against the fixture catalog injected straight into `apply_plan_edit` (no DB, no HTTP): move/add/remove semantics, prereq/term/credit-cap warnings, code normalization, input-plan immutability, and the `PlanEditRequest` validator. |
+| `test_admin_db.py` | Tests the admin browsing service's pure parts (no DB): whitelist rejection (incl. injection-shaped names), hidden-column projection, page-size clamping via a faked connection. |
 | `test_advisor_agent.py` | Tests the revise-plan agent's proposal-application and retry logic with a stubbed model transport (canned JSON, no real Ollama/network). |
 | `test_ollama_client.py` | Tests `is_local_model_endpoint()` — loopback/private-LAN/Tailscale allowed, public hosts rejected. |
 | `test_ingest_catalog.py` | Tests the pure chunk-formatting functions in `rag/ingest_catalog.py` (no DB, no model). |
@@ -88,8 +100,8 @@ Ships its own CLI (`catalog-ingest`), Alembic migrations, and a `Makefile` runbo
 
 | File | Description |
 |------|-------------|
-| `Makefile` | The runbook — `make up`/`down`/`stop`, `make db-init`, `make load-courses`, `make sync-programs`, `make backup`/`restore`, `make counts`, `make psql`. Auto-detects podman vs. Docker Desktop. |
-| `docker-compose.yml` | Three services: `postgres` (pgvector/pgvector:pg16, port 5433), `ingestion` (Playwright-based CLI container, source bind-mounted for live edits), `backend` (builds `../backend`, hardcodes its own DB/Ollama URLs — does **not** read `backend/.env`). |
+| `Makefile` | The runbook — `make up`/`down`/`stop`, `make db-init`, `make load-courses`, `make sync-programs`, `make backup`/`restore`, `make counts`, `make psql`, `make adminer`. Auto-detects podman vs. Docker Desktop. |
+| `docker-compose.yml` | Four services: `postgres` (pgvector/pgvector:pg16, port 5433), `ingestion` (Playwright-based CLI container, source bind-mounted for live edits), `backend` (builds `../backend`, hardcodes its own DB/Ollama URLs — does **not** read `backend/.env`), and `adminer` (browser DB client on port 8081; no `depends_on`, so starting it never restarts a running postgres). |
 | `Dockerfile` | Builds the ingestion image on Microsoft's Playwright image (Chromium + all system libs preinstalled) since the scrape target requires solving an AWS WAF JS challenge; installs the package editable so bind-mounted source edits apply without a rebuild. |
 | `alembic.ini` | Alembic config; migrations live under `src/catalog_ingestion/db/migrations`. |
 | `pyproject.toml` | Package metadata/deps (SQLAlchemy, Alembic, BeautifulSoup, Playwright, Typer, tenacity); `catalog-ingest` console-script entrypoint; ruff/pytest/mypy config. |
@@ -149,42 +161,49 @@ Ships its own CLI (`catalog-ingest`), Alembic migrations, and a `Makefile` runbo
 
 ## `clients/web/` — Next.js frontend
 
-A single-page dashboard (App Router) that calls the backend's `/plan`, `/advisor`, and
-`/academic` routes.
+The BoilerAdvisor UI (App Router, Purdue black & gold): a planner page with onboarding
+and persistence, plus a read-only `/admin` database browser.
 
 | File | Description |
 |------|-------------|
-| `package.json` | Next.js 15 / React 18 / Tailwind app; no test script configured. |
+| `package.json` | Next.js 15 / React 18 / Tailwind app (`boiler-advisor-web`); `dev` + `build` scripts, no test script configured. |
 | `package-lock.json` | npm lockfile for this app (the real one — not the stray root-level file). |
+| `tailwind.config.ts` | **Required for Tailwind to compile at all** (the app long shipped without it, rendering as unstyled HTML). Content globs over `app`/`components`/`lib`, Purdue `boiler.*` palette, `font-display`/`font-body` families. |
+| `postcss.config.mjs` | The other half of the Tailwind fix: declares the `tailwindcss` + `autoprefixer` PostCSS plugins. Config changes here need a dev-server restart. |
 | `tsconfig.json` | TypeScript config; `@/*` path alias maps to the project root, per Next.js convention. |
 | `tsconfig.tsbuildinfo` | Generated TS incremental-build cache; safe to delete. |
 | `next-env.d.ts` | Auto-generated Next.js type reference; do not hand-edit. |
 | `.env.local` | Local override for `NEXT_PUBLIC_API_BASE_URL` (defaults to `http://localhost:8000` in `lib/api.ts` if unset). |
-| `README.md` | **Stale** — describes an earlier "mockData" milestone (Next Steps: "Connect FastAPI backend", "Replace mock data") that has since been completed; the app is already wired to the real backend below. |
+| `README.md` | Frontend runbook: pages, styling primitives, known gaps. |
 | `.next/` | Next.js build output/cache; regenerated by `npm run dev`/`build`, safe to delete. |
 
 ### `clients/web/app/`
 
 | File | Description |
 |------|-------------|
-| `layout.tsx` | Root HTML layout: imports `globals.css`, sets the page title, renders a fixed `.mesh-bg` decorative background behind all pages. |
-| `page.tsx` | The entire app's single page. Holds a **hardcoded** `demoProfile` (name, program, courses, term), calls `generatePlan()` on mount, and renders `StudentProfilePanel` + a column of `SemesterCard`s + `AdvisorChat` in a 3-column grid. No routing, no profile-creation form. |
-| `globals.css` | Tailwind directives plus the site's one color theme (`--brand`/`--bg-1`/`--bg-2` orange/cream CSS variables), the `.card` glass-morphism style, and the `.mesh-bg` gradient. |
+| `layout.tsx` | Root HTML layout: imports `globals.css`, sets the BoilerAdvisor title/metadata, renders the sticky `NavBar`, the fixed `.mesh-bg` decorative background, and the footer disclaimer. |
+| `page.tsx` | The planner. No hardcoded profile: on mount it reads the student id from `localStorage` (`boileradvisor.studentId`) and restores the newest saved plan via `GET /v1/students/{id}` (404 → forget the id, show onboarding). First-run shows a hero + `ProfileSetup`; submit creates the student (`POST /v1/students`), generates the plan, and saves it. `handlePlanEdit` round-trips every move/add/remove through `editPlan()` and `persistPlan` autosaves each accepted edit/revision/regeneration (`POST /v1/students/{id}/plans`) — failures downgrade a save-status chip (Saved/Saving/failed/DB-down) instead of blocking. "Edit profile" re-creates the student row (no update route yet); "Start over" clears the id. |
+| `admin/page.tsx` | Read-only DB browser (TODO Priority 6): table list with row counts (`GET /v1/admin/tables`), paged row grid per table (`GET /v1/admin/tables/{table}`, 25/page), JSON cells truncated with hover titles, link to Adminer for editing. |
+| `globals.css` | Google Fonts `@import` (must stay **before** the `@tailwind` directives or browsers drop it), Tailwind directives, Purdue design tokens (`--gold` #CFB991, `--gold-bright`, `--ink`, `--bg-0/1`, ...), and the theme primitives: `.card`/`.card-accent`, `.kicker`, `.btn-gold`/`.btn-ghost`, `.field`, `.boiler-stripe` (gold/black diagonal rule), `.mesh-bg`, `.scroll-dark`. |
 
 ### `clients/web/components/`
 
 | File | Description |
 |------|-------------|
-| `StudentProfilePanel.tsx` | Read-only card showing name/degree/target-graduation plus a single "Regenerate Plan" button — no editing. |
-| `SemesterCard.tsx` | Displays one semester: title, total credits, a warning-or-"on track" pill, and its list of `CoursePill`s. Read-only — no drag/remove/add. |
-| `CoursePill.tsx` | Smallest display unit: a course code + title in a bordered card. |
-| `AdvisorChat.tsx` | Chat panel with two modes — **Ask** (calls `askAdvisor`, shows RAG source citations) and **Revise** (calls `revisePlan`, shows the LLM's structured proposal summary and hands the revised plan back up via `onPlanRevised`). This is currently the *only* way to change a generated plan short of a full regenerate. |
+| `NavBar.tsx` | Sticky black top bar: gold "B" mark + BoilerAdvisor wordmark, Planner/Database links with active state (`usePathname`), gold boiler-stripe underneath. |
+| `ProfileSetup.tsx` | The onboarding/edit form that replaced the demo profile: name, degree text (program picker pending Priority 3), start term/year, semesters, credit cap, optional target graduation, and two `CourseChipInput`s (completed / to-schedule). Client-side validation; submits a `StudentProfile`. |
+| `CourseChipInput.tsx` | Chip-list editor for course codes: debounced catalog search with clickable results; Enter adds the raw typed code so profiles can be built with the DB down. |
+| `StudentProfilePanel.tsx` | Shows the real profile (name, degree, start, credit cap, completed count, target graduation) with Regenerate / Edit profile / Start over actions. |
+| `SemesterCard.tsx` | Displays one semester: title, total credits, all warning pills (or "on track"), its list of `CoursePill`s with edit controls, and an `AddCourseSearch` box. Edit callbacks (`onMoveCourse`/`onRemoveCourse`/`onAddCourse`) bubble up to `page.tsx`, which round-trips them through `POST /v1/plan/edit`. |
+| `CoursePill.tsx` | Smallest display unit: a course code + title in a bordered card, plus optional edit affordances — a "Move to..." semester dropdown and a remove (×) button. All edit props are optional, so the pill still renders read-only where a plan isn't editable. |
+| `AddCourseSearch.tsx` | Debounced (300 ms, min 2 chars) course search against `GET /v1/academic/courses/search` with a stale-response guard; picking a result calls `onAdd(courseCode)` so the parent can issue the `add` edit. |
+| `AdvisorChat.tsx` | Chat panel with two modes — **Ask** (calls `askAdvisor`, shows RAG source citations) and **Revise** (calls `revisePlan`, shows the LLM's structured proposal summary and hands the revised plan back up via `onPlanRevised`). |
 
 ### `clients/web/lib/`
 
 | File | Description |
 |------|-------------|
-| `api.ts` | All backend calls and their TypeScript types: `generatePlan`, `revisePlan`, `askAdvisor`, plus the `StudentProfile`/`PlanResponse`/`AdvisorSource`/`PlanEditProposal` types mirroring the backend's Pydantic schemas. Does **not** yet wrap the backend's `/students*` persistence routes. |
+| `api.ts` | All backend calls (against the `/v1` prefix) and their TypeScript types: `generatePlan`, `editPlan`, `searchCourses`, `revisePlan`, `askAdvisor`, persistence wrappers (`createStudent`, `getStudent`, `savePlan` + `StudentRecord`/`SavedPlan`/`StudentDetail`), and admin wrappers (`fetchAdminTables`, `fetchAdminTableRows`). Errors throw `ApiError` carrying the HTTP status (so callers can distinguish 404 "student gone" from 503 "DB down") with FastAPI's `detail` as the message. |
 
 ---
 
