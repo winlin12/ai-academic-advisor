@@ -73,6 +73,10 @@ services:
       ACADEMIC_DATABASE_URL: postgresql://catalog:catalog@postgres:5432/catalog_ingestion
       # Ollama (optional, for /advisor/explain-plan) runs on the host, not in the pod.
       OLLAMA_BASE_URL: http://host.containers.internal:11434
+    extra_hosts:
+      # podman provides host.containers.internal natively; Docker only has
+      # host.docker.internal, so map the podman name to the host gateway there too.
+      - "host.containers.internal:host-gateway"
     ports:
       - "8000:8000"
     volumes:

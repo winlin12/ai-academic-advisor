@@ -1,11 +1,28 @@
 import { useState } from "react";
 
-import { askAdvisor, type AdvisorSource } from "@/lib/api";
+import {
+  askAdvisor,
+  revisePlan,
+  type AdvisorSource,
+  type PlanEditProposal,
+  type PlanResponse,
+  type StudentProfile,
+} from "@/lib/api";
 
 type ChatMessage = {
   role: "user" | "assistant";
   content: string;
   sources?: AdvisorSource[];
+  proposal?: PlanEditProposal;
+};
+
+type Mode = "ask" | "revise";
+
+type AdvisorChatProps = {
+  // When a profile + plan are supplied, the chat can also revise the plan in place.
+  profile?: StudentProfile;
+  plan?: PlanResponse | null;
+  onPlanRevised?: (plan: PlanResponse) => void;
 };
 
 // A short, human-readable label for a retrieved chunk, from whatever tags it carries.
@@ -23,7 +40,21 @@ function sourceLabel(source: AdvisorSource): string {
   return `Source ${source.id}`;
 }
 
-export default function AdvisorChat() {
+// Compact one-liner describing the knobs the agent turned, so the edit is inspectable.
+function proposalSummary(proposal: PlanEditProposal): string | null {
+  const parts: string[] = [];
+  if (proposal.reorder.length) parts.push(`earlier: ${proposal.reorder.join(", ")}`);
+  if (proposal.defer.length) parts.push(`deferred: ${proposal.defer.join(", ")}`);
+  if (proposal.avoid_tags.length) parts.push(`avoid: ${proposal.avoid_tags.join(", ")}`);
+  if (proposal.max_credits_per_semester != null) {
+    parts.push(`cap: ${proposal.max_credits_per_semester} cr`);
+  }
+  return parts.length ? parts.join(" · ") : null;
+}
+
+export default function AdvisorChat({ profile, plan, onPlanRevised }: AdvisorChatProps) {
+  const canRevise = Boolean(profile && plan);
+  const [mode, setMode] = useState<Mode>("ask");
   const [prompt, setPrompt] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
@@ -35,6 +66,8 @@ export default function AdvisorChat() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const reviseMode = canRevise && mode === "revise";
+
   async function handleSend() {
     const trimmedPrompt = prompt.trim();
     if (!trimmedPrompt || loading) {
@@ -42,23 +75,33 @@ export default function AdvisorChat() {
     }
 
     setError(null);
-    setMessages((prev) => [
-      ...prev,
-      { role: "user", content: trimmedPrompt },
-    ]);
+    setMessages((prev) => [...prev, { role: "user", content: trimmedPrompt }]);
     setPrompt("");
     setLoading(true);
 
     try {
-      const response = await askAdvisor(trimmedPrompt);
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          content: response.answer || "No response received.",
-          sources: response.sources,
-        },
-      ]);
+      if (reviseMode && profile) {
+        const response = await revisePlan(profile, trimmedPrompt, plan ?? undefined);
+        onPlanRevised?.(response.plan);
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "assistant",
+            content: response.rationale || "Updated the plan.",
+            proposal: response.proposal,
+          },
+        ]);
+      } else {
+        const response = await askAdvisor(trimmedPrompt);
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "assistant",
+            content: response.answer || "No response received.",
+            sources: response.sources,
+          },
+        ]);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unknown error");
     } finally {
@@ -72,6 +115,24 @@ export default function AdvisorChat() {
         Copilot
       </p>
       <h2 className="mb-4 mt-2 text-2xl font-bold text-stone-900">Advisor Chat</h2>
+
+      {canRevise && (
+        <div className="mb-4 flex rounded-full border border-orange-900/10 bg-white/60 p-1 text-xs font-semibold">
+          {(["ask", "revise"] as Mode[]).map((value) => (
+            <button
+              key={value}
+              onClick={() => setMode(value)}
+              className={
+                mode === value
+                  ? "flex-1 rounded-full bg-gradient-to-r from-orange-600 to-orange-500 px-3 py-1.5 text-white shadow"
+                  : "flex-1 rounded-full px-3 py-1.5 text-stone-600 transition hover:text-stone-900"
+              }
+            >
+              {value === "ask" ? "Ask a question" : "Revise my plan"}
+            </button>
+          ))}
+        </div>
+      )}
 
       <div className="mb-4 flex-1 space-y-3 overflow-y-auto rounded-2xl border border-orange-900/10 bg-white/60 p-3 text-center">
         {messages.map((message, index) => (
@@ -87,6 +148,11 @@ export default function AdvisorChat() {
               {message.role === "assistant" ? "Advisor" : "You"}
             </p>
             {message.content}
+            {message.proposal && proposalSummary(message.proposal) && (
+              <p className="mt-2 border-t border-orange-900/10 pt-2 text-left text-xs font-medium text-orange-800">
+                Plan updated — {proposalSummary(message.proposal)}
+              </p>
+            )}
             {message.sources && message.sources.length > 0 && (
               <div className="mt-3 space-y-2 border-t border-orange-900/10 pt-3 text-left">
                 <p className="text-[0.65rem] font-semibold uppercase tracking-wide opacity-60">
@@ -129,7 +195,11 @@ export default function AdvisorChat() {
       <div className="rounded-2xl border border-orange-900/15 bg-white/75 p-3">
         <textarea
           rows={3}
-          placeholder="Ask your advisor..."
+          placeholder={
+            reviseMode
+              ? "Tell me how to adjust the plan, e.g. \"less theory-heavy\" or \"cap me at 6 credits\"..."
+              : "Ask your advisor..."
+          }
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
           className="w-full resize-none rounded-xl border border-orange-900/15 bg-white/70 p-3 text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-orange-500 focus:ring-2 focus:ring-orange-200"
@@ -140,7 +210,7 @@ export default function AdvisorChat() {
           disabled={loading || !prompt.trim()}
           className="mt-3 w-full rounded-xl bg-gradient-to-r from-orange-600 to-orange-500 px-4 py-3 font-semibold text-white shadow-[0_10px_20px_rgba(234,88,12,0.28)] transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60"
         >
-          Send
+          {reviseMode ? "Revise plan" : "Send"}
         </button>
       </div>
     </div>

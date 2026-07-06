@@ -123,7 +123,11 @@ export default function HomePage() {
 
           <div className="lg:col-span-3">
             <div className="lg:sticky lg:top-8">
-              <AdvisorChat />
+              <AdvisorChat
+                profile={demoProfile}
+                plan={plan}
+                onPlanRevised={setPlan}
+              />
             </div>
           </div>
         </div>

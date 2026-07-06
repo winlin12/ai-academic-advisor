@@ -25,6 +25,14 @@ def test_generate_plan_has_semesters():
     assert "CS536" in planned_codes
 
 
+def test_next_term_crosses_calendar_year_at_spring():
+    from app.services.planner import next_term
+
+    assert next_term("fall", 2026) == ("spring", 2027)
+    assert next_term("spring", 2027) == ("summer", 2027)
+    assert next_term("summer", 2027) == ("fall", 2027)
+
+
 def test_unknown_course_warning():
     profile = StudentProfile(
         completed_courses=[],

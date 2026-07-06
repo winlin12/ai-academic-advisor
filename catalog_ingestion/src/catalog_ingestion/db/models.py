@@ -522,3 +522,45 @@ class PurdueapiTermsStaging(Base):
     end_date: Mapped[str | None] = mapped_column(String(32), nullable=True)
     raw_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     imported_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=_now)
+
+
+# ---------------------------------------------------------------------------
+# students / plans (app-side persistence — written by the backend, not ingestion)
+# ---------------------------------------------------------------------------
+
+class Student(Base):
+    __tablename__ = "students"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    # The full StudentProfile as the backend's schema serialises it (program_id, completed
+    # courses, preferences, ...). JSONB rather than columns: the profile shape belongs to the
+    # backend and evolves with it; the ingestion schema only provides durable storage.
+    profile: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=_now, onupdate=_now
+    )
+
+    plans: Mapped[list[StudentPlan]] = relationship(
+        back_populates="student", cascade="all, delete-orphan"
+    )
+
+
+class StudentPlan(Base):
+    __tablename__ = "plans"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    student_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("students.id", ondelete="CASCADE"), nullable=False
+    )
+    # Free-text feedback that produced this plan (revise-plan flow); NULL for a plain generate.
+    feedback: Mapped[str | None] = mapped_column(Text, nullable=True)
+    plan: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=_now)
+
+    student: Mapped[Student] = relationship(back_populates="plans")
+
+    __table_args__ = (
+        Index("ix_plans_student_id", "student_id"),
+    )

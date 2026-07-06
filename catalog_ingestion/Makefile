@@ -8,7 +8,10 @@
 #
 # Override the catalog year on any data target:  make load-courses YEAR=2025-2026
 
-COMPOSE    := podman compose
+# Container engine: rootless podman where available (the original target host), else docker
+# (e.g. macOS with Docker Desktop). All targets work identically under both.
+ENGINE     := $(shell command -v podman >/dev/null 2>&1 && echo podman || echo docker)
+COMPOSE    := $(ENGINE) compose
 PG         := catalog-ingestion-postgres
 CONTAINERS := catalog-ingestion-backend catalog-ingestion-postgres
 VOLUMES    := catalog_ingestion_catalog-pg-data catalog_ingestion_catalog-page-cache
@@ -35,11 +38,11 @@ up: ## Start the database + backend API (http://localhost:8000)
 	@echo "DB:   postgresql://catalog:catalog@localhost:5433/catalog_ingestion"
 
 stop: ## Stop the containers (keeps them and the data)
-	@podman stop -t 5 $(CONTAINERS) 2>/dev/null || true
+	@$(ENGINE) stop -t 5 $(CONTAINERS) 2>/dev/null || true
 	@echo "Stopped (data preserved). Start again with: make up"
 
 down: ## Stop & remove the containers (DATA PERSISTS in the volume)
-	@podman rm -f $(CONTAINERS) 2>/dev/null || true
+	@$(ENGINE) rm -f $(CONTAINERS) 2>/dev/null || true
 	@echo "Removed containers (data volume preserved). Recreate with: make up"
 
 status: ## Show stack status
@@ -50,10 +53,10 @@ logs: ## Follow the backend logs (Ctrl-C to exit)
 
 ## --- inspect the database --------------------------------------------------
 psql: ## Open a psql shell into the database
-	podman exec -it $(PG) psql -U catalog -d catalog_ingestion
+	$(ENGINE) exec -it $(PG) psql -U catalog -d catalog_ingestion
 
 counts: ## Print row counts for the main tables
-	@podman exec $(PG) psql -U catalog -d catalog_ingestion -At -c "\
+	@$(ENGINE) exec $(PG) psql -U catalog -d catalog_ingestion -At -c "\
 	  SELECT 'catalog_years', count(*) FROM catalog_years \
 	  UNION ALL SELECT 'programs', count(*) FROM programs \
 	  UNION ALL SELECT 'requirement_groups', count(*) FROM requirement_groups \
@@ -87,14 +90,14 @@ validate: ## Run data validation for YEAR
 
 ## --- backup / reset --------------------------------------------------------
 backup: ## Dump the database to catalog_db_backup.sql.gz
-	podman exec $(PG) pg_dump -U catalog -d catalog_ingestion | gzip > catalog_db_backup.sql.gz
+	$(ENGINE) exec $(PG) pg_dump -U catalog -d catalog_ingestion | gzip > catalog_db_backup.sql.gz
 	@echo "Wrote catalog_db_backup.sql.gz"
 
 restore: ## Restore the database from catalog_db_backup.sql.gz
-	gunzip -c catalog_db_backup.sql.gz | podman exec -i $(PG) psql -U catalog -d catalog_ingestion
+	gunzip -c catalog_db_backup.sql.gz | $(ENGINE) exec -i $(PG) psql -U catalog -d catalog_ingestion
 
 reset: ## DESTROY all data + volumes, then recreate empty tables
-	@podman rm -f $(CONTAINERS) 2>/dev/null || true
-	@podman volume rm $(VOLUMES) 2>/dev/null || true
+	@$(ENGINE) rm -f $(CONTAINERS) 2>/dev/null || true
+	@$(ENGINE) volume rm $(VOLUMES) 2>/dev/null || true
 	$(COMPOSE) up -d postgres
 	$(COMPOSE) run --rm ingestion db-init

@@ -10,7 +10,13 @@ from app.models.schemas import (
     AdvisorSource,
     ExplainPlanRequest,
     PlanResponse,
+    RevisePlanRequest,
+    RevisePlanResponse,
+    SavedPlan,
+    SavePlanRequest,
+    StudentDetail,
     StudentProfile,
+    StudentRecord,
 )
 from app.services.academic_db import (
     fetch_academic_facets,
@@ -18,10 +24,13 @@ from app.services.academic_db import (
     fetch_program_summaries,
     search_courses,
 )
+from app.services.advisor_agent import revise_plan
 from app.services.catalog import load_catalog
 from app.services.ollama_client import EmbeddingError, LocalModelEndpointError, OllamaClient
 from app.services.planner import generate_plan
+from app.services.planner_catalog import ProgramNotFoundError, resolve_profile_and_catalog
 from app.services.rag.pipeline import answer_question
+from app.services.students_db import create_student, fetch_student, list_students, save_plan
 
 router = APIRouter()
 
@@ -114,10 +123,63 @@ def academic_course_search(
         raise academic_db_unavailable(exc) from exc
 
 
+def _resolve_for_planning(profile: StudentProfile):
+    """Shared profile/catalog resolution for the plan and revise-plan routes.
+
+    Maps the bridge's failure modes onto the API's error ladder: unknown ``program_id`` → 404,
+    academic DB down while a program-driven plan was requested → 503. Profiles without a
+    ``program_id`` never 503 here — they fall back to the bundled fixture catalog.
+    """
+    try:
+        return resolve_profile_and_catalog(profile)
+    except ProgramNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Academic program not found") from exc
+    except psycopg.Error as exc:
+        raise academic_db_unavailable(exc) from exc
+
+
 @router.post("/plan/generate", response_model=PlanResponse)
 def plan_generate(profile: StudentProfile):
-    catalog = load_catalog()
+    profile, catalog = _resolve_for_planning(profile)
     return generate_plan(profile, catalog)
+
+
+@router.post("/students", response_model=StudentRecord, status_code=201)
+def students_create(profile: StudentProfile):
+    try:
+        return create_student(profile)
+    except psycopg.Error as exc:
+        raise academic_db_unavailable(exc) from exc
+
+
+@router.get("/students", response_model=list[StudentRecord])
+def students_list(limit: int = 100):
+    try:
+        return list_students(limit=limit)
+    except psycopg.Error as exc:
+        raise academic_db_unavailable(exc) from exc
+
+
+@router.get("/students/{student_id}", response_model=StudentDetail)
+def students_get(student_id: str):
+    try:
+        student = fetch_student(student_id)
+    except psycopg.Error as exc:
+        raise academic_db_unavailable(exc) from exc
+    if student is None:
+        raise HTTPException(status_code=404, detail="Student not found")
+    return student
+
+
+@router.post("/students/{student_id}/plans", response_model=SavedPlan, status_code=201)
+def students_save_plan(student_id: str, req: SavePlanRequest):
+    try:
+        saved = save_plan(student_id, req.plan, feedback=req.feedback)
+    except psycopg.Error as exc:
+        raise academic_db_unavailable(exc) from exc
+    if saved is None:
+        raise HTTPException(status_code=404, detail="Student not found")
+    return saved
 
 
 @router.post("/advisor/explain-plan")
@@ -153,6 +215,26 @@ Explain the plan clearly. Focus on prerequisites, semester sequencing, warnings,
         raise HTTPException(status_code=502, detail=f"Ollama request failed: {exc}") from exc
 
     return {"answer": answer}
+
+
+@router.post("/advisor/revise-plan", response_model=RevisePlanResponse)
+async def revise_plan_route(req: RevisePlanRequest):
+    """Revise a plan from free-text feedback via the local LFM2 agent.
+
+    The model proposes edits (reorder/defer/avoid-tags/credit-cap) and the deterministic
+    planner re-validates them, so the returned plan is always legal. Error ladder mirrors the
+    other advisor routes: 400 (non-local endpoint), 502 (model transport / bad JSON).
+    """
+    try:
+        client = OllamaClient()
+    except LocalModelEndpointError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    profile, catalog = _resolve_for_planning(req.profile)
+    try:
+        return await revise_plan(profile, catalog, req.feedback, client=client)
+    except Exception as exc:  # httpx / model transport failure
+        raise HTTPException(status_code=502, detail=f"Ollama request failed: {exc}") from exc
 
 
 @router.post("/advisor/ask", response_model=AdvisorAskResponse)

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 import re
+from typing import Any
 from urllib.parse import urlparse
 
 import httpx
@@ -26,6 +28,10 @@ class LocalModelEndpointError(ValueError):
 
 class EmbeddingError(RuntimeError):
     """Raised when the embedding endpoint returns a malformed or wrong-sized vector."""
+
+
+class ModelJSONError(RuntimeError):
+    """Raised when a ``format=json`` generation does not return parseable JSON."""
 
 
 def _is_local_hostname(hostname: str) -> bool:
@@ -103,6 +109,44 @@ USER:
             data = resp.json()
 
         return strip_reasoning(data.get("response", ""))
+
+    async def generate_json(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
+        """Like ``generate`` but constrain the model to emit a single JSON object.
+
+        Ollama's ``format:"json"`` grammar-constrains decoding to valid JSON, which is what
+        makes an 8B local model usable as a structured-output engine (the advisor agent then
+        validates the object against a Pydantic schema). We still ``strip_reasoning`` first in
+        case a reasoning model slips a ``<think>`` block in front of the JSON, and raise
+        ``ModelJSONError`` on anything unparseable so the caller can fall back gracefully.
+        """
+        prompt = f"""
+SYSTEM:
+{system_prompt}
+
+USER:
+{user_prompt}
+""".strip()
+
+        payload = {
+            "model": self.model,
+            "prompt": prompt,
+            "stream": False,
+            "format": "json",
+        }
+
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.post(f"{self.base_url}/api/generate", json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+
+        raw = strip_reasoning(data.get("response", ""))
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ModelJSONError(f"Model did not return valid JSON: {exc}: {raw[:200]!r}") from exc
+        if not isinstance(parsed, dict):
+            raise ModelJSONError(f"Model returned JSON but not an object: {type(parsed).__name__}")
+        return parsed
 
     async def embed(self, text: str, *, task_type: str = "search_document") -> list[float]:
         """Turn one text chunk into an embedding vector via the local embedding model.

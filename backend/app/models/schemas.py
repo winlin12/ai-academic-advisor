@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -94,6 +95,9 @@ class AcademicProgramDetail(BaseModel):
 class StudentProfile(BaseModel):
     name: str = "Student"
     degree_program: str = "Computer Science"
+    # Academic-DB program (programs.id). When set, ``remaining_courses`` is derived from the
+    # program's requirement rows minus ``completed_courses`` — client-listed codes are ignored.
+    program_id: str | None = None
     completed_courses: list[str] = Field(default_factory=list)
     remaining_courses: list[str] = Field(default_factory=list)
     start_term: str = "fall"
@@ -127,9 +131,78 @@ class PlanResponse(BaseModel):
     warnings: list[str]
 
 
+class StudentRecord(BaseModel):
+    """A persisted student: the stored profile plus its row identity."""
+
+    id: str
+    name: str
+    profile: StudentProfile
+    created_at: datetime
+
+
+class SavedPlan(BaseModel):
+    """One plan saved against a student; ``feedback`` records what prompted it, if anything."""
+
+    id: str
+    feedback: str | None = None
+    plan: PlanResponse
+    created_at: datetime
+
+
+class StudentDetail(StudentRecord):
+    plans: list[SavedPlan] = Field(default_factory=list)
+
+
+class SavePlanRequest(BaseModel):
+    plan: PlanResponse
+    feedback: str | None = None
+
+
 class ExplainPlanRequest(BaseModel):
     question: str
     plan: dict
+
+
+class PlanEditProposal(BaseModel):
+    """A structured edit the local model proposes in response to free-text feedback.
+
+    The model never emits a schedule directly — it only nudges the knobs the deterministic
+    planner already understands, and the planner re-derives a legal plan from them. Every
+    field is a preference, not a command: unknown course codes are ignored and the credit cap
+    is clamped, so a hallucinated proposal degrades to a no-op rather than an illegal plan.
+
+    * ``reorder`` — course codes to prioritise earlier, in the given order.
+    * ``defer`` — course codes to push toward later semesters.
+    * ``avoid_tags`` — requirement tags (e.g. ``theory-heavy``) to deprioritise.
+    * ``max_credits_per_semester`` — new per-semester credit cap, if the feedback asks for one.
+    """
+
+    rationale: str = ""
+    reorder: list[str] = Field(default_factory=list)
+    defer: list[str] = Field(default_factory=list)
+    avoid_tags: list[str] = Field(default_factory=list)
+    max_credits_per_semester: int | None = Field(default=None, ge=1, le=24)
+
+
+class RevisePlanRequest(BaseModel):
+    """Ask the local model to revise a plan from free-text feedback.
+
+    ``current_plan`` is optional context for the UI round-trip; the agent always re-derives a
+    fresh baseline from ``profile`` so legality never depends on client-supplied state.
+    """
+
+    profile: StudentProfile
+    feedback: str = Field(min_length=1)
+    current_plan: PlanResponse | None = None
+
+
+class RevisePlanResponse(BaseModel):
+    """The revised (still deterministically-validated) plan plus the model's reasoning."""
+
+    plan: PlanResponse
+    rationale: str
+    proposal: PlanEditProposal
+    iterations: int
 
 
 class AdvisorAskRequest(BaseModel):

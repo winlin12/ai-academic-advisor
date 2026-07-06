@@ -37,8 +37,20 @@ export type PlanResponse = {
   warnings: string[];
 };
 
-export type ExplainPlanResponse = {
-  answer: string;
+// A structured edit the local model proposes in response to free-text feedback.
+export type PlanEditProposal = {
+  rationale: string;
+  reorder: string[];
+  defer: string[];
+  avoid_tags: string[];
+  max_credits_per_semester: number | null;
+};
+
+export type RevisePlanResponse = {
+  plan: PlanResponse;
+  rationale: string;
+  proposal: PlanEditProposal;
+  iterations: number;
 };
 
 // One catalog chunk retrieved to ground the answer (cosine similarity + stored tags).
@@ -74,20 +86,27 @@ export async function generatePlan(
   return response.json();
 }
 
-export async function explainPlan(
-  question: string,
-  plan: PlanResponse,
-): Promise<ExplainPlanResponse> {
-  const response = await fetch(`${API_BASE_URL}/advisor/explain-plan`, {
+// Free-text feedback ("less theory-heavy", "cap me at 6 credits") that the local LFM2 agent
+// turns into a proposal, which the deterministic planner re-validates into a revised plan.
+export async function revisePlan(
+  profile: StudentProfile,
+  feedback: string,
+  currentPlan?: PlanResponse,
+): Promise<RevisePlanResponse> {
+  const response = await fetch(`${API_BASE_URL}/advisor/revise-plan`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ question, plan }),
+    body: JSON.stringify({
+      profile,
+      feedback,
+      current_plan: currentPlan ?? null,
+    }),
   });
 
   if (!response.ok) {
-    throw new Error(`Failed to get advisor response: ${response.status}`);
+    throw new Error(`Failed to revise plan: ${response.status}`);
   }
 
   return response.json();

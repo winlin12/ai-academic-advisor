@@ -4,10 +4,10 @@ TERM_ORDER = ["fall", "spring", "summer"]
 
 
 def next_term(term: str, year: int) -> tuple[str, int]:
+    """Advance one academic term: fall 2026 -> spring 2027 -> summer 2027 -> fall 2027."""
     idx = TERM_ORDER.index(term)
-    if idx == len(TERM_ORDER) - 1:
-        return TERM_ORDER[0], year + 1
-    return TERM_ORDER[idx + 1], year
+    nxt = TERM_ORDER[(idx + 1) % len(TERM_ORDER)]
+    return nxt, year + 1 if nxt == "spring" else year
 
 
 def prereqs_satisfied(course: Course, completed: set[str]) -> bool:
@@ -25,6 +25,12 @@ def generate_plan(profile: StudentProfile, catalog: list[Course]) -> PlanRespons
     if unknown_courses:
         warnings.append(f"Unknown courses ignored: {', '.join(unknown_courses)}")
         remaining = [code for code in remaining if code in catalog_by_code]
+
+    # Treat the order of ``remaining_courses`` as the student's (or the advisor agent's)
+    # preference order: courses listed earlier are scheduled earlier when several are legal in
+    # the same term. This is the knob the LFM2 revise-plan agent turns via reorder/defer — the
+    # planner still guarantees legality (prereqs, term offerings, credit cap) regardless.
+    priority = {code: index for index, code in enumerate(remaining)}
 
     term = profile.start_term.lower()
     year = profile.start_year
@@ -45,6 +51,7 @@ def generate_plan(profile: StudentProfile, catalog: list[Course]) -> PlanRespons
 
         candidates.sort(
             key=lambda c: (
+                priority.get(c.code, len(priority)),
                 "required" not in c.requirement_tags,
                 c.workload_score,
                 c.code,
