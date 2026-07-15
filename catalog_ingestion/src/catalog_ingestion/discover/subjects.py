@@ -35,10 +35,6 @@ class SubjectInfo:
     name: str | None
 
 
-def get_courses_navoid(catoid: int) -> int | None:
-    return KNOWN_COURSES_NAVOIDS.get(catoid)
-
-
 def build_courses_page_url(base_url: str, catoid: int, navoid: int) -> str:
     """URL of the unfiltered courses filter page (used to read the subject dropdown)."""
     return urljoin(base_url, f"/content.php?catoid={catoid}&navoid={navoid}")
@@ -118,19 +114,3 @@ def build_subject_filter_url(
         ("search_database", "Filter"),
     ]
     return urljoin(base_url, f"/content.php?{urlencode(params)}")
-
-
-def discover_subjects_from_course_links(html: str) -> list[SubjectInfo]:
-    """Fall-back: extract subject codes from course code patterns in HTML."""
-    import re
-
-    course_re = re.compile(r"\b([A-Z]{2,6})\s+\d{3,5}\b")
-    seen: set[str] = set()
-    subjects: list[SubjectInfo] = []
-    for match in course_re.finditer(html):
-        code = match.group(1)
-        if code not in seen:
-            seen.add(code)
-            subjects.append(SubjectInfo(code=code, name=None))
-    subjects.sort(key=lambda s: s.code)
-    return subjects

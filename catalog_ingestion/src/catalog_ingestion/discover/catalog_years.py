@@ -81,14 +81,6 @@ def discover_catalog_years(
     return results
 
 
-def find_year(years: list[CatalogYearInfo], label: str) -> CatalogYearInfo | None:
-    """Find a catalog year by its label (e.g. '2026-2027')."""
-    for year in years:
-        if year.label == label:
-            return year
-    return None
-
-
 def find_current_year(years: list[CatalogYearInfo]) -> CatalogYearInfo | None:
     """Return the most recent non-archived year."""
     for year in years:

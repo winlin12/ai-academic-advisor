@@ -110,7 +110,7 @@ python -m app.services.rag.ingest_catalog
 ## Using the App
 
 **Web UI** (http://localhost:3000) — current state, not aspirational:
-- **Onboarding, no demo profile**: first visit lands on a profile setup form (name, degree, start term/year, credit cap, completed courses + courses to schedule via catalog search). There is no hardcoded default student. A major/program *picker* is still pending (degree name is free text until the program crawl fills the `programs` table).
+- **Onboarding, no demo profile**: first visit lands on a profile setup form (name, degree, start term/year, credit cap, completed courses + courses to schedule via catalog search). There is no hardcoded default student. A major/program *picker* is still pending — the `programs` table is now fully populated (1,165 undergrad programs, 2026-2027; see [`TODO.md`](TODO.md) Priority 1), but the UI hasn't been wired up to it yet, so degree name is still free text (Priority 3, the current next goal).
 - **Plans persist**: creating a profile calls `POST /v1/students`, and every accepted edit/revision/regeneration is autosaved through `POST /v1/students/{id}/plans`. The student id lives in `localStorage`; a reload fetches the newest saved plan from the database. A status chip shows Saved / Saving / Save failed / Not saved (DB down).
 - Ask the AI advisor free-text questions (RAG-grounded, cites sources)
 - Revise the plan with free-text feedback (“less theory-heavy”, “cap at 6 credits”) — the model proposes reorder/defer/avoid-tag/credit-cap edits, the deterministic planner re-validates them
@@ -126,7 +126,9 @@ python -m app.services.rag.ingest_catalog
 - `POST /v1/advisor/revise-plan` — revise a plan with free-text feedback (LLM proposes, planner disposes)
 - `POST /v1/advisor/explain-plan` — explain a structured plan
 - `GET /v1/academic/courses/search` — search the real catalog
-- `GET /v1/academic/programs/{id}` — view requirements for a major
+- `GET /v1/academic/facets` — list catalog years/schools/subjects (for building program search filters)
+- `GET /v1/academic/programs` — search/list degree programs (1,165 loaded for 2026-2027); **not yet called from the web UI** (TODO Priority 3)
+- `GET /v1/academic/programs/{id}` — full requirement tree for one program; **not yet called from the web UI** (TODO Priority 3)
 - `POST /v1/students`, `GET /v1/students/{id}`, `POST /v1/students/{id}/plans` — profile/plan persistence (used by the web client for onboarding and plan autosave)
 - `GET /v1/admin/tables`, `GET /v1/admin/tables/{table}` — read-only table counts and paged row browsing (whitelisted tables only; backs the `/admin` page)
 
@@ -165,7 +167,7 @@ The AI proposes, the planner validates. The planner is the source of truth — n
 
 See [`TODO.md`](TODO.md) for:
 - Current database state (what's filled, what's missing)
-- High-priority next steps (program crawl, direct plan editing, API cleanup, DB browsing, web UI buildout)
+- **Current next goal**: the degree-program crawl is complete (1,165 programs, requirements, RAG chunks), but nothing in the web UI calls the `/v1/academic/programs*` endpoints yet — wiring up a degree/requirements lookup and program picker is the next thing to build (TODO.md Priority 3)
 - Technical design decisions and gotchas
 
 ### Testing

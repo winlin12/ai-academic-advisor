@@ -137,7 +137,7 @@ def sync_courses(
 
     from catalog_ingestion.db.session import get_session
     from catalog_ingestion.db.models import CatalogYear
-    from catalog_ingestion.fetch.client import build_fetcher, WafChallengeError
+    from catalog_ingestion.fetch.client import build_fetcher
     from catalog_ingestion.discover.subjects import (
         KNOWN_COURSES_NAVOIDS,
         build_courses_page_url,
@@ -160,7 +160,6 @@ def sync_courses(
             rprint(f"[red]Catalog year {year!r} not found. Run 'discover-years' first.[/red]")
             raise typer.Exit(1)
         catoid = db_year.catoid
-        year_id = db_year.id
 
     navoid = KNOWN_COURSES_NAVOIDS.get(catoid)
     if not navoid:

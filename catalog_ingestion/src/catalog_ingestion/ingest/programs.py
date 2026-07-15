@@ -14,9 +14,8 @@ from catalog_ingestion.db.models import (
     ProgramNote,
     RequirementGroup,
     RequirementOption,
-    SourcePage,
 )
-from catalog_ingestion.ingest.courses import get_or_create_subject, upsert_source_page
+from catalog_ingestion.ingest.courses import upsert_source_page
 from catalog_ingestion.parse.programs import ParsedProgram
 from catalog_ingestion.parse.requirements import RequirementGroupData, RequirementOptionData
 

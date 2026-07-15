@@ -21,10 +21,8 @@ clients/web/         Next.js UI that calls the backend over HTTP
 | `README.md` | Setup instructions, architecture overview, current usage/limitations. |
 | `TODO.md` | Current DB/feature state and prioritized next steps. |
 | `STRUCTURE.md` | This file. |
-| `.gitignore` | Ignores Python caches, `.env`, build artifacts, `node_modules`, and the legacy `purdueio/` data paths (see note below). |
-| `.dockerignore` | Docker build-context excludes; still references a `purdueio/` directory (see note below). |
-| `.env` / `.env.example` | **Legacy/vestigial.** Keys (`POSTGRES_DB`, `ASPNETCORE_ENVIRONMENT`, `SYNC_SCHEDULE`, ...) belong to an earlier "Purdue.io Docker" scraper stack that is no longer part of this repo — there's no root `docker-compose.yml` that reads them. The real, current env files are `backend/.env(.example)` and `catalog_ingestion/.env.example`. Safe to ignore or remove. |
-| `package-lock.json` | An empty npm lockfile (`"packages": {}`) at the repo root with no matching `package.json` — looks like a stray `npm install` run from the wrong directory. Not used by any part of the app (the real frontend lockfile is `clients/web/package-lock.json`). |
+| `.gitignore` | Ignores Python caches, `.env`, build artifacts (incl. `*.egg-info/`), `node_modules`, and `*.tsbuildinfo`. |
+| `.env` | **Legacy/vestigial, untracked.** An unmodified copy of the old "Purdue.io Docker" scraper template (`POSTGRES_DB`, `ASPNETCORE_ENVIRONMENT`, `SYNC_SCHEDULE`, ...) — nothing in this repo reads it. The real env files are `backend/.env(.example)`. Safe to delete. (The matching root `.env.example`, the stray empty root `package-lock.json`, and the unused root `.dockerignore` were removed 2026-07-06.) |
 | `.claude/settings.local.json` | Local Claude Code permission allowlist for this repo (not project logic). |
 | `.continue/config.yaml` | Local [Continue](https://continue.dev) IDE-assistant config pointing at an Ollama endpoint over Tailscale — developer tooling, not part of the app. |
 | `.DS_Store` | macOS Finder metadata; noise, safe to ignore. |
@@ -105,8 +103,7 @@ Ships its own CLI (`catalog-ingest`), Alembic migrations, and a `Makefile` runbo
 | `Dockerfile` | Builds the ingestion image on Microsoft's Playwright image (Chromium + all system libs preinstalled) since the scrape target requires solving an AWS WAF JS challenge; installs the package editable so bind-mounted source edits apply without a rebuild. |
 | `alembic.ini` | Alembic config; migrations live under `src/catalog_ingestion/db/migrations`. |
 | `pyproject.toml` | Package metadata/deps (SQLAlchemy, Alembic, BeautifulSoup, Playwright, Typer, tenacity); `catalog-ingest` console-script entrypoint; ruff/pytest/mypy config. |
-| `.env.example` | **Legacy** — same "Purdue.io Docker" template as the root `.env.example` (ASP.NET/CatalogSync keys); doesn't match this directory's actual `docker-compose.yml`. The real runtime config for this stack is env vars inlined directly in `docker-compose.yml`. |
-| `.gitignore` | Ignores `catalog_db_backup.sql.gz` and `logs/`. |
+| `.gitignore` | Ignores `catalog_db_backup.sql.gz` and `logs/`. (A legacy Purdue.io-era `.env.example` that didn't match this stack's `docker-compose.yml` was removed 2026-07-06 — runtime config is env vars inlined directly in `docker-compose.yml`.) |
 | `.dockerignore` | Excludes `.git`, caches, `.page_cache`, `docs`, `tests`, `*.md` from the ingestion image's build context. |
 | `README.md` | Runbook for running the DB + backend stack via `make` (podman-first, Docker Desktop-compatible). |
 | `catalog_db_backup.sql.gz` | A saved Postgres dump (schema + data, including RAG vectors) produced by `make backup` / consumed by `make restore`. Binary; not meant to be diffed. |
@@ -132,13 +129,12 @@ Ships its own CLI (`catalog-ingest`), Alembic migrations, and a `Makefile` runbo
 | `db/migrations/versions/001_initial_schema.py` | Initial migration: catalog years, colleges, subjects, courses, programs, requirement groups/options. |
 | `db/migrations/versions/002_students_plans.py` | Adds the `students` and `plans` tables (JSONB) — the app-side persistence the backend's `students_db.py` reads/writes. |
 | `discover/catalog_years.py` | Parses the catalog index page's `<select>` to enumerate available catalog years and their `catoid`s (the only page fetchable without solving the WAF challenge). |
-| `discover/nav_links.py` | Extracts navigation `<a>` links (with `catoid`/`navoid` query params) from a catalog page. |
 | `discover/programs.py` | Discovers `preview_program.php?catoid=N&poid=XXXXX` URLs from the programs list and college/department pages. |
 | `discover/subjects.py` | Discovers subject-code filter options from the courses page's `<select id="courseprefix">` dropdown and builds paginated course-listing URLs per subject. |
 | `fetch/client.py` | The HTTP fetcher: wraps caching, robots.txt-derived rate limiting, and an optional Playwright backend (for JS-challenge pages) behind one interface. |
 | `fetch/cache.py` | Disk-based page cache (`DiskCache`) keyed by content hash, with metadata sidecars, so re-runs skip already-fetched pages. |
 | `fetch/robots.py` | Parses `robots.txt` and enforces the site's crawl-delay / allow rules. |
-| `parse/common.py` | Shared HTML utilities (text cleaning, credit-hour extraction, BeautifulSoup helpers) used by every parser below. |
+| `parse/common.py` | Shared HTML utilities (`clean_text`, `soup`) used by every parser below. Each parser defines its own specialized credit/course-code regexes. |
 | `parse/courses.py` | Parses an individual `preview_course_nopop.php` page into code/title/credits/description/prereq text/etc. |
 | `parse/prerequisites.py` | Parses free-text prerequisite strings (e.g. `"CS 18000 and (MA 16100 or MA 16500)"`) into a structured AND/OR JSON tree, always preserving the raw text; low-confidence parses are flagged rather than guessed at. |
 | `parse/programs.py` | Parses a program's overview metadata (title, degree code, school) from `preview_program.php`. |
@@ -171,7 +167,7 @@ and persistence, plus a read-only `/admin` database browser.
 | `tailwind.config.ts` | **Required for Tailwind to compile at all** (the app long shipped without it, rendering as unstyled HTML). Content globs over `app`/`components`/`lib`, Purdue `boiler.*` palette, `font-display`/`font-body` families. |
 | `postcss.config.mjs` | The other half of the Tailwind fix: declares the `tailwindcss` + `autoprefixer` PostCSS plugins. Config changes here need a dev-server restart. |
 | `tsconfig.json` | TypeScript config; `@/*` path alias maps to the project root, per Next.js convention. |
-| `tsconfig.tsbuildinfo` | Generated TS incremental-build cache; safe to delete. |
+| `tsconfig.tsbuildinfo` | Generated TS incremental-build cache; safe to delete (gitignored as of 2026-07-06). |
 | `next-env.d.ts` | Auto-generated Next.js type reference; do not hand-edit. |
 | `.env.local` | Local override for `NEXT_PUBLIC_API_BASE_URL` (defaults to `http://localhost:8000` in `lib/api.ts` if unset). |
 | `README.md` | Frontend runbook: pages, styling primitives, known gaps. |
@@ -214,6 +210,7 @@ These are reproducible build artifacts — safe to delete, and already covered b
 
 - `backend/.ruff_cache/` — lint cache
 - `backend/tests/__pycache__/`, any `**/__pycache__/` — Python bytecode cache
+- `backend/*.egg-info/`, `catalog_ingestion/src/*.egg-info/` — setuptools editable-install metadata; regenerated by `pip install -e` (untracked + gitignored as of 2026-07-06)
 - `.pytest_cache/` (root and per-package) — pytest cache
 - `clients/web/.next/` — Next.js build output
 - `clients/web/node_modules/` (if present) — npm dependencies

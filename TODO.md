@@ -1,51 +1,56 @@
 # TODO — BoilerAdvisor
 
-Working notes and next steps. Last updated 2026-07-06 (renamed from "AI Academic Advisor" to **BoilerAdvisor** the same day).
+Working notes and next steps. Last updated 2026-07-06/07 (renamed from "AI Academic Advisor" to **BoilerAdvisor** on 2026-07-06).
+
+**🎯 Next goal:** the degree-program crawl is done and the data is sitting in Postgres, but the web app doesn't expose it yet. The concrete next step is wiring the program catalog into the UI so a student can search for a degree and pull up its requirements — see **Priority 3** below. That's the next thing to hand to an agent to implement.
 
 ## Current State
 
 **What works:**
-- ✅ Course catalog: 10,575 courses (2026-2027)
+- ✅ Course catalog: 10,607 courses (2026-2027)
+- ✅ **Degree programs: full crawl complete** — 1,165 programs (2026-2027), 23,213 requirement groups, 40,758 requirement options. See Priority 1.
 - ✅ Deterministic planner: validates prerequisites, term offerings, credit caps
-- ✅ RAG advisor: answers questions about courses with sources
+- ✅ RAG advisor: answers questions about courses with sources; requirement-block chunks are now embedded too (see Database state)
 - ✅ LFM2 agent: proposes plan revisions, deterministic planner validates
 - ✅ Web UI: onboarding profile form (no hardcoded demo profile), plan generation, direct editing (move/remove per course, add via debounced catalog search), advisor ask/revise chat
 - ✅ **Plan persistence, wired end-to-end**: onboarding calls `POST /v1/students`; every accepted edit/revision/regeneration autosaves via `POST /v1/students/{id}/plans`; a reload restores the newest saved plan (student id in `localStorage`). Save-status chip surfaces Saved/Saving/failed/DB-down.
 - ✅ **Database browsing**: read-only `/admin` page (table counts + paged rows via `GET /v1/admin/*`, whitelisted tables only) and an Adminer container (`make adminer` → http://localhost:8081) for full editing.
-- ✅ **Purdue black & gold UI** ("BoilerAdvisor"): design tokens in `globals.css`, top navigation (Planner / Database), onboarding hero, dark theme throughout. Root cause of the old "unstyled" look: Tailwind was never compiling — `tailwind.config.ts` + `postcss.config.mjs` didn't exist; they do now.
+- ✅ **Purdue black & gold UI** ("BoilerAdvisor"): design tokens in `globals.css`, top navigation (Planner / Database), onboarding hero, dark theme throughout. Root cause of the old "unstyled" look: Tailwind was never compiling — `tailwind.config.ts` + `postcss.config.mjs` didn't exist; they do now. UI pass is done and looks substantially better than the pre-rebrand version.
 - ✅ API: versioned `/v1` prefix with tagged domain routers (`academic`, `planning`, `advisor`, `students`, `admin`); `/v1/plan/generate`, `/v1/plan/edit`, `/v1/advisor/ask`, `/v1/advisor/revise-plan`
 - ✅ Direct plan editing: `POST /v1/plan/edit` (`services/plan_editor.py`) — deterministic move/add/remove with placement-preserving re-validation, no LLM
+- ✅ **Program/requirement read API already exists and is unused by the UI**: `GET /v1/academic/facets`, `GET /v1/academic/programs` (search/list), `GET /v1/academic/programs/{id}` (full requirement tree). Backend work for Priority 3 is done — only the frontend needs to call it.
 
 **What's missing / rough:**
-- ⏳ Degree programs: **crawl in progress** (2026-07-06; ~32h run). Counts below are a snapshot mid-crawl.
-- ❌ Graduate programs: not ingested yet
-- ❌ Prerequisite rules: 0 rows (Purdue doesn't publish; need separate source)
-- ⚠️ **No program/major picker in the UI** — degree program is free text until the crawl fills `programs`; then build the picker (Priority 3).
+- 🎯 **No program/degree lookup or picker in the UI** — the `programs` table is fully populated now, but nothing in `clients/web` calls `GET /v1/academic/programs*`. Degree program is still free text and `program_id` is always null. This is the next goal (Priority 3).
+- ❌ Graduate programs: not ingested yet (undergrad only, 2026-2027)
+- ❌ Colleges / departments: still 0 rows — not populated by the program crawl, no separate ingestion path yet
+- ❌ Prerequisite rules: effectively unimplemented — no ingestion pipeline writes real prerequisite data yet (Purdue doesn't publish prereqs in Acalog; needs a separate source)
 - ⚠️ **"Edit profile" creates a new student row** — there's no `PUT /v1/students/{id}`, so editing re-creates the student and re-points `localStorage`. Old rows accumulate harmlessly; add an update route to fix properly.
 - ⚠️ Saved-plan history is write-only from the UI — every save appends a `plans` row, but the UI only ever loads the newest one. No history browser/restore yet (rows are visible in `/admin`).
 
-**Database state** (`make counts` to verify — snapshot taken mid-crawl 2026-07-06):
+**Database state** (`make counts` to verify; snapshot 2026-07-07, crawl complete):
 
 | Table | Rows | Status |
 |-------|------|--------|
-| courses | 10,575 | ✅ Full 2026-2027 import |
+| courses | 10,607 | ✅ Full 2026-2027 import |
 | subjects | 208 | ✅ Ready |
-| programs | 10+ | ⏳ **Crawl running** (~959 total expected) |
-| requirement_groups | 316+ | ⏳ Filling as programs land |
-| requirement_options | 764+ | ⏳ Filling as programs land |
-| colleges | 0 | ⚠️ Side-effect of program crawl |
-| departments | 0 | Not implemented |
-| academic_rules (RAG) | 10,575 | ✅ All courses embedded (requirement chunks pending crawl) |
+| catalog_years | 13 | ✅ All years discovered (2014-2027); only 2026-2027 has programs crawled |
+| programs | 1,165 | ✅ **Crawl complete** (2026-2027 undergrad; exceeded the ~959 estimate) |
+| requirement_groups | 23,213 | ✅ Filled |
+| requirement_options | 40,758 | ✅ Filled |
+| colleges | 0 | ❌ Not populated by the crawl |
+| departments | 0 | ❌ Not implemented |
+| academic_rules (RAG) | 18,602 | ✅ 10,606 course chunks + 7,996 requirement chunks embedded |
 
-**Impact:** Program-driven plans and major-specific RAG answers unlock as the crawl completes (then re-run the RAG ingest for requirement chunks).
+**Impact:** The data a program picker needs (programs + requirement blocks + RAG chunks) is all in place. Program-driven plans and major-specific RAG answers are unblocked at the API layer already (`derive_remaining_courses()` in `planner_catalog.py`) — the only missing piece is UI that actually sets `program_id`. That's Priority 3.
 
 ---
 
-## Priority 1: Re-crawl Degree Programs (⏳ in progress 2026-07-06)
+## Priority 1: Re-crawl Degree Programs (✅ done 2026-07-06/07)
 
 **Why:** Without programs and requirements, major-specific questions fail. The data was lost when the machine changed. This unblocks many web features.
 
-**Scope:** ~959 undergrad programs × 120s crawl delay ≈ 32 hours. **Start backgrounded; use page cache on retries.**
+**Result:** 1,165 undergrad programs (2026-2027, beat the ~959 estimate), 23,213 requirement groups, 40,758 requirement options. Requirement-block RAG chunks backfilled too — `academic_rules` now has 7,996 requirement chunks alongside the 10,606 course chunks. `colleges`/`departments` stayed at 0 (the crawl doesn't populate them; no separate ingestion path exists yet).
 
 ```bash
 cd catalog_ingestion
@@ -54,7 +59,7 @@ make sync-programs YEAR=2026-2027 CONCURRENCY=1
 make backup                      # save catalog_db_backup.sql.gz when done
 ```
 
-Then backfill requirement-block RAG chunks:
+Requirement-block RAG chunks were then backfilled:
 ```bash
 cd backend && source .venv/bin/activate
 python -m app.services.rag.ingest_catalog  # idempotent; adds requirement chunks
@@ -62,10 +67,10 @@ python -m app.services.rag.ingest_catalog  # idempotent; adds requirement chunks
 
 **Verification:**
 ```bash
-cd catalog_ingestion && make counts  # should show programs > 0
+cd catalog_ingestion && make counts  # programs=1165, requirement_groups=23213, requirement_options=40758
 ```
 
-**Contingency:** If the old machine still has a Postgres backup or page cache, it's faster to restore or copy the cache.
+**Follow-up (not done):** graduate programs, past catalog years (2014-2025 are discovered in `catalog_years` but not crawled), colleges/departments.
 
 ---
 
@@ -83,19 +88,23 @@ cd catalog_ingestion && make counts  # should show programs > 0
 
 ---
 
-## Priority 3: Web UI Program Picker (profile form ✅ done; picker blocked on Priority 1)
+## Priority 3: Connect the Program Catalog to the Web UI (🎯 NEXT GOAL — fully unblocked)
 
-**Why:** ~~The web UI hardcodes a demo profile.~~ Done 2026-07-06: the hardcoded `demoProfile` is gone — first visit shows a profile setup form (`clients/web/components/ProfileSetup.tsx`: name, degree text, start term/year, credit cap, completed/remaining courses via catalog-search chips). What's still missing is picking a real *program* so requirements drive the plan.
+**Why:** Priority 1 finished: `programs`, `requirement_groups`, and `requirement_options` are fully populated (1,165 programs, 2026-2027), and requirement text is embedded in RAG. But nothing in `clients/web` calls the program endpoints yet — the profile form's degree field is still free text (`program_id` stays `null` forever), and there's no way for a student to just look up "what does a CS major require" without hitting `/docs` directly. This is the concrete next step: let someone search for a degree and see its requirements in the app.
 
-**Scope:** ~3 hours once programs are loaded.
+**Scope:** ~4-6 hours. **Backend needs no new work** — it's a read-only integration:
+- `GET /v1/academic/facets` → `{catalog_years, schools, subjects}` for building search filters
+- `GET /v1/academic/programs?query=&catalog_year=&school=&limit=` → `AcademicProgramSummary[]` (`id`, `school`, `program_title`, `degree_code`, `variant`, `block_count`, `course_count`) for search/autocomplete
+- `GET /v1/academic/programs/{id}` → `AcademicProgramDetail` with the full requirement tree: `blocks[]` → `rules[]` (choose-N logic, `raw_text`) → `options[]` → `courses[]` (course code/title/credits)
+- `derive_remaining_courses()` (`backend/app/services/planner_catalog.py`) already turns a `program_id` into a real remaining-course list for the planner — it just needs a UI that actually sets `program_id`
 
 **Steps:**
-1. In `ProfileSetup`, replace the free-text degree field with a program selector
-2. Call `GET /academic/facets` to list colleges/majors
-3. Fetch requirements with `GET /academic/programs/{id}`
-4. Set `program_id` on the profile so the backend derives `remaining_courses` from real requirement rows (the plumbing already exists in `planner_catalog.py`)
+1. **Standalone degree lookup view** — a new page/section (e.g. alongside Planner/Database in `NavBar.tsx`) where anyone can search programs by name/school and expand one to see its full requirement blocks. Pure read, no profile needed: `GET /v1/academic/programs` + `GET /v1/academic/programs/{id}`. This is the literal "pull a degree and its requirements up" feature.
+2. **Onboarding picker** — in `ProfileSetup.tsx`, replace the free-text degree field with the same search-and-select UI, and set `program_id` on submit. The field already exists end-to-end (`StudentProfile.program_id` in `backend/app/models/schemas.py`, threaded through `clients/web/lib/api.ts` and `ProfileSetup.tsx`) — it's just never populated from real data today.
+3. **Plan generation** — once `program_id` is set, no backend changes are needed; `planner_catalog.py` already derives `remaining_courses` from requirement rows for a real program.
+4. (Nice-to-have, feeds Priority 8) Reuse the same requirement-tree rendering from step 1 to show a student's plan progress against their program's requirements.
 
-**Test:** Can create a CS major profile and see CS-specific plans.
+**Test:** Search "Computer Science," open the BS in Computer Science (2026-2027), see its requirement blocks/rules render; as a new student, pick that same program during onboarding and get a program-specific plan instead of a free-text degree name.
 
 ---
 
@@ -150,10 +159,12 @@ cd catalog_ingestion && make counts  # should show programs > 0
 
 **Why:** Students should see what remains to graduate, grouped by major requirements.
 
+**Depends on:** Priority 3 — reuse its requirement-tree rendering rather than building it twice.
+
 **Scope:** ~5 hours.
 
 **Steps:**
-1. Fetch `GET /academic/programs/{id}` (returns requirement blocks)
+1. Fetch `GET /v1/academic/programs/{id}` (returns requirement blocks)
 2. Render as collapsible sections: "Core CS" → "Data Structures" (met), "Algorithms" (blocked by prereq)
 3. Cross-reference student's completed courses and plan
 4. Show which courses satisfy which requirement (why this course matters)
@@ -162,10 +173,9 @@ cd catalog_ingestion && make counts  # should show programs > 0
 
 ## Priority 9: Graduate Programs & Other Years
 
-**In Progress:**
-- Undergrad programs: blocked on Priority 1
+**Status:** Undergrad 2026-2027 done (Priority 1). Remaining:
 - Grad programs (MS/PhD): requires adding navoid to `catalog_ingestion/discover/programs.py`
-- Past years (2024-2025, etc.): requires `make load-courses YEAR=2025-2026` + crawl
+- Past years (2014-2025 already discovered in `catalog_years`, not crawled): requires `make load-courses YEAR=2025-2026` + `make sync-programs YEAR=2025-2026`
 
 ---
 
@@ -235,10 +245,9 @@ make psql                           # SQL prompt
 ## Completed Work
 
 ### 1. RAG Advisor (✅ Done)
-- All 10,575 courses embedded in pgvector
+- All 10,607 courses embedded in pgvector, plus 7,996 requirement-block chunks (18,602 total)
 - Similarity-ranked retrieval working
 - Answers cited with sources
-- Pending: requirement-block chunks (blocked by program crawl)
 
 ### 2. LFM2 Revise-Plan Agent (✅ Done)
 - Proposes edits (reorder, defer, credit cap)
@@ -263,6 +272,12 @@ make psql                           # SQL prompt
 - Hardcoded demo profile removed — onboarding profile form with catalog-search course chips
 - Read-only `/admin` DB browser (+ `GET /v1/admin/*` routes) and Adminer container (`make adminer`)
 - Purdue black & gold redesign; fixed Tailwind never compiling (missing configs)
+
+### 6. Full Degree Program Crawl (✅ Done 2026-07-06/07)
+- 1,165 undergrad programs crawled for 2026-2027 (beat the ~959 estimate)
+- 23,213 requirement groups, 40,758 requirement options populated
+- RAG backfilled with 7,996 requirement-block chunks
+- Backend read API (`/v1/academic/facets`, `/v1/academic/programs`, `/v1/academic/programs/{id}`) already built and ready — see Priority 3 for the still-open UI work
 
 ---
 

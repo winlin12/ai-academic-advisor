@@ -16,7 +16,6 @@ SAMPLE_INDEX_HTML = """
 
 
 def test_discovers_all_years():
-    from datetime import datetime
     page = FetchedPage(url="https://catalog.purdue.edu/index.php", html=SAMPLE_INDEX_HTML, http_status=200)
     years = discover_catalog_years(page, "https://catalog.purdue.edu")
     assert len(years) == 4

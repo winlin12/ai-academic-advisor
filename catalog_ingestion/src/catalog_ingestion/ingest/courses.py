@@ -6,11 +6,9 @@ import logging
 import uuid
 from datetime import datetime
 
-from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from catalog_ingestion.db.models import (
-    CatalogYear,
     Course,
     PrerequisiteRule,
     SourcePage,
@@ -160,42 +158,3 @@ def _upsert_prerequisite_rule(session: Session, *, course: Course, raw_text: str
     session.flush()
 
 
-def ingest_course_batch(
-    session: Session,
-    *,
-    parsed_courses: list[ParsedCourse],
-    catalog_year: CatalogYear,
-    html_map: dict[str, str],
-) -> dict[str, str]:
-    """Ingest a batch of courses. Returns {course_code: 'inserted'|'updated'|'skipped'}."""
-    stats: dict[str, str] = {}
-
-    for parsed in parsed_courses:
-        try:
-            source_page_id: uuid.UUID | None = None
-            html = html_map.get(parsed.source_url)
-            if html:
-                sp = upsert_source_page(
-                    session,
-                    url=parsed.source_url,
-                    html=html,
-                    http_status=200,
-                    catalog_year_id=catalog_year.id,
-                    page_type="course",
-                )
-                source_page_id = sp.id
-
-            ingest_course(
-                session,
-                parsed=parsed,
-                catalog_year_id=catalog_year.id,
-                source_page_id=source_page_id,
-            )
-            stats[parsed.course_code] = "ok"
-            logger.debug("Ingested course %s", parsed.course_code)
-        except Exception as exc:
-            logger.error("Failed to ingest course %s: %s", parsed.course_code, exc)
-            stats[parsed.course_code] = f"error: {exc}"
-            session.rollback()
-
-    return stats

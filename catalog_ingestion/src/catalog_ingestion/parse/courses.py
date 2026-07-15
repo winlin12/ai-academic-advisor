@@ -164,7 +164,6 @@ def _body_text_after_heading(heading_el) -> str:
         if container is not None:
             text = container.get_text("\n")
             # Drop everything up to and including the heading text itself.
-            head = clean_text(heading_el.get_text())
             idx = text.find(heading_el.get_text())
             if idx != -1:
                 text = text[idx + len(heading_el.get_text()):]

@@ -26,13 +26,12 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 PREREQ_PREFIX_RE = re.compile(r"^\s*(?:Prerequisite|Prerequisites)\s*[:\-]?\s*", re.IGNORECASE)
-COREQ_PREFIX_RE = re.compile(r"^\s*(?:Corequisite|Corequisites)\s*[:\-]?\s*", re.IGNORECASE)
 COURSE_RE = re.compile(r"\b([A-Z]{2,6})\s+(\d{3,5}[A-Z]?)\b")
 GRADE_RE = re.compile(r"(?:grade of|minimum grade)\s+([A-D][+-]?|P)\b", re.IGNORECASE)
 CONCURRENT_RE = re.compile(r"\b(concurrently|concurrent enrollment)\b", re.IGNORECASE)
@@ -89,8 +88,6 @@ def _parse_expr(text: str) -> tuple[dict[str, Any], list[str]]:
     """Parse a prerequisite expression into an AND/OR tree."""
     notes: list[str] = []
 
-    # Check for explicit parentheses groupings
-    has_parens = "(" in text and ")" in text
     # Split on top-level ' AND ' first (highest binding)
     and_parts = _split_top_level(text, " AND ")
     if len(and_parts) > 1:
@@ -157,11 +154,3 @@ def _split_top_level(text: str, separator: str) -> list[str]:
             i += 1
     parts.append("".join(current))
     return parts if len(parts) > 1 else parts
-
-
-def strip_prereq_prefix(text: str) -> str:
-    return PREREQ_PREFIX_RE.sub("", text).strip()
-
-
-def strip_coreq_prefix(text: str) -> str:
-    return COREQ_PREFIX_RE.sub("", text).strip()

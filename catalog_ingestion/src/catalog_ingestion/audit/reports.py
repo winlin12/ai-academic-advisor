@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
 from sqlalchemy.orm import Session
 
-from catalog_ingestion.audit.validation import ValidationResult, validate_catalog_year
+from catalog_ingestion.audit.validation import ValidationResult
 from catalog_ingestion.db.models import CatalogYear, Course, Program, Subject
 
 
@@ -39,75 +38,6 @@ def report_catalog_summary(session: Session, *, catalog_year_label: str) -> dict
         "courses": course_count,
         "programs": program_count,
         "courses_per_subject": courses_per_subject,
-    }
-
-
-def report_program(
-    session: Session, *, catalog_year_label: str, program_name: str
-) -> dict[str, Any]:
-    """Return parsed requirement structure for a specific program."""
-    from catalog_ingestion.db.models import RequirementGroup, RequirementOption
-
-    year = session.query(CatalogYear).filter_by(label=catalog_year_label).first()
-    if not year:
-        return {"error": f"Catalog year {catalog_year_label!r} not found"}
-
-    program = (
-        session.query(Program)
-        .filter(
-            Program.catalog_year_id == year.id,
-            Program.name.ilike(f"%{program_name}%"),
-        )
-        .first()
-    )
-    if not program:
-        return {"error": f"Program matching {program_name!r} not found in {catalog_year_label}"}
-
-    groups = (
-        session.query(RequirementGroup)
-        .filter_by(program_id=program.id, parent_group_id=None)
-        .order_by(RequirementGroup.display_order)
-        .all()
-    )
-
-    def group_to_dict(g: RequirementGroup) -> dict[str, Any]:
-        opts = (
-            session.query(RequirementOption)
-            .filter_by(requirement_group_id=g.id)
-            .order_by(RequirementOption.display_order)
-            .all()
-        )
-        children = (
-            session.query(RequirementGroup)
-            .filter_by(parent_group_id=g.id)
-            .order_by(RequirementGroup.display_order)
-            .all()
-        )
-        return {
-            "name": g.name,
-            "type": g.requirement_type,
-            "credits_min": g.credits_min,
-            "credits_max": g.credits_max,
-            "options": [
-                {
-                    "course_code": o.course_code_raw,
-                    "text": o.option_text,
-                    "is_selective": o.is_selective_option,
-                    "credits": o.credits,
-                }
-                for o in opts
-            ],
-            "children": [group_to_dict(c) for c in children],
-        }
-
-    return {
-        "program": program.name,
-        "degree_type": program.degree_type,
-        "program_type": program.program_type,
-        "campus": program.campus,
-        "college": program.college.name if program.college else None,
-        "total_credits": program.total_credits_min,
-        "requirement_groups": [group_to_dict(g) for g in groups],
     }
 
 

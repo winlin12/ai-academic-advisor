@@ -6,7 +6,6 @@ import logging
 import time
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse
 
 from catalog_ingestion.fetch.cache import CachedPage, DiskCache, content_hash
 from catalog_ingestion.fetch.robots import get_crawl_delay, is_allowed

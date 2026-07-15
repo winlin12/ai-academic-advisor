@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass, field
 from urllib.parse import parse_qs, urlparse
 
-from catalog_ingestion.parse.common import clean_text, extract_credits, soup
+from catalog_ingestion.parse.common import clean_text, soup
 
 logger = logging.getLogger(__name__)
 
