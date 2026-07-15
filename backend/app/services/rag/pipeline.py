@@ -1,51 +1,136 @@
 """Step 2 (ingest) + Step 3 (answer): the composition layer.
 
-This is the only module that imports *both* the embedding transport (OllamaClient) and the
-persistence layer (store). Each helper it calls is independently testable; this file just
-wires them into the two end-to-end flows.
+This is the only module that composes the embedding provider (``embeddings``), the
+persistence layer (``store``), and the chat model (``AnthropicClient``). Each helper it
+calls is independently testable; this file wires them into the two end-to-end flows.
+
+Retrieval is two-tier, cheapest-first:
+
+    1. EXACT — course codes mentioned in the question are pulled from ``academic_rules`` by
+       metadata match (deterministic SQL, no embedding, similarity pinned to 1.0).
+    2. SEMANTIC — the question is embedded and the nearest chunks are pulled by cosine
+       distance, floored by ``rag_min_similarity``.
+
+Both tiers are merged (exact first, deduped by row id) and packed under a hard token budget
+(``advisor_context_token_budget``) before anything reaches the prompt — input tokens are the
+Anthropic bill, and this budget is the cap.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import re
+from pathlib import Path
 from typing import Any
 
 from app.core.config import settings
-from app.services.ollama_client import OllamaClient
-from app.services.rag import store
+from app.services.anthropic_client import AnthropicClient
+from app.services.rag import embeddings, store
 
 logger = logging.getLogger(__name__)
 
 
+# The catalog database schema (a committed copy of catalog_ingestion/docs/schema.md; re-sync
+# with `cp` when the schema changes). Read once at import so the prompt bytes are identical on
+# every request — a per-request read that could pick up a changed file mid-process would
+# silently invalidate the prompt cache.
+_DB_SCHEMA = (Path(__file__).resolve().parents[2] / "data" / "db_schema.md").read_text(
+    encoding="utf-8"
+)
+
 # Fixed framing for every advisor answer. The retrieved rules are the ONLY facts the model
 # is allowed to use, which is what turns a general chatbot into a grounded advisor and stops
-# an 8B local model from inventing courses/credits it never saw.
+# it from inventing courses/credits it never saw. Static by construction — anything volatile
+# would invalidate the prompt-cache prefix (see AnthropicClient.system_block).
+#
+# The schema is appended for two reasons: it teaches the model what the context chunks'
+# metadata tags mean (they mirror these tables/columns), and it pushes the static prefix past
+# the model's minimum cacheable size (1,024 tokens on claude-sonnet-4-5), so the whole block
+# bills at ~0.1x on cache hits instead of full price every request.
 _ADVISOR_SYSTEM_PROMPT = (
     "You are a college academic advisor. Answer using ONLY the CONTEXT below, which contains "
     "retrieved degree rules and course descriptions. If the context does not contain the "
     "answer, say you don't have that rule on file and suggest the student confirm with their "
     "department. Be concise, and quote the specific requirement text you relied on."
+    "\n\nBackground: the context chunks are retrieved from a Postgres catalog database with "
+    "the schema below. Use it to interpret chunk metadata (table/column names, requirement "
+    "types, selective vs. required options) — it contains no course facts itself, so never "
+    "cite the schema as a source.\n\n"
+    + _DB_SCHEMA
 )
 
+# "CS 25100", "cs25100", "MA-16100" — subject prefix + number, tolerant of spacing/hyphen.
+_COURSE_CODE_RE = re.compile(r"\b([A-Za-z]{2,5})[\s-]?(\d{3,5})\b")
 
-async def ingest_rule(
-    content: str,
-    metadata: dict[str, Any] | None = None,
-    *,
-    client: OllamaClient | None = None,
-) -> int:
+
+async def ingest_rule(content: str, metadata: dict[str, Any] | None = None) -> int:
     """Step 2 end-to-end: embed one text chunk, then upsert it into pgvector.
 
     ``content`` is a self-contained rule/description string (e.g. the STS selective blurb).
     ``metadata`` is arbitrary structured tags (department, requirement_type, ...) stored as
-    JSONB for later filtering. Pass a shared ``client`` when bulk-ingesting to reuse config
-    and avoid re-running the endpoint guard for every chunk.
+    JSONB for later filtering.
     """
-    client = client or OllamaClient()
-    embedding = await client.embed(content, task_type="search_document")
+    embedding = await asyncio.to_thread(embeddings.embed_passage, content)
     rule_id = store.upsert_rule(content, metadata or {}, embedding)
     logger.info("Ingested rule id=%s (%d chars, %d-d vector)", rule_id, len(content), len(embedding))
     return rule_id
+
+
+# --- pure helpers (no DB, no model — unit-testable) ----------------------------------------
+
+
+def extract_course_codes(question: str) -> list[str]:
+    """Course codes mentioned in a question, normalized to space-free uppercase.
+
+    Exact match beats similarity search every time it applies and costs zero tokens to be
+    wrong less often — so codes are extracted deterministically before any embedding runs.
+    """
+    seen: set[str] = set()
+    codes: list[str] = []
+    for subject, number in _COURSE_CODE_RE.findall(question):
+        code = f"{subject.upper()}{number}"
+        if code not in seen:
+            seen.add(code)
+            codes.append(code)
+    return codes
+
+
+def _approx_tokens(text: str) -> int:
+    # ~4 chars/token is close enough for a packing budget; the free count_tokens endpoint
+    # keeps this approximation honest in tests, not in the request path.
+    return max(1, len(text) // 4)
+
+
+def merge_and_budget(
+    exact: list[dict[str, Any]],
+    semantic: list[dict[str, Any]],
+    budget_tokens: int,
+) -> list[dict[str, Any]]:
+    """Merge the two retrieval tiers and pack them under the context token budget.
+
+    Exact matches rank first (they answer the question the student literally asked), then
+    semantic matches in similarity order. Duplicates (a code both mentioned and semantically
+    near) are dropped by row id. Packing stops at the budget; a chunk that doesn't fit is
+    skipped rather than truncated, so every injected chunk stays self-contained.
+    """
+    merged: list[dict[str, Any]] = []
+    seen_ids: set[Any] = set()
+    for match in [*exact, *semantic]:
+        if match["id"] in seen_ids:
+            continue
+        seen_ids.add(match["id"])
+        merged.append(match)
+
+    packed: list[dict[str, Any]] = []
+    remaining = budget_tokens
+    for match in merged:
+        cost = _approx_tokens(match["content"])
+        if cost > remaining:
+            continue
+        packed.append(match)
+        remaining -= cost
+    return packed
 
 
 def _format_context(matches: list[dict[str, Any]]) -> str:
@@ -67,30 +152,39 @@ def _format_context(matches: list[dict[str, Any]]) -> str:
     return "\n\n".join(parts)
 
 
+# --- the end-to-end answer flow -------------------------------------------------------------
+
+
 async def answer_question(
     question: str,
     *,
     top_k: int | None = None,
-    client: OllamaClient | None = None,
+    client: AnthropicClient | None = None,
 ) -> dict[str, Any]:
-    """Step 3 end-to-end: embed question -> cosine search -> inject context -> generate.
+    """Step 3 end-to-end: exact + semantic retrieval -> budgeted context -> generate.
 
     Returns the answer plus the matches (with similarities) so callers/UI can show sources
     and so the retrieval quality is observable, not a black box.
     """
     top_k = top_k or settings.rag_top_k
-    client = client or OllamaClient()
+    client = client or AnthropicClient()
 
-    # 1-2. Embed the question with the QUERY-side prefix (asymmetric retrieval).
-    query_vector = await client.embed(question, task_type="search_query")
+    # Tier 1: deterministic — course codes named in the question, straight from SQL.
+    exact = store.fetch_by_course_codes(extract_course_codes(question))
 
-    # 3. Nearest chunks, then drop anything below the relevance floor.
-    matches = store.search(query_vector, top_k)
+    # Tier 2: semantic — embed the question (query-side instruction), cosine search, floor.
+    query_vector = await asyncio.to_thread(embeddings.embed_query, question)
+    semantic = store.search(query_vector, top_k)
     if settings.rag_min_similarity > 0:
-        matches = [m for m in matches if (m.get("similarity") or 0.0) >= settings.rag_min_similarity]
-    logger.info("Retrieved %d chunk(s) for question: %r", len(matches), question[:80])
+        semantic = [m for m in semantic if (m.get("similarity") or 0.0) >= settings.rag_min_similarity]
 
-    # 4-5. Fold into the prompt and let the chat model write the grounded answer.
+    matches = merge_and_budget(exact, semantic, settings.advisor_context_token_budget)
+    logger.info(
+        "Retrieved %d chunk(s) (%d exact, %d semantic pre-merge) for question: %r",
+        len(matches), len(exact), len(semantic), question[:80],
+    )
+
+    # Fold into the prompt and let Claude write the grounded answer.
     context = _format_context(matches)
     user_prompt = f"CONTEXT:\n{context}\n\nSTUDENT QUESTION:\n{question}"
     answer = await client.generate(_ADVISOR_SYSTEM_PROMPT, user_prompt)

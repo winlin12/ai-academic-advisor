@@ -1,27 +1,30 @@
-"""Tests for the LFM2 revise-plan agent.
+"""Tests for the revise-plan agent.
 
-The model transport is stubbed (canned JSON proposals), so these run with no Ollama and no
-network — they exercise the proposal-application logic and the propose → re-plan loop against
-the seed catalog.
+The model transport is stubbed (canned PlanEditProposal objects, mirroring what
+AnthropicClient.propose returns after structured-output parsing), so these run with no
+network — they exercise the proposal-application logic and the propose → re-plan loop
+against the seed catalog.
 """
 
 import asyncio
 
 from app.models.schemas import PlanEditProposal, StudentProfile
 from app.services.advisor_agent import _apply_proposal, revise_plan
+from app.services.anthropic_client import ModelResponseError
 from app.services.catalog import load_catalog
-from app.services.ollama_client import ModelJSONError
 
 
 class _StubClient:
-    """Stand-in for OllamaClient that returns canned JSON proposals in order."""
+    """Stand-in for AnthropicClient that returns canned proposals in order."""
 
-    def __init__(self, responses: list[dict]):
+    def __init__(self, responses: list[PlanEditProposal]):
         self.model = "stub-model"
         self._responses = list(responses)
         self.prompts: list[str] = []
 
-    async def generate_json(self, system_prompt: str, user_prompt: str) -> dict:
+    async def propose(
+        self, system_prompt: str, user_prompt: str, output_type: type[PlanEditProposal]
+    ) -> PlanEditProposal:
         self.prompts.append(user_prompt)
         return self._responses.pop(0)
 
@@ -64,7 +67,9 @@ def test_apply_proposal_keeps_profile_cap_when_proposal_omits_one():
 
 
 def test_revise_plan_applies_credit_cap_and_returns_rationale():
-    client = _StubClient([{"rationale": "Capping the load.", "max_credits_per_semester": 3}])
+    client = _StubClient(
+        [PlanEditProposal(rationale="Capping the load.", max_credits_per_semester=3)]
+    )
     result = asyncio.run(
         revise_plan(_profile(max_credits_per_semester=9), load_catalog(), "lighter please", client=client)
     )
@@ -75,14 +80,14 @@ def test_revise_plan_applies_credit_cap_and_returns_rationale():
     assert all(semester.total_credits <= 3 for semester in result.plan.semesters)
 
 
-def test_revise_plan_falls_back_to_baseline_on_bad_json():
-    class _BadClient:
+def test_revise_plan_falls_back_to_baseline_on_refusal():
+    class _RefusingClient:
         model = "stub"
 
-        async def generate_json(self, system_prompt: str, user_prompt: str) -> dict:
-            raise ModelJSONError("not json")
+        async def propose(self, system_prompt: str, user_prompt: str, output_type) -> PlanEditProposal:
+            raise ModelResponseError("stop_reason=refusal")
 
-    result = asyncio.run(revise_plan(_profile(), load_catalog(), "whatever", client=_BadClient()))
+    result = asyncio.run(revise_plan(_profile(), load_catalog(), "whatever", client=_RefusingClient()))
 
     # No usable proposal -> the baseline plan is returned unchanged, flagged as 0 iterations.
     assert result.iterations == 0

@@ -1,6 +1,7 @@
 # TODO — BoilerAdvisor
 
-Working notes and next steps. Last updated 2026-07-06/07 (renamed from "AI Academic Advisor" to **BoilerAdvisor** on 2026-07-06).
+Working notes and next steps. Last updated 2026-07-11 (pivoted the advisor from a local
+Ollama model to the Anthropic API — see "Anthropic API Pivot" under Completed Work).
 
 **🎯 Next goal:** the degree-program crawl is done and the data is sitting in Postgres, but the web app doesn't expose it yet. The concrete next step is wiring the program catalog into the UI so a student can search for a degree and pull up its requirements — see **Priority 3** below. That's the next thing to hand to an agent to implement.
 
@@ -10,8 +11,8 @@ Working notes and next steps. Last updated 2026-07-06/07 (renamed from "AI Acade
 - ✅ Course catalog: 10,607 courses (2026-2027)
 - ✅ **Degree programs: full crawl complete** — 1,165 programs (2026-2027), 23,213 requirement groups, 40,758 requirement options. See Priority 1.
 - ✅ Deterministic planner: validates prerequisites, term offerings, credit caps
-- ✅ RAG advisor: answers questions about courses with sources; requirement-block chunks are now embedded too (see Database state)
-- ✅ LFM2 agent: proposes plan revisions, deterministic planner validates
+- ✅ RAG advisor: answers questions about courses with sources; requirement-block chunks are now embedded too (see Database state). Retrieval is two-tier — exact course-code match (SQL) plus semantic search (in-process fastembed + pgvector), merged under a hard context token budget.
+- ✅ Claude Haiku agent: proposes plan revisions as a schema-enforced structured output, deterministic planner validates
 - ✅ Web UI: onboarding profile form (no hardcoded demo profile), plan generation, direct editing (move/remove per course, add via debounced catalog search), advisor ask/revise chat
 - ✅ **Plan persistence, wired end-to-end**: onboarding calls `POST /v1/students`; every accepted edit/revision/regeneration autosaves via `POST /v1/students/{id}/plans`; a reload restores the newest saved plan (student id in `localStorage`). Save-status chip surfaces Saved/Saving/failed/DB-down.
 - ✅ **Database browsing**: read-only `/admin` page (table counts + paged rows via `GET /v1/admin/*`, whitelisted tables only) and an Adminer container (`make adminer` → http://localhost:8081) for full editing.
@@ -40,7 +41,7 @@ Working notes and next steps. Last updated 2026-07-06/07 (renamed from "AI Acade
 | requirement_options | 40,758 | ✅ Filled |
 | colleges | 0 | ❌ Not populated by the crawl |
 | departments | 0 | ❌ Not implemented |
-| academic_rules (RAG) | 18,602 | ✅ 10,606 course chunks + 7,996 requirement chunks embedded |
+| academic_rules (RAG) | 18,603 | ✅ 10,607 course chunks + 7,996 requirement chunks; re-embedded 2026-07-11 at VECTOR(384) (fastembed BAAI/bge-small-en-v1.5), replacing the old Ollama nomic-embed-text VECTOR(768) vectors |
 
 **Impact:** The data a program picker needs (programs + requirement blocks + RAG chunks) is all in place. Program-driven plans and major-specific RAG answers are unblocked at the API layer already (`derive_remaining_courses()` in `planner_catalog.py`) — the only missing piece is UI that actually sets `program_id`. That's Priority 3.
 
@@ -203,10 +204,14 @@ The planner is the source of truth. No hallucinated courses, no broken prerequis
 
 ### RAG Advisor: Semantic Search + Grounding
 
-- `POST /advisor/ask` embeds the question, retrieves top-K similar course/requirement chunks from pgvector
+- `POST /advisor/ask` retrieves in two tiers: (1) exact — course codes named in the question,
+  matched deterministically against `academic_rules.metadata->>'code'`; (2) semantic — the
+  question is embedded in-process (fastembed) and the top-K nearest chunks are pulled from
+  pgvector. Both tiers are merged and packed under `ADVISOR_CONTEXT_TOKEN_BUDGET` before
+  reaching the Claude Haiku prompt (`services/rag/pipeline.py`).
 - Returns cited sources so answers are verifiable
 - Chunking strategy: one chunk per course + one per requirement block
-- Tuning knobs: `MAX_CHUNK_CHARS`, `RAG_TOP_K`, `RAG_MIN_SIMILARITY` in `.env`
+- Tuning knobs: `MAX_CHUNK_CHARS`, `RAG_TOP_K`, `RAG_MIN_SIMILARITY`, `ADVISOR_CONTEXT_TOKEN_BUDGET` in `.env`
 
 ### Database Schema
 
@@ -279,6 +284,48 @@ make psql                           # SQL prompt
 - RAG backfilled with 7,996 requirement-block chunks
 - Backend read API (`/v1/academic/facets`, `/v1/academic/programs`, `/v1/academic/programs/{id}`) already built and ready — see Priority 3 for the still-open UI work
 
+### 7. Anthropic API Pivot (✅ Done 2026-07-11)
+Moved the advisor from a local Ollama model to the Anthropic API (Claude Haiku). The
+deterministic planner/validation core (Priority 2, `services/planner.py`, `plan_editor.py`)
+is untouched — this was purely a swap of the LLM/RAG transport layer.
+- **Chat:** `services/ollama_client.py` deleted; `services/anthropic_client.py` wraps the
+  `anthropic` SDK (`generate()` for free text, `propose()` for schema-enforced structured
+  output). The API key is read by the SDK from `ANTHROPIC_API_KEY` — deliberately not a
+  `Settings` field, so it can never leak via a `.model_dump()`.
+- **`revise-plan` structured outputs:** `PlanEditProposal` (already a Pydantic model) is now
+  the Anthropic structured-output schema itself (`client.messages.parse(output_format=...)`);
+  the old JSON-repair/retry-on-parse-failure path in `advisor_agent.py` is gone — the API
+  guarantees the response validates. The propose→re-plan *semantic* retry loop (a legal
+  proposal that made the plan worse) is unchanged.
+- **Embeddings:** the Anthropic API has no embeddings endpoint, so `services/rag/embeddings.py`
+  now embeds in-process via `fastembed`/ONNX (`BAAI/bge-small-en-v1.5`, 384-d, CPU). This
+  required dropping and rebuilding `academic_rules` (old vectors were 768-d from Ollama's
+  `nomic-embed-text` and incompatible) and re-running `ingest_catalog` — all chunks
+  re-embedded in ~12 minutes on a laptop CPU (18,603 total rows: 10,607 course + 7,996
+  requirement chunks — matches the pre-pivot counts within one course chunk). **`catalog_db_backup.sql.gz`
+  is now stale on the RAG side** — take a fresh `make backup` before relying on it.
+- **Retrieval upgrade:** `services/rag/pipeline.py` now runs exact course-code match
+  (`store.fetch_by_course_codes`, SQL, similarity pinned to 1.0) alongside semantic search,
+  merges both tiers, and packs them under `ADVISOR_CONTEXT_TOKEN_BUDGET` — input tokens are
+  the Anthropic bill, so this cap is enforced in code, not by hope. `RAG_MIN_SIMILARITY`
+  raised from `0.0` to `0.45` now that it's actually a meaningful floor.
+- **Prompt caching:** `AnthropicClient.system_block()` marks the static system prompt with
+  `cache_control` unconditionally — a no-op below Haiku's 4,096-token minimum cacheable
+  prefix, a real discount above it.
+- **Health check:** `GET /health/llm` replaces `/health/ollama`, using the free Models API
+  (`models.retrieve`) so it costs zero tokens.
+- **Security:** `is_local_model_endpoint()` (blocked accidental cloud spend from a
+  misconfigured local endpoint) is gone — that concern is inverted now that cloud *is* the
+  target. Replaced by: no API key in `Settings`, `ANTHROPIC_API_KEY` only ever entering via
+  `docker-compose.yml`'s `env_file: ../backend/.env` (gitignored, never inlined, never baked
+  into the image), and a workspace-scoped key + Console spend limit (manual setup — see
+  `backend/.env.example`).
+
+**Not done as part of this pivot** (deferred, see the original architecture writeup):
+streaming responses for `/advisor/ask` (SSE via `client.messages.stream`), and evaluating
+Voyage AI as an alternative to in-process embeddings if the VPS CPU turns out to be a
+bottleneck at higher traffic.
+
 ---
 
 ## Development Commands
@@ -307,7 +354,7 @@ Read-only browsing also at http://localhost:3000/admin.
 
 **Debugging:**
 - API docs at http://localhost:8000/docs
-- Ollama health check: `curl http://localhost:8000/health/ollama`
+- Anthropic API health check (zero-token — uses the Models API, not inference): `curl http://localhost:8000/health/llm`
 - Catalog DB: `postgres://catalog:catalog@localhost:5433/catalog_ingestion`
 
 ---
@@ -317,6 +364,7 @@ Read-only browsing also at http://localhost:3000/admin.
 - **Calendar year transitions:** `planner.next_term` correctly crosses year boundaries (fall 2026 → spring 2027)
 - **Page cache:** `catalog_ingestion/.page_cache/` speeds up retries — don't delete casually
 - **RAG + planner:** Decoupled in code (`rag/store.py` has own connection) — either can be reset independently
+- **RAG embedding model is pinned to `academic_rules`'s VECTOR(n) column:** changing `RAG_EMBED_MODEL`/`RAG_EMBED_DIMENSIONS` means the existing table's vectors are no longer comparable to new ones — drop `academic_rules` and re-run `ingest_catalog` (idempotent, ~2 min for 18.6k chunks on CPU). This bit us on the 2026-07-11 Anthropic pivot (Ollama's 768-d `nomic-embed-text` → fastembed's 384-d `bge-small-en-v1.5`).
 - **Offline fallback:** `backend/app/data/courses.json` used when DB is down or unknown codes
 - **Prerequisite gap:** Purdue doesn't publish prerequisites in Acalog; real prereqs in Banner/myPurduePlan (separate sourcing needed)
 - **Fixed (2026-07-05):** `planner.next_term` now correctly crosses year boundaries (fall 2026 → spring 2027)

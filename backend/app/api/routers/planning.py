@@ -1,8 +1,8 @@
 """Deterministic planning routes: generate a plan, directly edit a plan.
 
-Neither route ever touches Ollama — this is the "planner disposes" half of the
-architecture, and it must stay fast and model-free so plan manipulation costs the local
-machine nothing but a few milliseconds of CPU.
+Neither route ever touches the LLM — this is the "planner disposes" half of the
+architecture, and it must stay fast and model-free so plan manipulation costs nothing but
+a few milliseconds of CPU (and zero Anthropic API tokens).
 """
 
 from fastapi import APIRouter, HTTPException

@@ -1,6 +1,6 @@
-"""LFM2 revise-plan agent: the model proposes, the deterministic planner disposes.
+"""Revise-plan agent: the model proposes, the deterministic planner disposes.
 
-The flow is deliberately asymmetric so a local ~8B model can never emit an illegal schedule:
+The flow is deliberately asymmetric so the model can never emit an illegal schedule:
 
     profile ──> generate_plan() ──> baseline legal plan
               │
@@ -14,6 +14,10 @@ The flow is deliberately asymmetric so a local ~8B model can never emit an illeg
 The planner remains the single source of truth for legality (prereqs, term offerings, credit
 caps). The model only reorders codes the planner already knows how to schedule; a hallucinated
 proposal degrades to a no-op because unknown codes and out-of-range caps are dropped on apply.
+
+The proposal is a structured output (``AnthropicClient.propose`` with the PlanEditProposal
+schema), so the API guarantees it parses — the retry loop below exists only for *semantic*
+quality (a proposal that made the plan worse), not for malformed JSON.
 """
 
 from __future__ import annotations
@@ -29,7 +33,7 @@ from app.models.schemas import (
     RevisePlanResponse,
     StudentProfile,
 )
-from app.services.ollama_client import ModelJSONError, OllamaClient
+from app.services.anthropic_client import AnthropicClient, ModelResponseError
 from app.services.planner import generate_plan
 
 logger = logging.getLogger(__name__)
@@ -37,19 +41,16 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_ITERATIONS = 3
 
 
+# Static by design (prompt-cache prefix). Field-level semantics live on PlanEditProposal's
+# Field descriptions, which travel with the structured-output schema — no JSON scaffolding
+# in the prompt.
 _SYSTEM_PROMPT = (
     "You are an assistant that tunes a college course plan from a student's feedback. You are "
     "NOT an official advisor and you must not invent courses, prerequisites, or requirements. "
     "A deterministic planner owns legality (prerequisites, term offerings, credit caps); you "
-    "only express preferences over the courses already listed. Respond with a SINGLE JSON "
-    "object and nothing else, using exactly these keys:\n"
-    '  "rationale": string — one or two sentences explaining the change, for the student.\n'
-    '  "reorder": string[] — course codes to take earlier, highest priority first.\n'
-    '  "defer": string[] — course codes to push to later semesters.\n'
-    '  "avoid_tags": string[] — requirement tags to deprioritise (e.g. "theory-heavy").\n'
-    '  "max_credits_per_semester": integer or null — new per-semester credit cap if asked.\n'
-    "Only use course codes and tags that appear in the context. Leave a list empty if it does "
-    "not apply. Never put a course in both reorder and defer."
+    "only express preferences over the courses already listed. Only use course codes and tags "
+    "that appear in the context. Leave a list empty if it does not apply. Never put a course "
+    "in both reorder and defer."
 )
 
 
@@ -167,7 +168,7 @@ async def revise_plan(
     catalog: list[Course],
     feedback: str,
     *,
-    client: OllamaClient,
+    client: AnthropicClient,
     max_iterations: int = DEFAULT_MAX_ITERATIONS,
 ) -> RevisePlanResponse:
     """Run the propose → apply → re-plan → re-validate loop and return the best plan found."""
@@ -182,10 +183,10 @@ async def revise_plan(
     for iteration in range(1, max_iterations + 1):
         prompt = _user_prompt(profile, best_plan, catalog, feedback, prior_warnings)
         try:
-            raw = await client.generate_json(_SYSTEM_PROMPT, prompt)
-            proposal = PlanEditProposal.model_validate(raw)
-        except (ModelJSONError, ValidationError) as exc:
-            # The model produced junk — keep the best legal plan so far instead of failing.
+            proposal = await client.propose(_SYSTEM_PROMPT, prompt, PlanEditProposal)
+        except (ModelResponseError, ValidationError) as exc:
+            # Refusal, truncation, or a value outside the client-side constraints (e.g. a
+            # credit cap past le=24) — keep the best legal plan so far instead of failing.
             logger.warning("revise-plan: unusable proposal on iteration %d: %s", iteration, exc)
             break
 

@@ -100,8 +100,6 @@ backup: ## Dump the database to catalog_db_backup.sql.gz
 restore: ## Restore the database from catalog_db_backup.sql.gz
 	gunzip -c catalog_db_backup.sql.gz | $(ENGINE) exec -i $(PG) psql -U catalog -d catalog_ingestion
 
-reset: ## DESTROY all data + volumes, then recreate empty tables
+reset: ## DESTROY all data + volumes
 	@$(ENGINE) rm -f $(CONTAINERS) 2>/dev/null || true
 	@$(ENGINE) volume rm $(VOLUMES) 2>/dev/null || true
-	$(COMPOSE) up -d postgres
-	$(COMPOSE) run --rm ingestion db-init

@@ -233,24 +233,40 @@ class PlanEditRequest(BaseModel):
 
 
 class PlanEditProposal(BaseModel):
-    """A structured edit the local model proposes in response to free-text feedback.
+    """A structured edit the model proposes in response to free-text feedback.
 
     The model never emits a schedule directly — it only nudges the knobs the deterministic
     planner already understands, and the planner re-derives a legal plan from them. Every
     field is a preference, not a command: unknown course codes are ignored and the credit cap
     is clamped, so a hallucinated proposal degrades to a no-op rather than an illegal plan.
 
-    * ``reorder`` — course codes to prioritise earlier, in the given order.
-    * ``defer`` — course codes to push toward later semesters.
-    * ``avoid_tags`` — requirement tags (e.g. ``theory-heavy``) to deprioritise.
-    * ``max_credits_per_semester`` — new per-semester credit cap, if the feedback asks for one.
+    This model doubles as the structured-output schema sent to the Anthropic API (the field
+    descriptions below are what the model sees), so the API guarantees every proposal
+    validates — there is no JSON-repair path.
     """
 
-    rationale: str = ""
-    reorder: list[str] = Field(default_factory=list)
-    defer: list[str] = Field(default_factory=list)
-    avoid_tags: list[str] = Field(default_factory=list)
-    max_credits_per_semester: int | None = Field(default=None, ge=1, le=24)
+    rationale: str = Field(
+        default="",
+        description="One or two sentences explaining the change, addressed to the student.",
+    )
+    reorder: list[str] = Field(
+        default_factory=list,
+        description="Course codes to take earlier, highest priority first.",
+    )
+    defer: list[str] = Field(
+        default_factory=list,
+        description="Course codes to push to later semesters.",
+    )
+    avoid_tags: list[str] = Field(
+        default_factory=list,
+        description="Requirement tags to deprioritise (e.g. 'theory-heavy').",
+    )
+    max_credits_per_semester: int | None = Field(
+        default=None,
+        ge=1,
+        le=24,
+        description="New per-semester credit cap, only if the student asked for one.",
+    )
 
 
 class RevisePlanRequest(BaseModel):

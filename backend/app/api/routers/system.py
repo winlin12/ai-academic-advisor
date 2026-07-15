@@ -4,7 +4,7 @@ API version advances."""
 
 from fastapi import APIRouter
 
-from app.services.ollama_client import LocalModelEndpointError, OllamaClient
+from app.services.anthropic_client import AnthropicClient
 
 router = APIRouter(tags=["system"])
 
@@ -14,24 +14,13 @@ def health():
     return {"status": "ok"}
 
 
-@router.get("/health/ollama")
-async def ollama_health():
-    try:
-        client = OllamaClient()
-    except LocalModelEndpointError as exc:
-        return {
-            "ok": False,
-            "detail": str(exc),
-            "local_only": True,
-            "compute_warning": "Local models can use substantial CPU/GPU, memory, and battery.",
-        }
+@router.get("/health/llm")
+async def llm_health():
+    """Verify the Anthropic API key and model id end-to-end without spending a token.
 
+    Uses the Models API (``models.retrieve``) — a free endpoint — so this probe can run on
+    every deploy and from uptime monitors at zero inference cost.
+    """
+    client = AnthropicClient()
     ok, detail = await client.health()
-    return {
-        "ok": ok,
-        "detail": detail,
-        "ollama_url": client.base_url,
-        "model": client.model,
-        "local_only": client.local_only,
-        "compute_warning": "Local models can use substantial CPU/GPU, memory, and battery.",
-    }
+    return {"ok": ok, "detail": detail, "model": client.model}

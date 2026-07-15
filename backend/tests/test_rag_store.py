@@ -92,3 +92,44 @@ def test_upsert_and_cosine_search_ranks_nearest_first():
         with psycopg.connect(settings.academic_database_url) as conn:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM academic_rules WHERE metadata->>'_test' = %s", (_TEST_MARKER,))
+
+
+@pytest.mark.skipif(not _db_available(), reason="catalog_ingestion Postgres not reachable")
+def test_fetch_by_course_codes_matches_space_insensitively():
+    dims = settings.rag_embed_dimensions
+
+    try:
+        store.ensure_schema()
+    except psycopg.Error as exc:
+        pytest.skip(f"pgvector not available (use the pgvector/pgvector image): {exc}")
+
+    try:
+        # Codes deliberately outside any real subject range (Purdue subjects are 2-4 real
+        # letters), so this test is robust to running against the fully-ingested catalog —
+        # a real code like "CS 25100" would collide with the actual stored row.
+        store.upsert_rule(
+            "TEST COURSE ZZ 90001 — Data Structures",
+            {"_test": _TEST_MARKER, "type": "course", "code": "ZZ 90001"},
+            _unit_vector(0, dims),
+        )
+        store.upsert_rule(
+            "TEST COURSE ZZ 90002 — Calculus",
+            {"_test": _TEST_MARKER, "type": "course", "code": "ZZ 90002"},
+            _unit_vector(1, dims),
+        )
+
+        # "ZZ90001" (no space, as extract_course_codes normalizes it) must still match
+        # the stored "ZZ 90001" metadata.
+        matches = store.fetch_by_course_codes(["ZZ90001"])
+        assert [m["metadata"]["code"] for m in matches] == ["ZZ 90001"]
+        assert matches[0]["similarity"] == 1.0
+
+        # A code with no stored match returns nothing, not an error.
+        assert store.fetch_by_course_codes(["ZZ99999"]) == []
+
+        # Empty input short-circuits without touching the DB.
+        assert store.fetch_by_course_codes([]) == []
+    finally:
+        with psycopg.connect(settings.academic_database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM academic_rules WHERE metadata->>'_test' = %s", (_TEST_MARKER,))

@@ -3,16 +3,19 @@
 The advisor answers over ``academic_rules`` (semantic retrieval), but that table starts empty
 — the catalog lives in the relational tables (``courses``, ``programs``, ...). This module is
 the bridge: it turns each course and each program requirement block into one self-contained,
-retrievable text chunk, embeds it via the local model, and upserts it.
+retrievable text chunk, embeds it in-process (fastembed/ONNX — see ``rag/embeddings.py``;
+the first run downloads ~100MB of model weights to the HF cache), and upserts it.
 
-Run it once after the relational catalog has been ingested (and re-run any time it changes):
+Run it once after the relational catalog has been ingested, and re-run any time the catalog
+OR the embedding model changes (stored vectors and query vectors must come from the same
+model — after a model change, drop ``academic_rules`` first so the VECTOR(n) width matches):
 
     python -m app.services.rag.ingest_catalog            # embed courses + program rules
     python -m app.services.rag.ingest_catalog --dry-run  # build chunks, print samples, no model
     python -m app.services.rag.ingest_catalog --limit 50 # smoke-test the model path cheaply
 
-Embedding 10k+ courses through a local model takes a while; ingestion is idempotent (chunks are
-keyed by a content hash), so a re-run only embeds new or changed chunks unless you pass --force.
+Ingestion is idempotent (chunks are keyed by a content hash), so a re-run only embeds new or
+changed chunks unless you pass --force.
 """
 
 from __future__ import annotations
@@ -28,7 +31,6 @@ from psycopg.rows import dict_row
 from app.core.config import settings
 from app.models.schemas import AcademicProgramDetail, RequirementBlockDetail
 from app.services.academic_db import _credits_text, fetch_program_detail, fetch_program_summaries
-from app.services.ollama_client import OllamaClient
 from app.services.rag import store
 from app.services.rag.pipeline import ingest_rule
 
@@ -174,7 +176,6 @@ async def ingest_catalog(
     if not dry_run:
         store.ensure_schema()
     existing = set() if (force or dry_run) else store.existing_hashes()
-    client = None if dry_run else OllamaClient()
 
     def chunk_sources() -> Iterator[Chunk]:
         if include_courses:
@@ -193,7 +194,7 @@ async def ingest_catalog(
             if counts[kind] < 2:  # show a couple of real samples per kind
                 logger.info("SAMPLE [%s] %s", kind, content[:200].replace("\n", " / "))
         else:
-            await ingest_rule(content, metadata, client=client)
+            await ingest_rule(content, metadata)
         counts[kind] += 1
 
         processed += 1

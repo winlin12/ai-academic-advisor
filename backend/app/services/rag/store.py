@@ -1,9 +1,9 @@
 """Step 1 (schema) + the Postgres side of Steps 2 and 3.
 
 This module is the *only* place that talks to Postgres/pgvector. It receives vectors as
-plain ``list[float]`` and returns plain dict rows; it neither knows nor cares that Ollama
-produced those vectors. That decoupling is what lets you swap the embedding model (or the
-whole embedding provider) without touching a line of SQL.
+plain ``list[float]`` and returns plain dict rows; it neither knows nor cares which model
+produced those vectors. That decoupling is what let the embedding provider move from
+Ollama to in-process fastembed (2026-07-10) without touching a line of SQL.
 """
 
 from __future__ import annotations
@@ -56,8 +56,8 @@ def ensure_schema() -> None:
     """Step 1: enable pgvector and create ``academic_rules`` + its indexes (idempotent).
 
     Safe to call on every startup: every statement is ``IF NOT EXISTS``. The VECTOR width is
-    pinned from config so the column, the model, and OllamaClient.embed can never silently
-    disagree.
+    pinned from config so the column, the embedding model, and ``embeddings.embed_*`` can
+    never silently disagree.
     """
     dims = settings.rag_embed_dimensions
     with _connect() as conn, conn.cursor() as cur:
@@ -143,6 +143,38 @@ def upsert_rule(content: str, metadata: dict[str, Any], embedding: list[float]) 
         )
         row = cur.fetchone()
     return int(row["id"])
+
+
+def fetch_by_course_codes(codes: list[str]) -> list[dict[str, Any]]:
+    """Exact-match retrieval: course chunks whose metadata ``code`` matches one of ``codes``.
+
+    The deterministic first tier of retrieval (see ``pipeline``): when a student names a
+    course, its chunk is fetched by metadata equality instead of hoping cosine distance
+    finds it. Codes are compared space-insensitively ("CS 25100" == "CS25100"). Rows come
+    back in the same shape as ``search()`` with similarity pinned to 1.0 so the pipeline
+    can merge both tiers into one ranked context. Returns [] on an empty/missing table.
+    """
+    if not codes:
+        return []
+    wanted = [code.replace(" ", "").upper() for code in codes]
+    with _connect() as conn:
+        if not _table_ready(conn):
+            return []
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id,
+                       content,
+                       metadata,
+                       1.0::float8 AS similarity
+                FROM academic_rules
+                WHERE metadata->>'type' = 'course'
+                  AND upper(replace(metadata->>'code', ' ', '')) = ANY(%(codes)s)
+                ORDER BY metadata->>'code'
+                """,
+                {"codes": wanted},
+            )
+            return cur.fetchall()
 
 
 def search(embedding: list[float], top_k: int) -> list[dict[str, Any]]:
