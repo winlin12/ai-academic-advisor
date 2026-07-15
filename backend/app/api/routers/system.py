@@ -4,7 +4,7 @@ API version advances."""
 
 from fastapi import APIRouter
 
-from app.services.anthropic_client import AnthropicClient
+from app.services.ollama_client import OllamaClient
 
 router = APIRouter(tags=["system"])
 
@@ -16,11 +16,10 @@ def health():
 
 @router.get("/health/llm")
 async def llm_health():
-    """Verify the Anthropic API key and model id end-to-end without spending a token.
-
-    Uses the Models API (``models.retrieve``) — a free endpoint — so this probe can run on
-    every deploy and from uptime monitors at zero inference cost.
+    """Verify Ollama is reachable and the configured model is actually pulled, without
+    running inference. Hits ``/api/tags`` only — same zero-cost intent as the old
+    Anthropic Models-API probe, just against the local server instead of the cloud.
     """
-    client = AnthropicClient()
+    client = OllamaClient()
     ok, detail = await client.health()
     return {"ok": ok, "detail": detail, "model": client.model}

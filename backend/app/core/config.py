@@ -9,16 +9,37 @@ _BACKEND_ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
 
 
 class Settings(BaseSettings):
-    # Anthropic API (cloud inference — replaced the local Ollama stack on 2026-07-10).
-    # The API key is deliberately NOT a field here: the SDK reads ANTHROPIC_API_KEY
-    # straight from the process environment, so the secret can never leak through a
-    # settings.model_dump() in a log line or debug endpoint.
-    # claude-sonnet-4-5 (not haiku) so prompt caching engages: its minimum cacheable
-    # prefix is 1,024 tokens vs. Haiku 4.5's 4,096, and the advisor system prompt +
-    # inlined DB schema (~2.5K tokens) clears the former but not the latter.
+    # Ollama (local inference — re-pivoted from the Anthropic API on 2026-07-15; a
+    # public-facing site can't carry unbounded per-question cloud spend). Production
+    # topology: the backend process and Ollama run on the SAME box (the RTX 2060 Super
+    # server, 24/7). 127.0.0.1, not "localhost": under uvicorn's uvloop, "localhost" can
+    # resolve AAAA (::1) first and fail outright against an IPv4-only Ollama bind, even
+    # though the same lookup falls back to IPv4 fine under the default asyncio loop —
+    # hit this in local testing. A literal IP sidesteps dual-stack resolution entirely.
+    ollama_base_url: str = "http://127.0.0.1:11434"
+    # PLACEHOLDER pending model_eval/'s verdict (see repo root model_eval/README.md) —
+    # this is not yet the chosen model, just something known-good to build the wiring
+    # against. Swap once the harness names a winner for the 2060 Super's 8GB.
+    ollama_model: str = "llama3.1:8b"
+    # Refuses to start against a non-local/non-private base URL unless explicitly
+    # lifted — a misconfiguration guard (accidentally pointing at a random public
+    # endpoint), not a real security boundary.
+    ollama_local_only: bool = True
+    # Mirrors model_eval/config.yaml's run knobs so production uses values that were
+    # actually measured, not defaults. Ollama defaults num_ctx to 2K-4K regardless of
+    # what the model supports — leaving this unset is the single biggest way to silently
+    # under-serve a model.
+    ollama_num_ctx: int = 8192
+    ollama_temperature: float = 0.15
+    # Keeps the model resident between requests on the same box; never restart the
+    # Ollama process to get a "fresh" context — each request already starts fresh
+    # server-side (no conversation carryover), this only controls VRAM residency.
+    ollama_keep_alive: str = "15m"
+
+    # Anthropic API — kept as an optional swappable backend (services/anthropic_client.py),
+    # not the active path. Requires ANTHROPIC_API_KEY (read by the SDK from the process
+    # environment, deliberately not a Settings field) if ever swapped back in.
     anthropic_model: str = "claude-sonnet-4-5"
-    # Per-response output cap. Advisor answers are deliberately short; raise only with
-    # a reason (this is also the per-request cost ceiling on the $15/MTok output side).
     anthropic_max_tokens: int = 2048
 
     # catalog_ingestion database (Docker Postgres publishes 5432 -> host 5433).

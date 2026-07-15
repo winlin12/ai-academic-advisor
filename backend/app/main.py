@@ -32,7 +32,7 @@ app = FastAPI(
         {"name": "system", "description": "Health and runtime probes (unversioned)."},
         {"name": "academic", "description": "Read-only catalog data: facets, programs, course search."},
         {"name": "planning", "description": "Deterministic planner: generate and directly edit plans. No LLM."},
-        {"name": "advisor", "description": "LLM routes (Anthropic API): RAG ask, explain-plan, revise-plan."},
+        {"name": "advisor", "description": "LLM routes (local Ollama): RAG ask, explain-plan, revise-plan."},
         {"name": "students", "description": "Student profile and saved-plan persistence."},
         {"name": "admin", "description": "Read-only database browsing for the admin page."},
     ],

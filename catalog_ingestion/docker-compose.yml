@@ -57,9 +57,10 @@ services:
     working_dir: /app
 
   # FastAPI web server (the app's backend). Reads the catalog_ingestion database over
-  # the compose network, calls the Anthropic API for chat, and serves the /academic/*,
-  # /catalog/*, /plan/*, /advisor/* endpoints. The Next.js client (clients/web) calls this
-  # at http://localhost:8000.
+  # the compose network, calls a local Ollama model (running on the HOST, outside this
+  # compose network — see the OLLAMA_BASE_URL override below) for chat, and serves the
+  # /academic/*, /catalog/*, /plan/*, /advisor/* endpoints. The Next.js client
+  # (clients/web) calls this at http://localhost:8000.
   backend:
     build:
       context: ../backend
@@ -70,9 +71,9 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    # ANTHROPIC_API_KEY (and any other secret/override) is injected here, at container
-    # start, from the gitignored backend/.env — never baked into the image, never inlined
-    # below. See backend/.env.example for the full list of keys this file may set.
+    # Any secret/override is injected here, at container start, from the gitignored
+    # backend/.env — never baked into the image, never inlined below. See
+    # backend/.env.example for the full list of keys this file may set.
     env_file:
       - ../backend/.env
     environment:
@@ -80,6 +81,16 @@ services:
       # name, not the host-published 5433 port. Non-secret, so inline here is fine — it
       # deliberately overrides whatever ACADEMIC_DATABASE_URL is set to in backend/.env.
       ACADEMIC_DATABASE_URL: postgresql://catalog:catalog@postgres:5432/catalog_ingestion
+      # Ollama runs on the HOST (this box, outside Docker), not as a compose service —
+      # "localhost" from backend/.env means the CONTAINER's own loopback here, which is
+      # wrong. host.docker.internal (mapped below via extra_hosts so this also works on
+      # Linux/podman, not just Docker Desktop) reaches the host's Ollama instead. This
+      # deliberately overrides whatever OLLAMA_BASE_URL is set to in backend/.env.
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+    extra_hosts:
+      # Docker Desktop (Mac) already resolves this; Linux Docker 20.10+/podman need it
+      # explicit. host-gateway = the special value that means "the host's real IP".
+      - "host.docker.internal:host-gateway"
     ports:
       - "8000:8000"
     volumes:

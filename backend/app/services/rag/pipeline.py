@@ -1,7 +1,7 @@
 """Step 2 (ingest) + Step 3 (answer): the composition layer.
 
 This is the only module that composes the embedding provider (``embeddings``), the
-persistence layer (``store``), and the chat model (``AnthropicClient``). Each helper it
+persistence layer (``store``), and the chat model (``OllamaClient``). Each helper it
 calls is independently testable; this file wires them into the two end-to-end flows.
 
 Retrieval is two-tier, cheapest-first:
@@ -12,8 +12,9 @@ Retrieval is two-tier, cheapest-first:
        distance, floored by ``rag_min_similarity``.
 
 Both tiers are merged (exact first, deduped by row id) and packed under a hard token budget
-(``advisor_context_token_budget``) before anything reaches the prompt — input tokens are the
-Anthropic bill, and this budget is the cap.
+(``advisor_context_token_budget``) before anything reaches the prompt. Local inference has no
+per-token bill, but the cap stays: a bloated context is still slower on an 8GB card and still
+a way to accidentally drown the model's ``num_ctx`` window.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from app.core.config import settings
-from app.services.anthropic_client import AnthropicClient
+from app.services.ollama_client import OllamaClient
 from app.services.rag import embeddings, store
 
 logger = logging.getLogger(__name__)
@@ -41,13 +42,13 @@ _DB_SCHEMA = (Path(__file__).resolve().parents[2] / "data" / "db_schema.md").rea
 
 # Fixed framing for every advisor answer. The retrieved rules are the ONLY facts the model
 # is allowed to use, which is what turns a general chatbot into a grounded advisor and stops
-# it from inventing courses/credits it never saw. Static by construction — anything volatile
-# would invalidate the prompt-cache prefix (see AnthropicClient.system_block).
+# it from inventing courses/credits it never saw. Static-first ordering (this block, then the
+# variable question) is kept even though local Ollama has no explicit prompt-cache API like
+# Anthropic's cache_control — it's still good hygiene (keeps a backend swap cheap) and lets
+# Ollama's own KV-cache reuse an identical prefix across requests on an already-loaded model.
 #
-# The schema is appended for two reasons: it teaches the model what the context chunks'
-# metadata tags mean (they mirror these tables/columns), and it pushes the static prefix past
-# the model's minimum cacheable size (1,024 tokens on claude-sonnet-4-5), so the whole block
-# bills at ~0.1x on cache hits instead of full price every request.
+# The schema is appended so the model can interpret the context chunks' metadata tags (they
+# mirror these tables/columns) — it contains no course facts itself, never a citable source.
 _ADVISOR_SYSTEM_PROMPT = (
     "You are a college academic advisor. Answer using ONLY the CONTEXT below, which contains "
     "retrieved degree rules and course descriptions. If the context does not contain the "
@@ -159,7 +160,7 @@ async def answer_question(
     question: str,
     *,
     top_k: int | None = None,
-    client: AnthropicClient | None = None,
+    client: OllamaClient | None = None,
 ) -> dict[str, Any]:
     """Step 3 end-to-end: exact + semantic retrieval -> budgeted context -> generate.
 
@@ -167,7 +168,7 @@ async def answer_question(
     and so the retrieval quality is observable, not a black box.
     """
     top_k = top_k or settings.rag_top_k
-    client = client or AnthropicClient()
+    client = client or OllamaClient()
 
     # Tier 1: deterministic — course codes named in the question, straight from SQL.
     exact = store.fetch_by_course_codes(extract_course_codes(question))

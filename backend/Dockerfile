@@ -1,7 +1,8 @@
 # FastAPI backend image for BoilerAdvisor.
 # Reads the catalog_ingestion Postgres database (see app/services/academic_db.py) and calls
-# the Anthropic API for chat (ANTHROPIC_API_KEY must be injected at runtime — see
-# catalog_ingestion/docker-compose.yml's env_file, never baked into this image).
+# a local Ollama model for chat (OLLAMA_BASE_URL must point at the Ollama instance running
+# on the HOST — see catalog_ingestion/docker-compose.yml's host.docker.internal override —
+# since Ollama is not itself a container in this stack).
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \

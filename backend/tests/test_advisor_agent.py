@@ -1,21 +1,21 @@
 """Tests for the revise-plan agent.
 
 The model transport is stubbed (canned PlanEditProposal objects, mirroring what
-AnthropicClient.propose returns after structured-output parsing), so these run with no
-network — they exercise the proposal-application logic and the propose → re-plan loop
-against the seed catalog.
+OllamaClient.propose returns after schema validation), so these run with no network — they
+exercise the proposal-application logic and the propose → re-plan loop against the seed
+catalog.
 """
 
 import asyncio
 
 from app.models.schemas import PlanEditProposal, StudentProfile
 from app.services.advisor_agent import _apply_proposal, revise_plan
-from app.services.anthropic_client import ModelResponseError
 from app.services.catalog import load_catalog
+from app.services.ollama_client import ModelResponseError
 
 
 class _StubClient:
-    """Stand-in for AnthropicClient that returns canned proposals in order."""
+    """Stand-in for OllamaClient that returns canned proposals in order."""
 
     def __init__(self, responses: list[PlanEditProposal]):
         self.model = "stub-model"

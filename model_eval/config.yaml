@@ -1,0 +1,84 @@
+# Harness configuration. Everything that could differ between models and
+# thereby pollute the comparison lives HERE, once, and is applied identically.
+
+ollama:
+  base_url: "http://localhost:11434"
+  # Shell command that prints recent Ollama server logs, used to parse the
+  # authoritative "offloaded X/Y layers to GPU" line (`ollama ps` reports a
+  # memory split, not a layer split — do not trust it for offload).
+  # Linux systemd install:   "journalctl -u ollama -n 4000 --no-pager"
+  # Docker:                  "docker logs --tail 4000 ollama"
+  # null = skip log parsing; the report will say offload is UNVERIFIED.
+  server_log_cmd: null
+
+run:
+  # THE critical knob. Applied identically to every model. If a model can't
+  # fit this context at Q4_K_M in 8GB, that is itself a finding — record it,
+  # don't silently shrink the context for that one model.
+  num_ctx: 8192
+  temperature: 0.15
+  seed: 42
+  top_p: 0.9
+  max_output_tokens: 1024   # num_predict; generous, so truncation is a model fault
+  runs_per_pair: 3          # N runs per (model x question) — variance, not luck
+  warmup_discard: 2         # generations per model discarded before measurement
+  keep_alive: "15m"         # keep model warm within its block; never restart Ollama
+  request_timeout_s: 300
+
+# Models. I do NOT assume knowledge of models that postdate my training
+# (lfm2.5, gemma4, qwen3.5, qwen3.6, granite4.1, ministral-3) — verify each
+# tag exists on ollama.com/library and prefer TEXT-ONLY tags (multimodal tags
+# waste ~1.4GB VRAM on a vision encoder). Fields:
+#   think: false = explicitly disable thinking (sent as "think": false)
+#          null  = model has no known thinking switch; nothing is sent
+#   bracket: 8gb | small | reference
+models:
+  - name: "lfm2.5"
+    bracket: 8gb
+    think: false          # brief says LFM2.5 reasons; verify the switch works
+  - name: "gemma4:e4b"
+    bracket: 8gb
+    think: false          # brief says Gemma 4 has a thinking mode
+  - name: "qwen3.5:9b"
+    bracket: 8gb
+    think: false
+  - name: "qwen3:8b"
+    bracket: 8gb
+    think: false          # qwen3 thinking is toggleable; harness sends think:false
+  - name: "qwen2.5:7b"
+    bracket: 8gb
+    think: null
+  - name: "granite4.1:8b"
+    bracket: 8gb
+    think: null           # unknown to me — check and correct
+  - name: "ministral-3:8b"
+    bracket: 8gb
+    think: null           # unknown to me — check and correct
+  - name: "mistral"
+    bracket: 8gb
+    think: null
+  - name: "llama3.1:8b"   # control
+    bracket: 8gb
+    think: null
+  - name: "deepseek-r1:8b" # expected latency counterexample
+    bracket: 8gb
+    think: false          # if disabling fails, r1 output will show <think> anyway
+  - name: "gemma4:e2b"    # small-tier sanity check
+    bracket: small
+    think: false
+  - name: "qwen3.6:27b"   # reference tier — run on the 5070 Ti box only
+    bracket: reference
+    think: false
+
+paths:
+  schema_sql: "schema.sql"
+  questions: "questions.yaml"
+  db_file: "eval.sqlite"
+  results_dir: "results"
+
+# Pre-registered decision thresholds (see README.md "Decision rule").
+# Edit BEFORE running; the report evaluates the rule mechanically from these.
+decision:
+  sql_correct_gap_pp: 15        # 27B minus mitigated-best-8GB, percentage points
+  sql_correct_8gb_floor: 0.80   # if mitigated 8GB >= this, cache+retry covers the rest
+  min_gold_questions: 30        # below this, the report refuses to call the gap real

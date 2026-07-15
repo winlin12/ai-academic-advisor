@@ -1,8 +1,7 @@
 """LLM-facing routes: ask (RAG), explain-plan, revise-plan. These are the only routes that
-spend Anthropic API tokens; everything they return that *matters* (the plan itself) is still
+call the local Ollama model; everything they return that *matters* (the plan itself) is still
 produced or re-validated by the deterministic planner."""
 
-import anthropic
 import psycopg
 from fastapi import APIRouter, HTTPException
 
@@ -17,41 +16,36 @@ from app.models.schemas import (
     RevisePlanResponse,
 )
 from app.services.advisor_agent import revise_plan
-from app.services.anthropic_client import AnthropicClient, MissingAPIKeyError, ModelResponseError
+from app.services.ollama_client import (
+    ModelNotFoundError,
+    ModelResponseError,
+    OllamaClient,
+    OllamaConnectionError,
+)
 from app.services.rag.embeddings import EmbeddingError
 from app.services.rag.pipeline import answer_question
 
 router = APIRouter(prefix="/advisor", tags=["advisor"])
 
+_LlmError = OllamaConnectionError | ModelNotFoundError | ModelResponseError
 
-def _llm_http_error(exc: anthropic.APIError | MissingAPIKeyError) -> HTTPException:
-    """Map the SDK's typed errors (plus our own MissingAPIKeyError) onto the HTTP ladder,
-    most specific first.
 
-    503 = our config problem (key), 429 = upstream rate limit (retryable by the client),
-    502 = upstream transport/API failure. The SDK already retried 429/5xx with backoff
-    before any of these surface here.
+def _llm_http_error(exc: _LlmError) -> HTTPException:
+    """Map the local-model failure modes onto the HTTP ladder, most specific first.
+
+    503 = the model backend isn't usable right now (server down, model not pulled) —
+    retryable once an operator fixes it, not by the client retrying immediately. 502 =
+    the server answered but the output was unusable (empty, or still-invalid JSON after
+    propose()'s internal retry). There is no upstream rate limit to map (no cloud vendor).
     """
-    if isinstance(exc, MissingAPIKeyError):
+    if isinstance(exc, (OllamaConnectionError, ModelNotFoundError)):
         return HTTPException(status_code=503, detail=str(exc))
-    if isinstance(exc, anthropic.AuthenticationError):
-        return HTTPException(
-            status_code=503,
-            detail=(
-                "Anthropic API authentication failed — set ANTHROPIC_API_KEY in "
-                "backend/.env (or the process environment) and restart the backend."
-            ),
-        )
-    if isinstance(exc, anthropic.RateLimitError):
-        return HTTPException(status_code=429, detail="Anthropic API rate limit hit; retry shortly.")
-    if isinstance(exc, anthropic.APIStatusError):
-        return HTTPException(status_code=502, detail=f"Anthropic API error {exc.status_code}: {exc.message}")
-    return HTTPException(status_code=502, detail=f"Could not reach the Anthropic API: {exc}")
+    return HTTPException(status_code=502, detail=str(exc))
 
 
 @router.post("/explain-plan", response_model=ExplainPlanResponse)
 async def explain_plan(req: ExplainPlanRequest):
-    client = AnthropicClient()
+    client = OllamaClient()
 
     system_prompt = """
 You are an AI academic planning assistant.
@@ -74,10 +68,8 @@ Explain the plan clearly. Focus on prerequisites, semester sequencing, warnings,
 
     try:
         answer = await client.generate(system_prompt=system_prompt, user_prompt=user_prompt)
-    except (anthropic.APIError, MissingAPIKeyError) as exc:
+    except (OllamaConnectionError, ModelNotFoundError, ModelResponseError) as exc:
         raise _llm_http_error(exc) from exc
-    except ModelResponseError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     return ExplainPlanResponse(answer=answer)
 
@@ -88,14 +80,14 @@ async def revise_plan_route(req: RevisePlanRequest):
 
     The model proposes edits (reorder/defer/avoid-tags/credit-cap) as a schema-enforced
     PlanEditProposal and the deterministic planner re-validates them, so the returned plan
-    is always legal. Error ladder: 503 (API key), 429 (upstream rate limit), 502 (API).
+    is always legal. Error ladder: 503 (Ollama down / model not pulled), 502 (bad output).
     """
-    client = AnthropicClient()
+    client = OllamaClient()
 
     profile, catalog = resolve_for_planning(req.profile)
     try:
         return await revise_plan(profile, catalog, req.feedback, client=client)
-    except (anthropic.APIError, MissingAPIKeyError) as exc:
+    except (OllamaConnectionError, ModelNotFoundError, ModelResponseError) as exc:
         raise _llm_http_error(exc) from exc
 
 
@@ -105,15 +97,15 @@ async def advisor_ask(req: AdvisorAskRequest):
 
     Course codes named in the question are fetched deterministically; the question is also
     embedded (in-process) and the most similar ``academic_rules`` chunks are pulled by
-    cosine distance. Claude is grounded on just those, under a hard context token budget.
+    cosine distance. The local model is grounded on just those, under a hard context budget.
     The retrieved chunks come back as ``sources`` so the answer stays inspectable and
     citable. The catalog must first be loaded into ``academic_rules``
     (``python -m app.services.rag.ingest_catalog``), otherwise retrieval returns nothing
     and the model will say it has no rule on file.
 
-    Error ladder: 503 (API key / database), 429 (upstream rate limit), 502 (embedding/API).
+    Error ladder: 503 (database / Ollama down / model not pulled), 502 (embedding/output).
     """
-    client = AnthropicClient()
+    client = OllamaClient()
 
     try:
         result = await answer_question(req.question, client=client)
@@ -121,10 +113,8 @@ async def advisor_ask(req: AdvisorAskRequest):
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     except psycopg.Error as exc:
         raise academic_db_unavailable(exc) from exc
-    except (anthropic.APIError, MissingAPIKeyError) as exc:
+    except (OllamaConnectionError, ModelNotFoundError, ModelResponseError) as exc:
         raise _llm_http_error(exc) from exc
-    except ModelResponseError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     return AdvisorAskResponse(
         answer=result["answer"],
