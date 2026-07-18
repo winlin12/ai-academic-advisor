@@ -10,6 +10,7 @@ noise at the current sample size.
 from __future__ import annotations
 
 import json
+import sqlite3
 import statistics
 from collections import defaultdict
 from pathlib import Path
@@ -30,6 +31,7 @@ class ModelStats:
     def __init__(self) -> None:
         self.sql_records: list[dict] = []
         self.summary_records: list[dict] = []
+        self.e2e_records: list[dict] = []
         self.env: dict[str, Any] = {}
 
     # -- helpers -------------------------------------------------------------
@@ -72,6 +74,39 @@ class ModelStats:
     @staticmethod
     def k_clarify(r):
         return r["behavior_ok"] if r["expected_behavior"] == "clarify" else None
+
+    def correct_honest_value(self, gold_ids: set[str]) -> float | None:
+        vals = [bool(r["sql_correct"]) for r in self.sql_records if r["question_id"] in gold_ids]
+        return _rate(vals) if vals else None
+
+    def correct_honest(self, gold_ids: set[str]) -> str:
+        """SQL_CORRECT with abstentions counted as misses, not excluded. k_correct's
+        denominator is only rows where the model actually emitted SQL against a gold
+        question — a decline/clarify/unparseable on a real question silently vanishes
+        from that rate instead of counting against it. This recomputes over every
+        gold-eligible call: r['sql_correct'] is True -> pass, anything else -> fail."""
+        def key(r):
+            return bool(r["sql_correct"]) if r["question_id"] in gold_ids else None
+        buckets: dict[int, list[bool]] = defaultdict(list)
+        vals: list[bool] = []
+        for r in self.sql_records:
+            v = key(r)
+            if v is None:
+                continue
+            vals.append(v)
+            buckets[r["run_idx"]].append(v)
+        if not vals:
+            return "—"
+        spread = [_rate(v) for v in buckets.values() if v]
+        return self._fmt(_rate(vals), spread)
+
+    def e2e_rate(self) -> str:
+        """Heuristic pass rate for the end-to-end stage (model's OWN retrieval, not gold
+        rows, fed to the summarizer). Not a verdict — see the honesty ledger in scorers.py."""
+        if not self.e2e_records:
+            return "—"
+        passed = sum(1 for r in self.e2e_records if r.get("e2e_auto_pass"))
+        return f"{passed}/{len(self.e2e_records)} heuristic-pass"
 
     def metric(self, key) -> str:
         return self._fmt(self._overall(key), self._by_run(key))
@@ -117,23 +152,52 @@ def load_stats(path: Path) -> dict[str, ModelStats]:
             s.sql_records.append(r)
         elif r.get("stage") == "summary" and "error" not in r:
             s.summary_records.append(r)
+        elif r.get("stage") == "e2e" and "error" not in r:
+            s.e2e_records.append(r)
     return dict(stats)
 
 
-def _model_table(stats: dict[str, ModelStats], cfg: dict) -> list[str]:
+def gold_empty_questions(root: Path, cfg: dict, questions: list[dict]) -> list[str]:
+    """Gold SQL that returns zero rows against the actual seed DB is a trap: ANY candidate
+    query that also returns nothing — right or wrong — trivially matches it, inflating
+    SQL_CORRECT for whichever model happens to give up gracefully. Flag these so they get
+    fixed (add seed rows or drop the gold) instead of silently padding scores."""
+    db_file = root / cfg["paths"]["db_file"]
+    if not db_file.exists():
+        return []
+    conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
+    conn.execute("PRAGMA query_only = ON")
+    empty: list[str] = []
+    for q in questions:
+        gold = (q.get("gold_sql") or "").strip()
+        if not gold:
+            continue
+        try:
+            rows = conn.execute(gold.rstrip(";")).fetchall()
+        except sqlite3.Error:
+            continue
+        if not rows:
+            empty.append(q["id"])
+    conn.close()
+    return empty
+
+
+def _model_table(stats: dict[str, ModelStats], cfg: dict, gold_ids: set[str]) -> list[str]:
     bracket = {m["name"]: m.get("bracket", "?") for m in cfg["models"]}
     lines = [
-        "| Model | Bracket | SQL_VALID | SQL_CORRECT | DECLINE | CLARIFY | Faithfulness | p50/p95 | Consistency | Offload |",
-        "|---|---|---|---|---|---|---|---|---|---|",
+        "| Model | Bracket | SQL_VALID | SQL_CORRECT (attempted) | SQL_CORRECT (honest) "
+        "| E2E (heuristic) | DECLINE | CLARIFY | Faithfulness | p50/p95 | Consistency | Offload |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     def sort_key(item):
-        return -(item[1].metric_value(ModelStats.k_correct) or 0)
+        return -(item[1].correct_honest_value(gold_ids) or 0)
     for name, s in sorted(stats.items(), key=sort_key):
         off = (s.env.get("offload") or {})
         off_s = off.get("layers") or ("full" if off.get("fully_offloaded") else "UNVERIFIED")
         lines.append(
             f"| {name} | {bracket.get(name, '?')} | {s.metric(ModelStats.k_valid)} "
-            f"| {s.metric(ModelStats.k_correct)} | {s.metric(ModelStats.k_decline)} "
+            f"| {s.metric(ModelStats.k_correct)} | {s.correct_honest(gold_ids)} "
+            f"| {s.e2e_rate()} | {s.metric(ModelStats.k_decline)} "
             f"| {s.metric(ModelStats.k_clarify)} | {s.flagged_summaries()} "
             f"| {s.latency()} | {s.consistency()} | {off_s} |"
         )
@@ -154,7 +218,7 @@ def best_8gb(stats: dict[str, ModelStats], cfg: dict) -> str | None:
 
 
 def _head_to_head(base: dict[str, ModelStats], mitig: dict[str, ModelStats],
-                  cfg: dict) -> list[str]:
+                  cfg: dict, gold_ids: set[str]) -> list[str]:
     ref_name = next((m["name"] for m in cfg["models"] if m.get("bracket") == "reference"), None)
     champ = best_8gb(base, cfg)
     if not champ or not ref_name or ref_name not in base:
@@ -170,12 +234,16 @@ def _head_to_head(base: dict[str, ModelStats], mitig: dict[str, ModelStats],
         "|---|---|---|---|",
     ]
     for label, key in [("SQL_VALID", ModelStats.k_valid),
-                       ("SQL_CORRECT", ModelStats.k_correct),
+                       ("SQL_CORRECT (attempted)", ModelStats.k_correct),
                        ("DECLINE", ModelStats.k_decline),
                        ("CLARIFY", ModelStats.k_clarify)]:
         lines.append(f"| {label} | {b8.metric(key)} | "
                      f"{m8.metric(key) if m8 else 'not run'} | {ref.metric(key)} |")
     lines += [
+        f"| SQL_CORRECT (honest, abstentions=miss) | {b8.correct_honest(gold_ids)} | "
+        f"{m8.correct_honest(gold_ids) if m8 else 'not run'} | {ref.correct_honest(gold_ids)} |",
+        f"| E2E (heuristic pass) | {b8.e2e_rate()} | "
+        f"{m8.e2e_rate() if m8 else 'not run'} | {ref.e2e_rate()} |",
         f"| Faithfulness (heuristic triage) | {b8.flagged_summaries()} | "
         f"{m8.flagged_summaries() if m8 else 'not run'} | {ref.flagged_summaries()} |",
         f"| Latency p50/p95 | {b8.latency()} | {m8.latency() if m8 else 'not run'} "
@@ -218,6 +286,9 @@ def generate_report(root: Path) -> Path:
     if not base:
         raise SystemExit("No baseline results found — run `python run.py run` first.")
 
+    questions = yaml.safe_load((root / cfg["paths"]["questions"]).read_text())
+    gold_ids = {q["id"] for q in questions if (q.get("gold_sql") or "").strip()}
+
     meta_path = results_dir / "meta_baseline.json"
     meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
 
@@ -232,16 +303,37 @@ def generate_report(root: Path) -> Path:
                   "schema.sql or prompts.py mid-run. These rows are not comparable. "
                   "Delete results/ and re-run.", ""]
 
-    lines += ["## Per-model results", "",
-              "Rates show overall (min–max across run replicates). SQL_CORRECT covers only "
-              "questions with gold SQL. Faithfulness numbers are heuristic triage counts — "
-              "the real faithfulness grade is your manual review of "
-              "`results/review_queue.jsonl`.", ""]
-    lines += _model_table(base, cfg)
-    lines += ["", "## Head-to-head: best 8GB vs reference", ""]
-    lines += _head_to_head(base, mitig, cfg)
+    empty_gold = gold_empty_questions(root, cfg, questions)
+    if empty_gold:
+        lines += [f"⚠️ **{len(empty_gold)} gold quer{'y' if len(empty_gold)==1 else 'ies'} "
+                  f"return ZERO rows against the seed DB**: {', '.join(empty_gold)}. Any "
+                  "candidate SQL that also returns nothing trivially matches these and counts "
+                  "as SQL_CORRECT — add the missing seed rows or drop the gold.", ""]
 
-    # Manual review queue: every summary + every flagged/unparseable behavior call.
+    dupes = [m["name"] for m in cfg["models"]
+             if [x["name"] for x in cfg["models"]].count(m["name"]) > 1]
+    if dupes:
+        lines += [f"⚠️ **Model(s) listed more than once in config.yaml**: "
+                  f"{', '.join(sorted(set(dupes)))}. Each duplicate runs separately and their "
+                  "records get pooled under one name here — if the duplicates differ in "
+                  "`think` or any other option, this row is a blend of two conditions. "
+                  "Remove the duplicate entries.", ""]
+
+    lines += ["## Per-model results", "",
+              "Rates show overall (min–max across run replicates). SQL_CORRECT (attempted) "
+              "covers only calls where the model emitted SQL against a gold question — a "
+              "decline/clarify/unparseable silently drops out of that denominator. "
+              "SQL_CORRECT (honest) counts every gold-eligible call, scoring abstentions as "
+              "misses. E2E feeds the model's OWN retrieved rows (not gold rows) into the "
+              "summarizer — closer to what a student actually sees — and is a heuristic "
+              "pass/fail triage, not a verdict. Faithfulness numbers are heuristic triage "
+              "counts — the real grade is your manual review of `results/review_queue.jsonl`.",
+              ""]
+    lines += _model_table(base, cfg, gold_ids)
+    lines += ["", "## Head-to-head: best 8GB vs reference", ""]
+    lines += _head_to_head(base, mitig, cfg, gold_ids)
+
+    # Manual review queue: every summary + e2e answer + flagged/unparseable behavior call.
     queue = results_dir / "review_queue.jsonl"
     with queue.open("w") as f:
         for stats in list(base.values()) + list(mitig.values()):
@@ -249,13 +341,20 @@ def generate_report(root: Path) -> Path:
                 f.write(json.dumps({k: r[k] for k in
                         ("model", "question_id", "run_idx", "mitigated", "output",
                          "rows_json", "faithfulness_flags")}) + "\n")
+            for r in stats.e2e_records:
+                if not r.get("needs_review"):
+                    continue
+                f.write(json.dumps({k: r.get(k) for k in
+                        ("model", "question_id", "run_idx", "mitigated", "output",
+                         "retrieval_correct", "rows_json", "gold_rows_json",
+                         "faithfulness_flags", "recall_flags", "e2e_auto_pass")}) + "\n")
             for r in stats.sql_records:
                 if r.get("needs_review"):
                     f.write(json.dumps({k: r.get(k) for k in
                             ("model", "question_id", "run_idx", "mitigated", "category",
                              "expected_behavior", "action", "output")}) + "\n")
-    lines += ["", f"Manual review queue written to `{queue}` — faithfulness and off-format "
-              "decline calls are graded by you, not by this script.", ""]
+    lines += ["", f"Manual review queue written to `{queue}` — faithfulness, e2e, and "
+              "off-format decline calls are graded by you, not by this script.", ""]
 
     out = results_dir / "report.md"
     out.write_text("\n".join(lines))

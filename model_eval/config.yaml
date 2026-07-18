@@ -9,7 +9,7 @@ ollama:
   # Linux systemd install:   "journalctl -u ollama -n 4000 --no-pager"
   # Docker:                  "docker logs --tail 4000 ollama"
   # null = skip log parsing; the report will say offload is UNVERIFIED.
-  server_log_cmd: null
+  server_log_cmd: "journalctl -u ollama -n 4000 --no-pager"
 
 run:
   # THE critical knob. Applied identically to every model. If a model can't
@@ -17,7 +17,7 @@ run:
   # don't silently shrink the context for that one model.
   num_ctx: 8192
   temperature: 0.15
-  seed: 42
+  seed: 67
   top_p: 0.9
   max_output_tokens: 1024   # num_predict; generous, so truncation is a model fault
   runs_per_pair: 3          # N runs per (model x question) — variance, not luck
@@ -26,12 +26,14 @@ run:
   request_timeout_s: 300
 
 # Models. I do NOT assume knowledge of models that postdate my training
-# (lfm2.5, gemma4, qwen3.5, qwen3.6, granite4.1, ministral-3) — verify each
-# tag exists on ollama.com/library and prefer TEXT-ONLY tags (multimodal tags
-# waste ~1.4GB VRAM on a vision encoder). Fields:
+# (lfm2.5, gemma4, qwen3.5, qwen3.6, granite4.1, ministral-3, ornith, rnj-1,
+# olmo-3, glm4:9b, minicpm-v4.5) — verify each tag exists on ollama.com/library
+# and prefer TEXT-ONLY tags (multimodal tags waste ~1.4GB VRAM on a vision
+# encoder). Fields:
 #   think: false = explicitly disable thinking (sent as "think": false)
 #          null  = model has no known thinking switch; nothing is sent
-#   bracket: 8gb | small | reference
+#          "VERIFY" = I don't actually know; check the model card before the run
+#   bracket: 8gb | small | coder | reference | new
 models:
   - name: "lfm2.5"
     bracket: 8gb
@@ -54,7 +56,7 @@ models:
   - name: "ministral-3:8b"
     bracket: 8gb
     think: null           # unknown to me — check and correct
-  - name: "mistral"
+  - name: "mistral:7b"
     bracket: 8gb
     think: null
   - name: "llama3.1:8b"   # control
@@ -63,6 +65,41 @@ models:
   - name: "deepseek-r1:8b" # expected latency counterexample
     bracket: 8gb
     think: false          # if disabling fails, r1 output will show <think> anyway
+  - name: "minicpm-v4.5:8b"  # CAUTION: vision-language model, no known text-only
+    bracket: 8gb              # tag as of this writing — pays the ~1.4GB vision-
+    think: null      # encoder tax your own note above warns about
+  - name: "olmo-3:7b"
+    bracket: 8gb
+    think: null        # AI2 Olmo — no thinking switch known to me, confirm
+  - name: "olmo2:7b"
+    bracket: 8gb
+    think: null            # prior Olmo gen, no known thinking mode
+  - name: "glm4:9b"
+    bracket: 8gb
+    think: null        # later GLM gens (4.5/4.6) have thinking modes;
+  - name: "ornith:8b"
+    bracket: 8gb
+    think: false
+  - name: "rnj-2:8b"
+    bracket: 8gb
+    think: false
+                       # unclear if this base glm4:9b tag does — confirm
+
+  # --- coder-tuned models: added to test whether code-specific pretraining
+  # helps SQL generation over general chat models of similar size ---
+  #- name: "qwen2.5-coder:7b"
+  #  bracket: coder
+  #  think: null
+  #- name: "deepseek-coder:6.7b"  # NOT the R1 reasoning distill — base coder model
+  #  bracket: coder
+  #  think: null
+  - name: "sqlcoder:7b"    # purpose-built for text-to-SQL — most relevant addition
+    bracket: coder
+    think: null
+
+  - name: "phi4-mini:3.8b"  # small-tier, not 8gb-tier — parameter count is well
+    bracket: small           # under the others; compare within its own bracket
+    think: null
   - name: "gemma4:e2b"    # small-tier sanity check
     bracket: small
     think: false
@@ -70,6 +107,8 @@ models:
     bracket: reference
     think: false
 
+  # nomic-embed-text intentionally excluded — it's the embedding model behind
+  # the semantic cache, not a chat/SQL competitor. Don't give it a bracket.
 paths:
   schema_sql: "schema.sql"
   questions: "questions.yaml"

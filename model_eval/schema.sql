@@ -115,7 +115,8 @@ INSERT INTO catalog_years (id, label, start_year, end_year) VALUES
 INSERT INTO subjects (id, catalog_year_id, code, name) VALUES
     (1, 1, 'CS',   'Computer Science'),
     (2, 1, 'MA',   'Mathematics'),
-    (3, 1, 'STAT', 'Statistics');
+    (3, 1, 'STAT', 'Statistics'),
+    (4, 1, 'PHYS', 'Physics');
 
 INSERT INTO courses (id, catalog_year_id, subject_id, subject_code, course_number,
                      course_code, title, description, credit_hours_min,
@@ -147,7 +148,11 @@ INSERT INTO courses (id, catalog_year_id, subject_id, subject_code, course_numbe
     (11, 1, 2, 'MA', '26100', 'MA 26100', 'Multivariate Calculus',
      'Partial derivatives, multiple integrals, vector calculus.', 4, 4, 'MA 16200'),
     (12, 1, 3, 'STAT', '35000', 'STAT 35000', 'Introduction To Statistics',
-     'Probability, estimation, hypothesis testing.', 3, 3, 'MA 16200');
+     'Probability, estimation, hypothesis testing.', 3, 3, 'MA 16200'),
+    (13, 1, 2, 'MA', '26500', 'MA 26500', 'Linear Algebra',
+     'Vector spaces, matrices, eigenvalues, linear transformations.', 3, 3, 'MA 16200'),
+    (14, 1, 4, 'PHYS', '17200', 'PHYS 17200', 'Modern Mechanics',
+     'Mechanics for engineers: kinematics, dynamics, energy, momentum.', 4, 4, 'MA 16200');
 
 INSERT INTO course_aliases (id, course_id, alias_code, reason) VALUES
     (1, 5, 'CS 251', 'legacy three-digit code'),
@@ -192,4 +197,5 @@ INSERT INTO requirement_options (id, requirement_group_id, course_id, course_cod
     (12, 3, 12, 'STAT 35000', 'STAT 35000 - Introduction To Statistics (3 cr)',  3, 1, 0);
 
 INSERT INTO program_notes (id, program_id, note_text, note_type) VALUES
-    (1, 1, 'A minimum GPA of 2.0 in CS core courses is required for graduation.', 'gpa');
+    (1, 1, 'A minimum GPA of 2.0 in CS core courses is required for graduation.', 'gpa'),
+    (2, 2, 'A minimum GPA of 2.0 in Data Science core courses is required for graduation.', 'gpa');

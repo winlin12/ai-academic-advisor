@@ -14,6 +14,11 @@ Measurement discipline enforced here:
 Stage independence: summarization (stage B) is fed rows from the GOLD query, not from
 the model's own stage-A SQL — so a bad SQL writer doesn't contaminate the measurement
 of the same model's summarization faithfulness.
+
+Stage C (e2e) is the deliberate exception: it feeds the model's OWN stage-A SQL rows
+(when stage A produced valid SQL) into the same summarizer, because that — not stage B —
+is what a student actually receives from the app. Stage B isolates summarization skill;
+stage C measures the whole pipeline. Both are kept, on purpose, as separate metrics.
 """
 
 from __future__ import annotations
@@ -245,13 +250,49 @@ def run_model(ctx: EvalContext, model_cfg: dict, out, *, mitigate: bool = False)
                         "model": name, "question_id": q["id"], "stage": "summary",
                         "run_idx": run_idx, "mitigated": mitigate, "error": str(exc)}) + "\n")
                     continue
-                rows_json = json.dumps([dict(zip(cols, r)) for r in rows],
-                                       sort_keys=True, default=str)
+                gold_rows_json = json.dumps([dict(zip(cols, r)) for r in rows],
+                                            sort_keys=True, default=str)
                 srec = _gen_record(name, q, run_idx, sres, s_hash, "summary", mitigate)
-                srec["rows_json"] = rows_json
-                srec["faithfulness_flags"] = scorers.faithfulness_flags(sres.text, rows_json)
+                srec["rows_json"] = gold_rows_json
+                srec["faithfulness_flags"] = scorers.faithfulness_flags(sres.text, gold_rows_json)
                 srec["needs_review"] = True  # every summary is manually graded, no exceptions
                 out.write(json.dumps(srec, default=str) + "\n")
+
+                # ---- stage C: end-to-end (model's OWN retrieval => what a student sees) --
+                if parsed.action == "sql" and sql_score.valid:
+                    e_cols, e_rows = sql_score.columns, sql_score.rows
+                    e_prompt, e_hash = ctx.prompts.build_summary_prompt(
+                        q["question"], e_cols, e_rows)
+                    try:
+                        e_res = ctx.client.generate(
+                            name, e_prompt, options=opts, think=think, keep_alive=keep_alive)
+                    except OllamaError as exc:
+                        out.write(json.dumps({
+                            "model": name, "question_id": q["id"], "stage": "e2e",
+                            "run_idx": run_idx, "mitigated": mitigate, "error": str(exc)}) + "\n")
+                    else:
+                        e_rows_json = json.dumps([dict(zip(e_cols, r)) for r in e_rows],
+                                                 sort_keys=True, default=str)
+                        faith = scorers.faithfulness_flags(e_res.text, e_rows_json)
+                        recall = scorers.recall_flags(e_res.text, gold_rows_json)
+                        erec = _gen_record(name, q, run_idx, e_res, e_hash, "e2e", mitigate)
+                        erec["retrieval_correct"] = sql_score.correct
+                        erec["rows_json"] = e_rows_json
+                        erec["gold_rows_json"] = gold_rows_json
+                        erec["faithfulness_flags"] = faith
+                        erec["recall_flags"] = recall
+                        erec["e2e_auto_pass"] = bool(sql_score.correct) and not faith and not recall
+                        erec["needs_review"] = True
+                        out.write(json.dumps(erec, default=str) + "\n")
+                else:
+                    # No grounded data reached the summarizer at all (bad/no SQL) — this
+                    # IS the end-to-end outcome the student would get, not a skipped case.
+                    out.write(json.dumps({
+                        "model": name, "question_id": q["id"], "category": q["category"],
+                        "expected_behavior": q["expected_behavior"], "stage": "e2e",
+                        "run_idx": run_idx, "mitigated": mitigate, "action": parsed.action,
+                        "retrieval_correct": False, "e2e_auto_pass": False,
+                        "e2e_outcome": "no_grounded_data", "needs_review": False}) + "\n")
         out.flush()
 
     conn.close()

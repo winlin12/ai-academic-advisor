@@ -45,8 +45,8 @@ record is self-describing and carries the static-prompt hash).
 | `harness/prompts.py` | Static-first prompt builder. Static block = role + schema + output contract + few-shot; question (and rows) last. sha256 of the static block travels with every record. |
 | `harness/db.py` | Builds the DB; read-only execution (`mode=ro` + `PRAGMA query_only`); execution-accuracy row comparison. |
 | `harness/scorers.py` | SQL_VALID / SQL_CORRECT / behavior (decline/clarify) / faithfulness heuristic. The "honesty ledger" at the top says which are truly automatic. |
-| `harness/runner.py` | Orchestration: warmup + discard, VRAM delta via nvidia-smi, offload from server log, N runs per pair, stage A (text-to-SQL) + stage B (summarize **gold** rows), mitigation mode. |
-| `harness/report.py` | Per-model table, head-to-head, variance display, mechanical decision-rule check, manual review queue. No composite score exists. |
+| `harness/runner.py` | Orchestration: warmup + discard, VRAM delta via nvidia-smi, offload from server log, N runs per pair, stage A (text-to-SQL) + stage B (summarize **gold** rows) + stage C (summarize the model's **own** rows — end-to-end), mitigation mode. |
+| `harness/report.py` | Per-model table, head-to-head, variance display, mechanical decision-rule check, manual review queue, config-duplicate and empty-gold guards. No composite score exists. |
 
 Data flow: `questions.yaml` → `prompts.py` (static-first prompt) → `ollama_client.py` →
 raw output → `scorers.py` (against `eval.sqlite`, read-only) → `results/runs_*.jsonl` →
@@ -57,7 +57,9 @@ raw output → `scorers.py` (against `eval.sqlite`, read-only) → `results/runs
 | Metric | Status |
 |---|---|
 | SQL_VALID | **Automatic.** Parse + execute on a read-only connection. |
-| SQL_CORRECT | **Automatic where you supply gold SQL.** Execution accuracy (row value-bags), so equivalent SQL formulations pass. Known false-positive mode: wrong logic returning coincidentally identical values on a small seed DB — spot-check passes. |
+| SQL_CORRECT (attempted) | **Automatic where you supply gold SQL.** Execution accuracy (row value-bags), so equivalent SQL formulations pass — but the denominator is only calls where the model actually emitted SQL. A decline/clarify/unparseable on a real gold question silently drops out instead of counting as a miss, which flatters models that abstain more often. Known false-positive mode: wrong logic returning coincidentally identical values (most commonly: gold itself returns zero rows — see `report.py`'s empty-gold warning — so ANY candidate, right or wrong, matches trivially). |
+| SQL_CORRECT (honest) | **Automatic.** Same execution-accuracy check, but scored over every gold-eligible call — an abstention or unparseable output on a real question counts as a miss. Use this one for cross-model comparisons; "(attempted)" is there so you can see how much of the gap is abstention, not capability. |
+| E2E | **Automatic pass/fail heuristic, not a verdict.** Feeds the model's OWN stage-A SQL rows (not gold rows) into the summarizer — the actual two-stage pipeline a user experiences. `e2e_auto_pass` = retrieval matched gold AND no hallucinated/omitted course codes; it's a triage filter like faithfulness, and every e2e answer with real data lands in the review queue too. |
 | DECLINE / CLARIFY | **Automatic-ish.** The output contract (`SQL:`/`CLARIFY:`/`DECLINE:`) makes it parseable; off-format outputs hit a phrase heuristic and are flagged into the review queue. Note the confound: sentinel-format compliance is itself a model skill being measured. |
 | FAITHFULNESS | **Manual, full stop.** The heuristic (course codes/numbers in the answer that aren't in the rows) is a triage filter that catches *entity* hallucination only. Relational hallucination ("X requires Y") is not machine-checkable without a judge model — which I deliberately did not add, because judging small models with another model smuggles in a second unvalidated instrument. Every summary lands in `review_queue.jsonl`; the number you quote is your manual grade. |
 | Ambiguity handling | Parsing is automatic; whether the clarifying question is *sensible* is your call (review queue). |
@@ -76,6 +78,13 @@ raw output → `scorers.py` (against `eval.sqlite`, read-only) → `results/runs
   memory split, not a layer split, and is recorded only as a labeled fallback
 - models unloaded between blocks so VRAM baselines don't stack
 - static prompt block hashed into every record; the report refuses to compare mixed hashes
+- `config.yaml` cannot list the same model twice without the report flagging it — a model
+  entered under two brackets (e.g. two different `think` settings) silently ran twice and
+  pooled both conditions into one row until this check was added; if you add a model, make
+  sure its name is unique in `models:`
+- gold SQL that returns zero rows against the seed DB is flagged in the report — any
+  candidate query trivially matches an empty gold regardless of whether its logic is right,
+  so an unflagged empty gold quietly pads whichever model happens to give up gracefully
 
 ## The biggest threats you had NOT listed
 

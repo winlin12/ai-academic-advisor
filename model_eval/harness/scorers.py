@@ -10,6 +10,11 @@
                  Relational hallucination ("X must come before Y") is NOT machine-checked
                  here and every summarization answer goes to the manual review queue.
                  Do not quote the heuristic as a faithfulness rate; quote your manual one.
+  E2E           the model's OWN executed SQL rows (not gold rows) fed into the summarizer
+                 — the actual two-stage pipeline a student would experience. e2e_auto_pass
+                 is a heuristic conjunction (retrieval matched gold AND no hallucinated/
+                 missing course codes) — a triage filter, not a verdict. Every e2e record
+                 with real data goes to the manual review queue like any other summary.
 
 No composite score exists anywhere in this harness, deliberately.
 """
@@ -123,6 +128,18 @@ def faithfulness_flags(answer: str, rows_json: str) -> list[str]:
             continue  # digits inside course codes are already handled above
         if num not in haystack:
             flags.append(f"number not in rows: {num}")
+    return flags
+
+
+def recall_flags(answer: str, rows_json: str) -> list[str]:
+    """Course codes present in the retrieved rows that never show up in the answer — the
+    mirror image of faithfulness_flags (which catches invention, this catches omission).
+    Heuristic triage only; scoped to course codes to avoid noise from incidental numbers."""
+    flags: list[str] = []
+    haystack = answer.replace(" ", " ")
+    for code in set(_COURSE_CODE_RE.findall(rows_json)):
+        if code not in haystack and code.replace(" ", "") not in haystack.replace(" ", ""):
+            flags.append(f"course code from rows missing in answer: {code}")
     return flags
 
 
