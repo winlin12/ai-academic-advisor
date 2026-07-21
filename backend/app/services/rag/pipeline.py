@@ -1,7 +1,7 @@
 """Step 2 (ingest) + Step 3 (answer): the composition layer.
 
 This is the only module that composes the embedding provider (``embeddings``), the
-persistence layer (``store``), and the chat model (``OllamaClient``). Each helper it
+persistence layer (``store``), and the chat model (``LlamaCppClient``). Each helper it
 calls is independently testable; this file wires them into the two end-to-end flows.
 
 Retrieval is two-tier, cheapest-first:
@@ -14,7 +14,8 @@ Retrieval is two-tier, cheapest-first:
 Both tiers are merged (exact first, deduped by row id) and packed under a hard token budget
 (``advisor_context_token_budget``) before anything reaches the prompt. Local inference has no
 per-token bill, but the cap stays: a bloated context is still slower on an 8GB card and still
-a way to accidentally drown the model's ``num_ctx`` window.
+a way to accidentally overflow llama-server's fixed ``--ctx-size`` window (unlike Ollama,
+there's no per-request num_ctx to silently absorb the overage).
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from app.core.config import settings
-from app.services.ollama_client import OllamaClient
+from app.services.llamacpp_client import LlamaCppClient
 from app.services.rag import embeddings, store
 
 logger = logging.getLogger(__name__)
@@ -43,9 +44,9 @@ _DB_SCHEMA = (Path(__file__).resolve().parents[2] / "data" / "db_schema.md").rea
 # Fixed framing for every advisor answer. The retrieved rules are the ONLY facts the model
 # is allowed to use, which is what turns a general chatbot into a grounded advisor and stops
 # it from inventing courses/credits it never saw. Static-first ordering (this block, then the
-# variable question) is kept even though local Ollama has no explicit prompt-cache API like
-# Anthropic's cache_control — it's still good hygiene (keeps a backend swap cheap) and lets
-# Ollama's own KV-cache reuse an identical prefix across requests on an already-loaded model.
+# variable question) is kept even though local llama-server has no explicit prompt-cache API
+# like Anthropic's cache_control — it's still good hygiene (keeps a backend swap cheap) and
+# lets llama-server's own KV-cache (`--cache-reuse`) reuse an identical prefix across requests.
 #
 # The schema is appended so the model can interpret the context chunks' metadata tags (they
 # mirror these tables/columns) — it contains no course facts itself, never a citable source.
@@ -160,7 +161,7 @@ async def answer_question(
     question: str,
     *,
     top_k: int | None = None,
-    client: OllamaClient | None = None,
+    client: LlamaCppClient | None = None,
 ) -> dict[str, Any]:
     """Step 3 end-to-end: exact + semantic retrieval -> budgeted context -> generate.
 
@@ -168,7 +169,7 @@ async def answer_question(
     and so the retrieval quality is observable, not a black box.
     """
     top_k = top_k or settings.rag_top_k
-    client = client or OllamaClient()
+    client = client or LlamaCppClient()
 
     # Tier 1: deterministic — course codes named in the question, straight from SQL.
     exact = store.fetch_by_course_codes(extract_course_codes(question))
@@ -185,7 +186,7 @@ async def answer_question(
         len(matches), len(exact), len(semantic), question[:80],
     )
 
-    # Fold into the prompt and let Claude write the grounded answer.
+    # Fold into the prompt and let the local model write the grounded answer.
     context = _format_context(matches)
     user_prompt = f"CONTEXT:\n{context}\n\nSTUDENT QUESTION:\n{question}"
     answer = await client.generate(_ADVISOR_SYSTEM_PROMPT, user_prompt)

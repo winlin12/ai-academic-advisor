@@ -15,11 +15,12 @@ The planner remains the single source of truth for legality (prereqs, term offer
 caps). The model only reorders codes the planner already knows how to schedule; a hallucinated
 proposal degrades to a no-op because unknown codes and out-of-range caps are dropped on apply.
 
-The proposal is a structured output (``OllamaClient.propose`` with the PlanEditProposal
-schema). Unlike the old Anthropic transport, Ollama's JSON-schema ``format`` constrains
-syntax but not schema validity, so ``propose()`` itself retries once on a malformed
-response; the retry loop below is for a *different* concern — *semantic* quality (a
-proposal that legally parsed but made the plan worse).
+The proposal is a structured output (``LlamaCppClient.propose`` with the PlanEditProposal
+schema). llama.cpp's grammar-constrained ``response_format`` is stricter than Ollama's old
+syntax-only ``format=<schema>``, but still doesn't guarantee every schema keyword, so
+``propose()`` itself retries once on a malformed response; the retry loop below is for a
+*different* concern — *semantic* quality (a proposal that legally parsed but made the plan
+worse).
 """
 
 from __future__ import annotations
@@ -35,7 +36,7 @@ from app.models.schemas import (
     RevisePlanResponse,
     StudentProfile,
 )
-from app.services.ollama_client import ModelResponseError, OllamaClient
+from app.services.llamacpp_client import LlamaCppClient, ModelResponseError
 from app.services.planner import generate_plan
 
 logger = logging.getLogger(__name__)
@@ -170,7 +171,7 @@ async def revise_plan(
     catalog: list[Course],
     feedback: str,
     *,
-    client: OllamaClient,
+    client: LlamaCppClient,
     max_iterations: int = DEFAULT_MAX_ITERATIONS,
 ) -> RevisePlanResponse:
     """Run the propose → apply → re-plan → re-validate loop and return the best plan found."""

@@ -1,6 +1,6 @@
 """LLM-facing routes: ask (RAG), explain-plan, revise-plan. These are the only routes that
-call the local Ollama model; everything they return that *matters* (the plan itself) is still
-produced or re-validated by the deterministic planner."""
+call the local llama.cpp model; everything they return that *matters* (the plan itself) is
+still produced or re-validated by the deterministic planner."""
 
 import psycopg
 from fastapi import APIRouter, HTTPException
@@ -16,36 +16,35 @@ from app.models.schemas import (
     RevisePlanResponse,
 )
 from app.services.advisor_agent import revise_plan
-from app.services.ollama_client import (
-    ModelNotFoundError,
+from app.services.llamacpp_client import (
+    LlamaCppClient,
+    LlamaCppConnectionError,
     ModelResponseError,
-    OllamaClient,
-    OllamaConnectionError,
 )
 from app.services.rag.embeddings import EmbeddingError
 from app.services.rag.pipeline import answer_question
 
 router = APIRouter(prefix="/advisor", tags=["advisor"])
 
-_LlmError = OllamaConnectionError | ModelNotFoundError | ModelResponseError
+_LlmError = LlamaCppConnectionError | ModelResponseError
 
 
 def _llm_http_error(exc: _LlmError) -> HTTPException:
     """Map the local-model failure modes onto the HTTP ladder, most specific first.
 
-    503 = the model backend isn't usable right now (server down, model not pulled) —
-    retryable once an operator fixes it, not by the client retrying immediately. 502 =
-    the server answered but the output was unusable (empty, or still-invalid JSON after
-    propose()'s internal retry). There is no upstream rate limit to map (no cloud vendor).
+    503 = the model backend isn't usable right now (llama-server down) — retryable once an
+    operator fixes it, not by the client retrying immediately. 502 = the server answered but
+    the output was unusable (empty, non-2xx, or still-invalid JSON after propose()'s internal
+    retry). There is no upstream rate limit to map (no cloud vendor).
     """
-    if isinstance(exc, (OllamaConnectionError, ModelNotFoundError)):
+    if isinstance(exc, LlamaCppConnectionError):
         return HTTPException(status_code=503, detail=str(exc))
     return HTTPException(status_code=502, detail=str(exc))
 
 
 @router.post("/explain-plan", response_model=ExplainPlanResponse)
 async def explain_plan(req: ExplainPlanRequest):
-    client = OllamaClient()
+    client = LlamaCppClient()
 
     system_prompt = """
 You are an AI academic planning assistant.
@@ -68,7 +67,7 @@ Explain the plan clearly. Focus on prerequisites, semester sequencing, warnings,
 
     try:
         answer = await client.generate(system_prompt=system_prompt, user_prompt=user_prompt)
-    except (OllamaConnectionError, ModelNotFoundError, ModelResponseError) as exc:
+    except (LlamaCppConnectionError, ModelResponseError) as exc:
         raise _llm_http_error(exc) from exc
 
     return ExplainPlanResponse(answer=answer)
@@ -80,14 +79,14 @@ async def revise_plan_route(req: RevisePlanRequest):
 
     The model proposes edits (reorder/defer/avoid-tags/credit-cap) as a schema-enforced
     PlanEditProposal and the deterministic planner re-validates them, so the returned plan
-    is always legal. Error ladder: 503 (Ollama down / model not pulled), 502 (bad output).
+    is always legal. Error ladder: 503 (llama-server down), 502 (bad output).
     """
-    client = OllamaClient()
+    client = LlamaCppClient()
 
     profile, catalog = resolve_for_planning(req.profile)
     try:
         return await revise_plan(profile, catalog, req.feedback, client=client)
-    except (OllamaConnectionError, ModelNotFoundError, ModelResponseError) as exc:
+    except (LlamaCppConnectionError, ModelResponseError) as exc:
         raise _llm_http_error(exc) from exc
 
 
@@ -103,9 +102,9 @@ async def advisor_ask(req: AdvisorAskRequest):
     (``python -m app.services.rag.ingest_catalog``), otherwise retrieval returns nothing
     and the model will say it has no rule on file.
 
-    Error ladder: 503 (database / Ollama down / model not pulled), 502 (embedding/output).
+    Error ladder: 503 (database / llama-server down), 502 (embedding/output).
     """
-    client = OllamaClient()
+    client = LlamaCppClient()
 
     try:
         result = await answer_question(req.question, client=client)
@@ -113,7 +112,7 @@ async def advisor_ask(req: AdvisorAskRequest):
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     except psycopg.Error as exc:
         raise academic_db_unavailable(exc) from exc
-    except (OllamaConnectionError, ModelNotFoundError, ModelResponseError) as exc:
+    except (LlamaCppConnectionError, ModelResponseError) as exc:
         raise _llm_http_error(exc) from exc
 
     return AdvisorAskResponse(

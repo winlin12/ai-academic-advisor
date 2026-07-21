@@ -4,7 +4,7 @@ API version advances."""
 
 from fastapi import APIRouter
 
-from app.services.ollama_client import OllamaClient
+from app.services.llamacpp_client import LlamaCppClient
 
 router = APIRouter(tags=["system"])
 
@@ -16,10 +16,9 @@ def health():
 
 @router.get("/health/llm")
 async def llm_health():
-    """Verify Ollama is reachable and the configured model is actually pulled, without
-    running inference. Hits ``/api/tags`` only — same zero-cost intent as the old
-    Anthropic Models-API probe, just against the local server instead of the cloud.
+    """Verify llama-server is reachable and has the configured model loaded, without
+    running inference. Hits ``/health`` and ``/v1/models`` only, never ``/v1/chat/completions``.
     """
-    client = OllamaClient()
+    client = LlamaCppClient()
     ok, detail = await client.health()
     return {"ok": ok, "detail": detail, "model": client.model}

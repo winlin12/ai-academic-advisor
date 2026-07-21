@@ -13,7 +13,7 @@ const MIN_QUERY_LENGTH = 2;
 
 // Debounced search over GET /v1/academic/courses/search so a student can hand-add a course
 // to a semester. Debouncing matters doubly on a local-first stack: every keystroke saved is
-// a Postgres ILIKE query the laptop doesn't run while Ollama may be holding the RAM.
+// a Postgres ILIKE query the laptop doesn't run while llama.cpp may be holding the RAM.
 export default function AddCourseSearch({ onAdd, disabled = false }: Props) {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<AcademicCourseResult[]>([]);

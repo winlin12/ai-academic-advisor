@@ -1,7 +1,9 @@
 # TODO — BoilerAdvisor
 
-Working notes and next steps. Last updated 2026-07-11 (pivoted the advisor from a local
-Ollama model to the Anthropic API — see "Anthropic API Pivot" under Completed Work).
+Working notes and next steps. Last updated 2026-07-21 (moved the advisor's local model from
+Ollama to llama.cpp — see "llama.cpp Pivot" under Completed Work. The app had already moved
+back from the Anthropic API to a local Ollama model before this; the "Anthropic API Pivot"
+entry below is kept as history but is no longer the active backend).
 
 **🎯 Next goal:** the degree-program crawl is done and the data is sitting in Postgres, but the web app doesn't expose it yet. The concrete next step is wiring the program catalog into the UI so a student can search for a degree and pull up its requirements — see **Priority 3** below. That's the next thing to hand to an agent to implement.
 
@@ -12,7 +14,7 @@ Ollama model to the Anthropic API — see "Anthropic API Pivot" under Completed 
 - ✅ **Degree programs: full crawl complete** — 1,165 programs (2026-2027), 23,213 requirement groups, 40,758 requirement options. See Priority 1.
 - ✅ Deterministic planner: validates prerequisites, term offerings, credit caps
 - ✅ RAG advisor: answers questions about courses with sources; requirement-block chunks are now embedded too (see Database state). Retrieval is two-tier — exact course-code match (SQL) plus semantic search (in-process fastembed + pgvector), merged under a hard context token budget.
-- ✅ Claude Haiku agent: proposes plan revisions as a schema-enforced structured output, deterministic planner validates
+- ✅ Local llama.cpp agent (Qwen2.5-Coder-7B-Instruct-Q4_K_M): proposes plan revisions as a schema-enforced structured output, deterministic planner validates
 - ✅ Web UI: onboarding profile form (no hardcoded demo profile), plan generation, direct editing (move/remove per course, add via debounced catalog search), advisor ask/revise chat
 - ✅ **Plan persistence, wired end-to-end**: onboarding calls `POST /v1/students`; every accepted edit/revision/regeneration autosaves via `POST /v1/students/{id}/plans`; a reload restores the newest saved plan (student id in `localStorage`). Save-status chip surfaces Saved/Saving/failed/DB-down.
 - ✅ **Database browsing**: read-only `/admin` page (table counts + paged rows via `GET /v1/admin/*`, whitelisted tables only) and an Adminer container (`make adminer` → http://localhost:8081) for full editing.
@@ -208,7 +210,7 @@ The planner is the source of truth. No hallucinated courses, no broken prerequis
   matched deterministically against `academic_rules.metadata->>'code'`; (2) semantic — the
   question is embedded in-process (fastembed) and the top-K nearest chunks are pulled from
   pgvector. Both tiers are merged and packed under `ADVISOR_CONTEXT_TOKEN_BUDGET` before
-  reaching the Claude Haiku prompt (`services/rag/pipeline.py`).
+  reaching the local llama.cpp prompt (`services/rag/pipeline.py`).
 - Returns cited sources so answers are verifiable
 - Chunking strategy: one chunk per course + one per requirement block
 - Tuning knobs: `MAX_CHUNK_CHARS`, `RAG_TOP_K`, `RAG_MIN_SIMILARITY`, `ADVISOR_CONTEXT_TOKEN_BUDGET` in `.env`
@@ -284,7 +286,11 @@ make psql                           # SQL prompt
 - RAG backfilled with 7,996 requirement-block chunks
 - Backend read API (`/v1/academic/facets`, `/v1/academic/programs`, `/v1/academic/programs/{id}`) already built and ready — see Priority 3 for the still-open UI work
 
-### 7. Anthropic API Pivot (✅ Done 2026-07-11)
+### 7. Anthropic API Pivot (✅ Done 2026-07-11, superseded — see item 8)
+**No longer the active backend.** The app moved back to a local model (Ollama, then
+llama.cpp — item 8) before this file was updated to say so; kept below as history of what
+changed at the time, not a description of the current stack.
+
 Moved the advisor from a local Ollama model to the Anthropic API (Claude Haiku). The
 deterministic planner/validation core (Priority 2, `services/planner.py`, `plan_editor.py`)
 is untouched — this was purely a swap of the LLM/RAG transport layer.
@@ -326,6 +332,39 @@ streaming responses for `/advisor/ask` (SSE via `client.messages.stream`), and e
 Voyage AI as an alternative to in-process embeddings if the VPS CPU turns out to be a
 bottleneck at higher traffic.
 
+### 8. llama.cpp Pivot (✅ Done 2026-07-21)
+Moved the advisor's local model from Ollama to `llama-server` (llama.cpp's HTTP server),
+running `Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf` — model_eval/'s verdict for the 2060 Super's
+8GB budget (best quality among 8GB-class models tried; code-tuned pretraining measurably
+helped this app's SQL-shaped tasks). The deterministic planner/validation core is untouched —
+purely a swap of the local-inference transport.
+- **Chat:** `services/ollama_client.py` deleted; `services/llamacpp_client.py` talks to
+  `llama-server`'s OpenAI-compatible `/v1/chat/completions` (default port **8080**, not
+  Ollama's 11434). `generate()`/`propose()`/`health()` keep the same surface as before.
+- **Structured outputs:** `propose()` now uses `response_format={"type": "json_schema", ...}`,
+  which llama.cpp converts to a GBNF grammar server-side — stricter than Ollama's old
+  syntax-only `format=<schema>`, but still not a hard guarantee on every schema keyword, so
+  the Pydantic-validate-then-retry-once loop stays.
+- **Context size / model, no longer per-request:** unlike Ollama, llama-server's context size
+  (`--ctx-size`) and loaded model (`--model`) are fixed at process launch — there's no
+  `OLLAMA_NUM_CTX`/`OLLAMA_KEEP_ALIVE` equivalent to set per-request. `LLAMACPP_MODEL` in
+  `.env` must match the gguf `llama-server` was actually started with; a mismatch is caught by
+  `health()` (`/v1/models`), not by the request.
+- **Health check:** `GET /health/llm` now hits llama-server's `/health` (reachable?) and
+  `/v1/models` (is the loaded model the configured one?), still zero-token.
+- **Config:** `Settings`/`.env` renamed `OLLAMA_*` → `LLAMACPP_*`
+  (`LLAMACPP_BASE_URL=http://127.0.0.1:8080`, `LLAMACPP_MODEL`, `LLAMACPP_LOCAL_ONLY`,
+  `LLAMACPP_TEMPERATURE`, `LLAMACPP_MAX_TOKENS`); `catalog_ingestion/docker-compose.yml`'s
+  backend service override moved from `OLLAMA_BASE_URL: http://host.docker.internal:11434` to
+  `LLAMACPP_BASE_URL: http://host.docker.internal:8080`.
+- **Embeddings unaffected:** RAG embeddings still run in-process via `fastembed`, independent
+  of the chat backend — no `academic_rules` re-embed needed for this pivot.
+
+**Not done as part of this pivot:** no launch/systemd script for `llama-server` is checked
+into the repo yet (the box currently runs it by hand:
+`llama-server -m Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf -ngl 99 --host 0.0.0.0 --port 8080`) —
+worth a systemd unit for the 24/7 box, mirroring whatever kept Ollama running as a service.
+
 ---
 
 ## Development Commands
@@ -354,7 +393,7 @@ Read-only browsing also at http://localhost:3000/admin.
 
 **Debugging:**
 - API docs at http://localhost:8000/docs
-- Anthropic API health check (zero-token — uses the Models API, not inference): `curl http://localhost:8000/health/llm`
+- llama.cpp health check (zero-token — `/health` + `/v1/models`, not inference): `curl http://localhost:8000/health/llm`
 - Catalog DB: `postgres://catalog:catalog@localhost:5433/catalog_ingestion`
 
 ---

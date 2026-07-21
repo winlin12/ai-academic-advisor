@@ -1,6 +1,6 @@
 # BoilerAdvisor
 
-An AI academic planning assistant for Purdue students: reason about degree requirements, prerequisites, semester plans, workload balance, and graduation paths. Catalog data, the deterministic planner, and RAG retrieval all run locally against your own Postgres; chat reasoning (ask/revise-plan) calls the Anthropic API (Claude Haiku).
+An AI academic planning assistant for Purdue students: reason about degree requirements, prerequisites, semester plans, workload balance, and graduation paths. Catalog data, the deterministic planner, RAG retrieval, and chat reasoning (ask/revise-plan) all run **entirely locally** — Postgres for data, and a local [llama.cpp](https://github.com/ggml-org/llama.cpp) server (`llama-server`) running `Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf` for the LLM. No cloud API, no per-question spend, no internet required once everything is set up.
 
 ## What it does
 
@@ -21,7 +21,8 @@ Ask questions like:
 - **Docker Desktop** (or podman) — required for the Postgres database
 - **Python 3.11+** — for the backend and ingestion pipeline
 - **Node.js 18+** — for the web frontend
-- **An Anthropic API key** — create a workspace-scoped key in the [Anthropic Console](https://console.anthropic.com/) (Settings → API keys) and set a monthly spend limit on that workspace before using it. Needed for `/v1/advisor/*` (ask, revise-plan, explain-plan); the rest of the app works without one.
+- **A GPU with ~8GB VRAM is recommended** (this project was tuned against an RTX 2060 Super) for fast local inference — a CPU-only box also works, just slower. **~5GB free disk** for the model file.
+- **llama.cpp** (`llama-server`) — see step 3 below for building/installing it and downloading the model. No API key of any kind is needed for chat.
 
 ### 1. Clone & Install
 
@@ -50,38 +51,68 @@ Restore from backup instead (recommended, includes RAG vectors):
 make restore                   # from catalog_db_backup.sql.gz
 ```
 
-### 3. Start the Backend API — choose ONE
+### 3. Start the Local LLM (llama.cpp)
+
+The advisor needs an OpenAI-compatible `llama-server` reachable at `http://127.0.0.1:8080` (the backend's default `LLAMACPP_BASE_URL`) with `Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf` loaded.
+
+**Get `llama-server`** — pick one:
+```bash
+# Option A: Homebrew (macOS/Linux)
+brew install llama.cpp
+
+# Option B: build from source (needed for CUDA/ROCm GPU support on Linux)
+git clone https://github.com/ggml-org/llama.cpp
+cd llama.cpp
+cmake -B build -DGGML_CUDA=ON   # drop -DGGML_CUDA=ON for a CPU-only build
+cmake --build build --config Release -j"$(nproc)"
+# binary lands at build/bin/llama-server
+```
+(See the [llama.cpp releases page](https://github.com/ggml-org/llama.cpp/releases) for prebuilt binaries too.)
+
+**Run it** — `-hf` downloads the model straight from Hugging Face into the standard HF cache the first time (~4.7GB), so no separate download step is needed:
+```bash
+llama-server -hf bartowski/Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M -ngl 99 --port 8080
+```
+- `-ngl 99` offloads every layer to the GPU (drop it, or lower the number, on a CPU-only box or a smaller GPU).
+- No `--ctx-size` flag is needed on an 8GB card — this model's native 32768-token context still fits under 8GB VRAM at Q4_K_M with full GPU offload. Pass `--ctx-size <n>` to cap it lower if you're tighter on VRAM.
+- Already have the gguf file downloaded (e.g. from this repo's `models/` dir)? Run `llama-server -m /path/to/Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf -ngl 99 --port 8080` instead of `-hf`.
+
+Leave this running — it's a long-lived local service, same role Postgres plays. Verify it's up:
+```bash
+curl http://127.0.0.1:8080/health   # {"status":"ok"}
+```
+
+### 4. Start the Backend API — choose ONE
 
 **Option A: All in Docker (simplest — no Python setup)**
 
 ```bash
 cd catalog_ingestion
 cp ../backend/.env.example ../backend/.env
-# Edit backend/.env: set ANTHROPIC_API_KEY (required for ask/revise-plan; everything else works without it)
+# Defaults work as-is if llama-server is running on the host per step 3 — no editing required
 make up          # starts Postgres + backend containers together
 ```
 
-The backend container reads `backend/.env` via `env_file` for `ANTHROPIC_API_KEY` and the RAG tuning knobs. `ACADEMIC_DATABASE_URL` is the one exception — it's overridden inline in `catalog_ingestion/docker-compose.yml` to point at the `postgres` compose service (not `.env`'s `localhost:5433`), since containers can't reach each other via `localhost`. Also note: no `--reload`, so backend code edits require `docker compose restart backend`.
+The backend container reads `backend/.env` via `env_file` for the RAG tuning knobs, and talks to `llama-server` on the host via `host.docker.internal:8080` (overridden inline in `catalog_ingestion/docker-compose.yml`, since containers can't reach the host via `localhost`). `ACADEMIC_DATABASE_URL` is similarly overridden to point at the `postgres` compose service. Also note: no `--reload`, so backend code edits require `docker compose restart backend`.
 
 **Option B: Native backend (for active development — supports `--reload`)**
 
 ```bash
 cd backend
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 
-# Configure Anthropic API key + DB connection
 cp .env.example .env
-# Edit .env: set ANTHROPIC_API_KEY (required for ask/revise-plan; everything else works without it)
+# Defaults work as-is if llama-server is running on 127.0.0.1:8080 per step 3
 # ACADEMIC_DATABASE_URL defaults to localhost:5433, matching the docker-compose port mapping
 
 uvicorn app.main:app --reload --port 8000
 ```
 
-Either way, visit http://localhost:8000/docs for API docs.
+Either way, visit http://localhost:8000/docs for API docs, and `curl http://localhost:8000/health/llm` to confirm the backend can see `llama-server` and the right model is loaded.
 
-### 4. Start the Web Frontend
+### 5. Start the Web Frontend
 
 ```bash
 cd clients/web
@@ -91,7 +122,7 @@ npm run dev
 
 Open http://localhost:3000
 
-### 5. (Optional) Populate RAG Advisor
+### 6. (Optional) Populate RAG Advisor
 
 The advisor learns from course descriptions via semantic search. Embeddings are produced in-process by `fastembed`/ONNX (`BAAI/bge-small-en-v1.5`, runs on CPU, no separate service or API key needed) — the first embedding call downloads ~100MB of model weights to the local Hugging Face cache. First-time setup:
 
@@ -100,10 +131,10 @@ cd backend
 source .venv/bin/activate
 
 # Preview what will be embedded (no model calls)
-python -m app.services.rag.ingest_catalog --dry-run
+python3 -m app.services.rag.ingest_catalog --dry-run
 
 # Embed courses and program requirements (~12 min first time on a laptop CPU)
-python -m app.services.rag.ingest_catalog
+python3 -m app.services.rag.ingest_catalog
 ```
 
 ## Using the App
@@ -118,7 +149,7 @@ python -m app.services.rag.ingest_catalog
 - **Design**: Purdue-inspired black & gold theme (Boilermaker Gold `#CFB991` on warm black), top navigation between Planner and Database views.
 
 **API** (http://localhost:8000/docs) — all product routes live under `/v1`, grouped into tagged domain routers (`academic`, `planning`, `advisor`, `students`); health probes stay unversioned:
-- `GET /health`, `GET /health/llm` — liveness / Anthropic API key+model status (zero-token check via the Models API)
+- `GET /health`, `GET /health/llm` — liveness / llama-server reachability + loaded-model check (zero-token, hits `/health` + `/v1/models`)
 - `POST /v1/plan/generate` — generate a degree plan (deterministic)
 - `POST /v1/plan/edit` — move/add/remove one course, deterministically re-validated (no LLM)
 - `POST /v1/advisor/ask` — ask a question with sources (RAG)
@@ -154,12 +185,12 @@ The AI proposes, the planner validates. The planner is the source of truth — n
 | Component | Role | Technology |
 |-----------|------|-----------|
 | `catalog_ingestion/` | Scrape Purdue catalog, populate database | Python, Postgres, Playwright |
-| `backend/` | Planner engine, LLM endpoints, RAG store | FastAPI, pgvector, Anthropic API, fastembed |
+| `backend/` | Planner engine, LLM endpoints, RAG store | FastAPI, pgvector, llama.cpp, fastembed |
 | `clients/web/` | Student-facing dashboard | Next.js, React, TypeScript |
 
 **Data flow:**
 - Purdue Acalog → Postgres (courses, requirements, degree rules)
-- Anthropic API (Claude Haiku, cloud) ← FastAPI → Web UI
+- Local llama.cpp server (`Qwen2.5-Coder-7B-Instruct-Q4_K_M`, GPU) ← FastAPI → Web UI
 - pgvector store (semantic search) ← in-process fastembed embeddings (local, CPU)
 
 ## Development Notes
@@ -167,7 +198,7 @@ The AI proposes, the planner validates. The planner is the source of truth — n
 See [`TODO.md`](TODO.md) for:
 - Current database state (what's filled, what's missing)
 - **Current next goal**: the degree-program crawl is complete (1,165 programs, requirements, RAG chunks), but nothing in the web UI calls the `/v1/academic/programs*` endpoints yet — wiring up a degree/requirements lookup and program picker is the next thing to build (TODO.md Priority 3)
-- Technical design decisions and gotchas
+- Technical design decisions and gotchas, including the [llama.cpp Pivot](TODO.md) write-up (moved off Ollama 2026-07-21)
 
 ### Testing
 
@@ -206,15 +237,21 @@ cd catalog_ingestion && docker compose stop backend   # if using Option A
 `ACADEMIC_DATABASE_URL` is overridden inline in `catalog_ingestion/docker-compose.yml` for the Docker backend (Option A) so it can reach the `postgres` compose service — that override always wins over whatever's in `backend/.env`. If you need a different DB there, edit `docker-compose.yml` directly, or switch to Option B where `.env`'s `ACADEMIC_DATABASE_URL` is used as-is.
 
 **`curl http://localhost:8000/health/llm` returns `"ok": false`**
-`ANTHROPIC_API_KEY` is missing, invalid, or unset in whichever `.env` your running backend reads (Option A reads `backend/.env` via Docker's `env_file`; Option B reads it directly). Set it, then restart the backend (`docker compose restart backend` for Option A, or re-run `uvicorn` for Option B).
+`llama-server` isn't reachable, or the loaded model doesn't match `LLAMACPP_MODEL`. Check:
+1. Is `llama-server` actually running? `curl http://127.0.0.1:8080/health` should return `{"status":"ok"}`. If not, go back to step 3.
+2. Running in Docker (Option A)? The backend container reaches the host via `host.docker.internal:8080` (see `catalog_ingestion/docker-compose.yml`), not `localhost` — make sure `llama-server` is bound to `0.0.0.0` (or at least reachable from Docker), not just `127.0.0.1`, e.g. `llama-server ... --host 0.0.0.0 --port 8080`.
+3. Loaded the wrong model? The `/health/llm` detail message names both the configured model and what's actually loaded — restart `llama-server` with `-hf bartowski/Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M` (or `-m <path-to-the-gguf>`).
+
+**`llama-server` fails to start, or is slow / falls back to CPU**
+- Out of VRAM: close other GPU processes, or drop `-ngl 99` to a smaller number to offload fewer layers (the rest run on CPU, slower but still works).
+- Built without GPU support: rebuild with `-DGGML_CUDA=ON` (NVIDIA) or the equivalent flag for your GPU vendor — see the [llama.cpp build docs](https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md).
 
 **`make sync-programs` / `make db-init` take a long time on first run**
 The `ingestion` service builds a ~2GB Playwright image the first time it's invoked. Subsequent runs are fast. Watch for a build step in the output before assuming it's hung.
 
 ## Safety & Compliance
 
-- **Local data**: Catalog data, the planner, and the RAG vector store all live in your own Postgres — nothing about degree requirements or student data is sent anywhere except the specific text passed to the Anthropic API for `/v1/advisor/*` requests
-- **Cloud LLM**: Chat reasoning (ask/revise-plan/explain-plan) calls the Anthropic API (Claude Haiku) — set a Console spend limit on your API key ([`backend/.env.example`](backend/.env.example))
-- **Offline fallback**: Planning/browsing routes work without internet or an API key (uses embedded course data); only `/v1/advisor/*` requires connectivity
+- **Fully local**: Catalog data, the planner, the RAG vector store, and the chat model all run on your own machine — nothing about degree requirements, student data, or chat questions is ever sent to a third party. No API key, no internet connection required once Postgres and `llama-server` are running and the model/course data are downloaded.
+- **Offline fallback**: Planning/browsing routes work even if `llama-server` is down (uses embedded course data); only `/v1/advisor/*` needs it reachable.
 - **Disclaimer**: Always present as a planning tool, not official advising
 - **Verification**: Users must confirm major decisions with their university

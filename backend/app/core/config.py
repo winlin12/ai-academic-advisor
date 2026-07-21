@@ -9,32 +9,33 @@ _BACKEND_ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
 
 
 class Settings(BaseSettings):
-    # Ollama (local inference — re-pivoted from the Anthropic API on 2026-07-15; a
+    # llama.cpp (local inference via `llama-server` — moved off Ollama on 2026-07-21; a
     # public-facing site can't carry unbounded per-question cloud spend). Production
-    # topology: the backend process and Ollama run on the SAME box (the RTX 2060 Super
-    # server, 24/7). 127.0.0.1, not "localhost": under uvicorn's uvloop, "localhost" can
-    # resolve AAAA (::1) first and fail outright against an IPv4-only Ollama bind, even
+    # topology: the backend process and llama-server run on the SAME box (the RTX 2060
+    # Super server, 24/7). 127.0.0.1, not "localhost": under uvicorn's uvloop, "localhost"
+    # can resolve AAAA (::1) first and fail outright against an IPv4-only bind, even
     # though the same lookup falls back to IPv4 fine under the default asyncio loop —
-    # hit this in local testing. A literal IP sidesteps dual-stack resolution entirely.
-    ollama_base_url: str = "http://127.0.0.1:11434"
-    # PLACEHOLDER pending model_eval/'s verdict (see repo root model_eval/README.md) —
-    # this is not yet the chosen model, just something known-good to build the wiring
-    # against. Swap once the harness names a winner for the 2060 Super's 8GB.
-    ollama_model: str = "llama3.1:8b"
+    # hit this in local testing with Ollama. A literal IP sidesteps dual-stack resolution
+    # entirely. Port 8080 is llama-server's default.
+    llamacpp_base_url: str = "http://127.0.0.1:8080"
+    # model_eval/'s verdict for the 2060 Super's 8GB: best quality among 8GB-class models
+    # tried, code-tuned pretraining measurably helped this app's SQL-shaped tasks. Must be
+    # the exact gguf filename llama-server was launched with (`llama-server -m <this>`) —
+    # unlike Ollama there is no tag/pull; the model is whatever file the process loaded.
+    llamacpp_model: str = "Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf"
     # Refuses to start against a non-local/non-private base URL unless explicitly
     # lifted — a misconfiguration guard (accidentally pointing at a random public
     # endpoint), not a real security boundary.
-    ollama_local_only: bool = True
-    # Mirrors model_eval/config.yaml's run knobs so production uses values that were
-    # actually measured, not defaults. Ollama defaults num_ctx to 2K-4K regardless of
-    # what the model supports — leaving this unset is the single biggest way to silently
-    # under-serve a model.
-    ollama_num_ctx: int = 8192
-    ollama_temperature: float = 0.15
-    # Keeps the model resident between requests on the same box; never restart the
-    # Ollama process to get a "fresh" context — each request already starts fresh
-    # server-side (no conversation carryover), this only controls VRAM residency.
-    ollama_keep_alive: str = "15m"
+    llamacpp_local_only: bool = True
+    llamacpp_temperature: float = 0.15
+    # Generous ceiling so truncation is a model fault, not a config one; mirrors
+    # model_eval/config.yaml's max_output_tokens. Unlike Ollama's num_ctx, llama-server's
+    # context size is fixed at process launch (`--ctx-size`; omitted entirely on the 2060
+    # Super box, which defaults to the model's native 32768 and still fits under 8GB VRAM
+    # at Q4_K_M) and can't be overridden per-request — keep this budget comfortably under
+    # whatever that launch context is so a long system+user prompt still leaves room to
+    # generate.
+    llamacpp_max_tokens: int = 1024
 
     # Anthropic API — kept as an optional swappable backend (services/anthropic_client.py),
     # not the active path. Requires ANTHROPIC_API_KEY (read by the SDK from the process

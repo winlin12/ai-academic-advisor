@@ -1,7 +1,7 @@
 """Tests for the deterministic direct-edit engine (services/plan_editor.py).
 
 Everything runs against the bundled fixture catalog injected directly into
-``apply_plan_edit`` — no database, no Ollama, no HTTP. Baselines are produced by the real
+``apply_plan_edit`` — no database, no llama.cpp, no HTTP. Baselines are produced by the real
 ``generate_plan`` so edits are always exercised against a plan the planner itself considers
 legal.
 """

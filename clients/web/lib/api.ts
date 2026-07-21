@@ -128,7 +128,7 @@ export async function generatePlan(
   return response.json();
 }
 
-// One deterministic move/add/remove applied to the current plan. Bypasses Ollama entirely:
+// One deterministic move/add/remove applied to the current plan. Bypasses llama.cpp entirely:
 // the backend mutates the layout and re-validates it against the planner's rules, so this
 // round-trips in milliseconds with zero model compute. `targetSemester` is a zero-based
 // index into plan.semesters (required for move/add, ignored for remove). Passing `profile`
