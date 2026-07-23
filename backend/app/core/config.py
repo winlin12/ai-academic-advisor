@@ -43,8 +43,24 @@ class Settings(BaseSettings):
     anthropic_model: str = "claude-sonnet-4-5"
     anthropic_max_tokens: int = 2048
 
+    # Summer is a real term with real offerings, but summer enrolment has cost/aid/residency
+    # consequences the planner cannot reason about, so it is not scheduled into by default.
+    # Flip to true when summer planning becomes a deliberate, student-facing choice.
+    planner_include_summer: bool = False
+
     # catalog_ingestion database (Docker Postgres publishes 5432 -> host 5433).
     academic_database_url: str = "postgresql://catalog:catalog@localhost:5433/catalog_ingestion"
+
+    # PurdueIO database. This is where the data actually is: the `advisor` schema holds the
+    # crawled degree programs/requirements (1,435 programs) and, as of 002_course_offerings,
+    # observed term offerings; the PurdueIO tables alongside it hold courses and the Classes
+    # rows those offerings are derived from. The catalog_ingestion database above is the
+    # older, currently-empty copy of the same idea — see TODO.md for the consolidation.
+    # The container publishes no host port, so the default addresses it on the Docker
+    # network; override for a different topology.
+    purdueio_database_url: str = (
+        "postgresql://purdueio:changeme_in_production@172.18.0.4:5432/purdueio"
+    )
 
     # RAG / pgvector semantic retrieval. Embeddings are produced IN-PROCESS by fastembed
     # (ONNX on CPU) — the Anthropic API has no embeddings endpoint, and a 384-d model is

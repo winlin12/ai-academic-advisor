@@ -1,0 +1,402 @@
+0.00.095.686 I cmn  common_param: common_params_print_info: build 10083 (846e991ec) with Clang 20.1.8 for Windows x86_64
+0.00.095.690 I cmn  common_param: common_params_print_info: verbosity = 5 (adjust with the `-lv N` CLI arg)
+0.00.095.691 I cmn  common_param: device_info:
+0.00.143.477 I cmn  common_param:   - CUDA0   : NVIDIA GeForce RTX 5070 Ti (16302 MiB, 15037 MiB free)
+0.00.143.488 I cmn  common_param:   - CPU     : AMD Ryzen 7 9850X3D 8-Core Processor            (63091 MiB, 43941 MiB free)
+0.00.143.563 I cmn  common_param: system_info: n_threads = 8 (n_threads_batch = 8) / 8 | CUDA : ARCHS = 750,800,860,890,900,1200,1210 | USE_GRAPHS = 1 | BLACKWELL_NATIVE_FP4 = 1 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | AVX512 = 1 | AVX512_VBMI = 1 | AVX512_VNNI = 1 | AVX512_BF16 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | 
+0.00.143.612 I srv          init: running without SSL
+0.00.143.689 I srv          init: using 7 threads for HTTP server
+0.00.143.696 I srv          init: The UI is disabled
+0.00.143.697 I srv          init: Use --ui/--no-ui (or deprecated --webui/--no-webui) to enable/disable
+0.00.143.847 W srv  llama_server: -----------------
+0.00.143.852 W srv  llama_server: CORS is set to allow all origins ('*') and no API key is set
+0.00.143.853 W srv  llama_server: this can be a security risk (cross-origin attacks)
+0.00.143.853 W srv  llama_server: more info: https://github.com/ggml-org/llama.cpp/pull/25655
+0.00.143.853 W srv  llama_server: -----------------
+0.00.143.877 I srv         start: binding port with default address family
+0.00.145.742 I srv    load_model: loading model 'D:\llm\models\nemotron-cascade-2\nvidia_Nemotron-Cascade-2-30B-A3B-Q4_K_M.gguf'
+0.00.145.747 I srv    load_model: local path 'D:\llm\models\nemotron-cascade-2\nvidia_Nemotron-Cascade-2-30B-A3B-Q4_K_M.gguf'
+0.00.145.753 I cmn  common_init_: fitting params to device memory ...
+0.00.145.754 I cmn  common_init_: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+0.00.145.755 I common_params_fit_impl: getting device memory data for initial parameters:
+0.00.201.822 I llama_model_loader: loaded meta data with 57 key-value pairs and 401 tensors from D:\llm\models\nemotron-cascade-2\nvidia_Nemotron-Cascade-2-30B-A3B-Q4_K_M.gguf (version GGUF V3 (latest))
+0.00.201.833 I llama_model_loader: Dumping metadata keys/values. Note: KV overrides do not apply in this output.
+0.00.201.836 I llama_model_loader: - kv   0:                       general.architecture str              = nemotron_h_moe
+0.00.201.837 I llama_model_loader: - kv   1:                               general.type str              = model
+0.00.201.839 I llama_model_loader: - kv   2:                               general.name str              = Nemotron Cascade 2 30B A3B
+0.00.201.840 I llama_model_loader: - kv   3:                           general.basename str              = Nemotron-Cascade-2
+0.00.201.841 I llama_model_loader: - kv   4:                         general.size_label str              = 30B-A3B
+0.00.201.841 I llama_model_loader: - kv   5:                            general.license str              = other
+0.00.201.841 I llama_model_loader: - kv   6:                       general.license.name str              = nvidia-open-model-license
+0.00.201.843 I llama_model_loader: - kv   7:                       general.license.link str              = https://www.nvidia.com/en-us/agreemen...
+0.00.201.855 I llama_model_loader: - kv   8:                               general.tags arr[str,7]       = ["nvidia", "nemotron-cascade-2", "rea...
+0.00.201.857 I llama_model_loader: - kv   9:                          general.languages arr[str,1]       = ["en"]
+0.00.201.859 I llama_model_loader: - kv  10:                 nemotron_h_moe.block_count u32              = 52
+0.00.201.860 I llama_model_loader: - kv  11:              nemotron_h_moe.context_length u32              = 1048576
+0.00.201.860 I llama_model_loader: - kv  12:            nemotron_h_moe.embedding_length u32              = 2688
+0.00.201.865 I llama_model_loader: - kv  13:         nemotron_h_moe.feed_forward_length arr[i32,52]      = [0, 1856, 0, 1856, 0, 0, 1856, 0, 185...
+0.00.201.866 I llama_model_loader: - kv  14:        nemotron_h_moe.attention.head_count u32              = 32
+0.00.201.869 I llama_model_loader: - kv  15:     nemotron_h_moe.attention.head_count_kv arr[i32,52]      = [0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, ...
+0.00.201.873 I llama_model_loader: - kv  16:              nemotron_h_moe.rope.freq_base f32              = 10000.000000
+0.00.201.874 I llama_model_loader: - kv  17: nemotron_h_moe.attention.layer_norm_rms_epsilon f32              = 0.000010
+0.00.201.875 I llama_model_loader: - kv  18: nemotron_h_moe.attention.layer_norm_epsilon f32              = 0.000010
+0.00.201.875 I llama_model_loader: - kv  19:           nemotron_h_moe.expert_used_count u32              = 6
+0.00.201.875 I llama_model_loader: - kv  20:          nemotron_h_moe.expert_group_count u32              = 1
+0.00.201.876 I llama_model_loader: - kv  21:     nemotron_h_moe.expert_group_used_count u32              = 1
+0.00.201.876 I llama_model_loader: - kv  22:                  nemotron_h_moe.vocab_size u32              = 131072
+0.00.201.877 I llama_model_loader: - kv  23:        nemotron_h_moe.rope.dimension_count u32              = 84
+0.00.201.877 I llama_model_loader: - kv  24:             nemotron_h_moe.ssm.conv_kernel u32              = 4
+0.00.201.877 I llama_model_loader: - kv  25:              nemotron_h_moe.ssm.state_size u32              = 128
+0.00.201.878 I llama_model_loader: - kv  26:             nemotron_h_moe.ssm.group_count u32              = 8
+0.00.201.878 I llama_model_loader: - kv  27:              nemotron_h_moe.ssm.inner_size u32              = 4096
+0.00.201.878 I llama_model_loader: - kv  28:          nemotron_h_moe.ssm.time_step_rank u32              = 64
+0.00.201.879 I llama_model_loader: - kv  29:      nemotron_h_moe.rope.scaling.finetuned bool             = false
+0.00.201.879 I llama_model_loader: - kv  30:        nemotron_h_moe.attention.key_length u32              = 128
+0.00.201.879 I llama_model_loader: - kv  31:      nemotron_h_moe.attention.value_length u32              = 128
+0.00.201.879 I llama_model_loader: - kv  32:  nemotron_h_moe.expert_feed_forward_length u32              = 1856
+0.00.201.880 I llama_model_loader: - kv  33: nemotron_h_moe.expert_shared_feed_forward_length u32              = 3712
+0.00.201.880 I llama_model_loader: - kv  34:                nemotron_h_moe.expert_count u32              = 128
+0.00.201.880 I llama_model_loader: - kv  35:         nemotron_h_moe.expert_shared_count u32              = 1
+0.00.201.881 I llama_model_loader: - kv  36:         nemotron_h_moe.expert_weights_norm bool             = true
+0.00.201.882 I llama_model_loader: - kv  37:        nemotron_h_moe.expert_weights_scale f32              = 2.500000
+0.00.201.882 I llama_model_loader: - kv  38:                       tokenizer.ggml.model str              = gpt2
+0.00.201.882 I llama_model_loader: - kv  39:                         tokenizer.ggml.pre str              = tekken
+0.00.214.770 I llama_model_loader: - kv  40:                      tokenizer.ggml.tokens arr[str,131072]  = ["<unk>", "<s>", "</s>", "[INST]", "[...
+0.00.218.853 I llama_model_loader: - kv  41:                  tokenizer.ggml.token_type arr[i32,131072]  = [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, ...
+0.00.244.753 I llama_model_loader: - kv  42:                      tokenizer.ggml.merges arr[str,269443]  = ["Ġ Ġ", "Ġ t", "e r", "i n", "Ġ �...
+0.00.244.758 I llama_model_loader: - kv  43:                tokenizer.ggml.bos_token_id u32              = 1
+0.00.244.759 I llama_model_loader: - kv  44:                tokenizer.ggml.eos_token_id u32              = 11
+0.00.244.759 I llama_model_loader: - kv  45:            tokenizer.ggml.unknown_token_id u32              = 0
+0.00.244.761 I llama_model_loader: - kv  46:            tokenizer.ggml.padding_token_id u32              = 11
+0.00.244.761 I llama_model_loader: - kv  47:               tokenizer.ggml.add_bos_token bool             = false
+0.00.244.761 I llama_model_loader: - kv  48:               tokenizer.ggml.add_sep_token bool             = false
+0.00.244.762 I llama_model_loader: - kv  49:               tokenizer.ggml.add_eos_token bool             = false
+0.00.244.764 I llama_model_loader: - kv  50:                    tokenizer.chat_template str              = {% macro render_extra_keys(json_dict,...
+0.00.244.765 I llama_model_loader: - kv  51:               general.quantization_version u32              = 2
+0.00.244.765 I llama_model_loader: - kv  52:                          general.file_type u32              = 15
+0.00.244.766 I llama_model_loader: - kv  53:                      quantize.imatrix.file str              = /models_out/Nemotron-Cascade-2-30B-A3...
+0.00.244.766 I llama_model_loader: - kv  54:                   quantize.imatrix.dataset str              = /training_dir/calibration_datav5.txt
+0.00.244.767 I llama_model_loader: - kv  55:             quantize.imatrix.entries_count u32              = 185
+0.00.244.767 I llama_model_loader: - kv  56:              quantize.imatrix.chunks_count u32              = 822
+0.00.244.770 I llama_model_loader: - type  f32:  237 tensors
+0.00.244.771 I llama_model_loader: - type q5_0:   63 tensors
+0.00.244.771 I llama_model_loader: - type q8_0:   83 tensors
+0.00.244.771 I llama_model_loader: - type q4_K:   12 tensors
+0.00.244.771 I llama_model_loader: - type q5_K:    6 tensors
+0.00.244.773 I print_info: file format = GGUF V3 (latest)
+0.00.244.773 I print_info: file type   = Q4_K - Medium
+0.00.244.776 I print_info: file size   = 23.02 GiB (6.26 BPW) 
+0.00.244.815 I llama_prepare_model_devices: using device CUDA0 (NVIDIA GeForce RTX 5070 Ti) (0000:01:00.0) - 15037 MiB free
+0.00.299.704 D init_tokenizer: initializing tokenizer for type 2
+0.00.303.817 I load: 0 unused tokens
+0.00.303.824 D load: control token:    475 '<SPECIAL_475>' is not marked as EOG
+0.00.303.825 D load: control token:    787 '<SPECIAL_787>' is not marked as EOG
+0.00.303.825 D load: control token:     59 '<SPECIAL_59>' is not marked as EOG
+0.00.303.826 D load: control token:    318 '<SPECIAL_318>' is not marked as EOG
+0.00.303.828 D load: control token:    996 '<SPECIAL_996>' is not marked as EOG
+0.00.303.830 D load: control token:     51 '<SPECIAL_51>' is not marked as EOG
+0.00.303.832 D load: control token:    505 '<SPECIAL_505>' is not marked as EOG
+0.00.303.832 D load: control token:    970 '<SPECIAL_970>' is not marked as EOG
+0.00.303.833 D load: control token:    101 '<SPECIAL_101>' is not marked as EOG
+0.00.303.834 D load: control token:      0 '<unk>' is not marked as EOG
+0.00.303.835 D load: control token:    788 '<SPECIAL_788>' is not marked as EOG
+0.00.303.835 D load: control token:     56 '<SPECIAL_56>' is not marked as EOG
+0.00.303.837 D load: control token:    502 '<SPECIAL_502>' is not marked as EOG
+0.00.303.838 D load: control token:    814 '<SPECIAL_814>' is not marked as EOG
+0.00.303.839 D load: control token:      4 '[/INST]' is not marked as EOG
+0.00.303.840 D load: control token:      1 '<s>' is not marked as EOG
+0.00.303.840 D load: control token:    472 '<SPECIAL_472>' is not marked as EOG
+0.00.303.841 D load: control token:    545 '<SPECIAL_545>' is not marked as EOG
+0.00.303.841 D load: control token:    224 '<SPECIAL_224>' is not marked as EOG
+0.00.303.842 D load: control token:      6 '[/AVAILABLE_TOOLS]' is not marked as EOG
+0.00.303.843 D load: control token:    659 '<SPECIAL_659>' is not marked as EOG
+0.00.303.844 D load: control token:     24 '<SPECIAL_24>' is not marked as EOG
+0.00.303.845 D load: control token:      3 '[INST]' is not marked as EOG
+0.00.303.845 D load: control token:    174 '<SPECIAL_174>' is not marked as EOG
+0.00.303.846 D load: control token:     19 '<SPECIAL_19>' is not marked as EOG
+0.00.303.847 D load: control token:    255 '<SPECIAL_255>' is not marked as EOG
+0.00.303.848 D load: control token:    138 '<SPECIAL_138>' is not marked as EOG
+0.00.303.848 D load: control token:     86 '<SPECIAL_86>' is not marked as EOG
+0.00.303.849 D load: control token:    658 '<SPECIAL_658>' is not marked as EOG
+0.00.303.850 D load: control token:     25 '<SPECIAL_25>' is not marked as EOG
+0.00.303.850 D load: control token:    175 '<SPECIAL_175>' is not marked as EOG
+0.00.303.851 D load: control token:     18 '<SPECIAL_18>' is not marked as EOG
+0.00.303.851 D load: control token:      5 '[AVAILABLE_TOOLS]' is not marked as EOG
+0.00.303.853 D load: control token:     69 '<SPECIAL_69>' is not marked as EOG
+0.00.303.854 D load: control token:    474 '<SPECIAL_474>' is not marked as EOG
+0.00.303.854 D load: control token:    786 '<SPECIAL_786>' is not marked as EOG
+0.00.303.855 D load: control token:     58 '<SPECIAL_58>' is not marked as EOG
+0.00.303.856 D load: control token:      7 '[TOOL_RESULTS]' is not marked as EOG
+0.00.303.856 D load: control token:    319 '<SPECIAL_319>' is not marked as EOG
+0.00.303.857 D load: control token:    464 '<SPECIAL_464>' is not marked as EOG
+0.00.303.858 D load: control token:    851 '<SPECIAL_851>' is not marked as EOG
+0.00.303.859 D load: control token:    792 '<SPECIAL_792>' is not marked as EOG
+0.00.303.859 D load: control token:     40 '<SPECIAL_40>' is not marked as EOG
+0.00.303.860 D load: control token:    323 '<SPECIAL_323>' is not marked as EOG
+0.00.303.861 D load: control token:    709 '<SPECIAL_709>' is not marked as EOG
+0.00.303.862 D load: control token:      8 '[/TOOL_RESULTS]' is not marked as EOG
+0.00.303.862 D load: control token:     37 '<SPECIAL_37>' is not marked as EOG
+0.00.303.862 D load: control token:    260 '<SPECIAL_260>' is not marked as EOG
+0.00.303.863 D load: control token:      9 '[TOOL_CALLS]' is not marked as EOG
+0.00.303.864 D load: control token:     91 '<SPECIAL_91>' is not marked as EOG
+0.00.303.865 D load: control token:     30 '<SPECIAL_30>' is not marked as EOG
+0.00.303.866 D load: control token:    951 '<SPECIAL_951>' is not marked as EOG
+0.00.303.866 D load: control token:    160 '<SPECIAL_160>' is not marked as EOG
+0.00.303.867 D load: control token:    393 '<SPECIAL_393>' is not marked as EOG
+0.00.303.868 D load: control token:     10 '<|im_start|>' is not marked as EOG
+0.00.303.868 D load: control token:    819 '<SPECIAL_819>' is not marked as EOG
+0.00.303.869 D load: control token:    989 '<SPECIAL_989>' is not marked as EOG
+0.00.303.870 D load: control token:     20 '<SPECIAL_20>' is not marked as EOG
+0.00.303.870 D load: control token:    822 '<SPECIAL_822>' is not marked as EOG
+0.00.303.871 D load: control token:    375 '<SPECIAL_375>' is not marked as EOG
+0.00.303.873 D load: control token:     38 '<SPECIAL_38>' is not marked as EOG
+0.00.303.874 D load: control token:    898 '<SPECIAL_898>' is not marked as EOG
+0.00.303.875 D load: control token:    842 '<SPECIAL_842>' is not marked as EOG
+0.00.303.875 D load: control token:    378 '<SPECIAL_378>' is not marked as EOG
+0.00.303.877 D load: control token:     35 '<SPECIAL_35>' is not marked as EOG
+0.00.303.877 D load: control token:    262 '<SPECIAL_262>' is not marked as EOG
+0.00.303.878 D load: control token:    129 '<SPECIAL_129>' is not marked as EOG
+0.00.303.879 D load: control token:    918 '<SPECIAL_918>' is not marked as EOG
+0.00.303.879 D load: control token:     93 '<SPECIAL_93>' is not marked as EOG
+0.00.303.880 D load: control token:    199 '<SPECIAL_199>' is not marked as EOG
+0.00.303.880 D load: control token:    876 '<SPECIAL_876>' is not marked as EOG
+0.00.303.881 D load: control token:     27 '<SPECIAL_27>' is not marked as EOG
+0.00.303.882 D load: control token:    825 '<SPECIAL_825>' is not marked as EOG
+0.00.303.882 D load: control token:    988 '<SPECIAL_988>' is not marked as EOG
+0.00.303.883 D load: control token:     21 '<SPECIAL_21>' is not marked as EOG
+0.00.303.884 D load: control token:    873 '<SPECIAL_873>' is not marked as EOG
+0.00.303.885 D load: control token:    309 '<SPECIAL_309>' is not marked as EOG
+0.00.303.886 D load: control token:     22 '<SPECIAL_22>' is not marked as EOG
+0.00.303.887 D load: control token:    872 '<SPECIAL_872>' is not marked as EOG
+0.00.303.887 D load: control token:    308 '<SPECIAL_308>' is not marked as EOG
+0.00.303.888 D load: control token:     23 '<SPECIAL_23>' is not marked as EOG
+0.00.303.889 D load: control token:    198 '<SPECIAL_198>' is not marked as EOG
+0.00.303.889 D load: control token:    877 '<SPECIAL_877>' is not marked as EOG
+0.00.303.890 D load: control token:     26 '<SPECIAL_26>' is not marked as EOG
+0.00.303.890 D load: control token:    196 '<SPECIAL_196>' is not marked as EOG
+0.00.303.891 D load: control token:    879 '<SPECIAL_879>' is not marked as EOG
+0.00.303.892 D load: control token:    303 '<SPECIAL_303>' is not marked as EOG
+0.00.303.893 D load: control token:    981 '<SPECIAL_981>' is not marked as EOG
+0.00.303.893 D load: control token:    655 '<SPECIAL_655>' is not marked as EOG
+0.00.303.895 D load: control token:     28 '<SPECIAL_28>' is not marked as EOG
+0.00.303.896 D load: control token:    197 '<SPECIAL_197>' is not marked as EOG
+0.00.303.896 D load: control token:    878 '<SPECIAL_878>' is not marked as EOG
+0.00.303.897 D load: control token:    302 '<SPECIAL_302>' is not marked as EOG
+0.00.303.898 D load: control token:    654 '<SPECIAL_654>' is not marked as EOG
+0.00.303.898 D load: control token:    980 '<SPECIAL_980>' is not marked as EOG
+0.00.303.899 D load: control token:     29 '<SPECIAL_29>' is not marked as EOG
+0.00.303.900 D load: control token:     31 '<SPECIAL_31>' is not marked as EOG
+0.00.303.901 D load: control token:     32 '<SPECIAL_32>' is not marked as EOG
+0.00.303.902 D load: control token:     33 '<SPECIAL_33>' is not marked as EOG
+0.00.303.903 D load: control token:    843 '<SPECIAL_843>' is not marked as EOG
+0.00.303.904 D load: control token:    379 '<SPECIAL_379>' is not marked as EOG
+0.00.303.905 D load: control token:     34 '<SPECIAL_34>' is not marked as EOG
+0.00.303.906 D load: control token:     36 '<SPECIAL_36>' is not marked as EOG
+0.00.303.906 D load: control token:    374 '<SPECIAL_374>' is not marked as EOG
+0.00.303.907 D load: control token:     39 '<SPECIAL_39>' is not marked as EOG
+0.00.303.908 D load: control token:    850 '<SPECIAL_850>' is not marked as EOG
+0.00.303.908 D load: control token:    465 '<SPECIAL_465>' is not marked as EOG
+0.00.303.908 D load: control token:    793 '<SPECIAL_793>' is not marked as EOG
+0.00.303.909 D load: control token:     41 '<SPECIAL_41>' is not marked as EOG
+0.00.303.910 D load: control token:    853 '<SPECIAL_853>' is not marked as EOG
+0.00.303.910 D load: control token:    466 '<SPECIAL_466>' is not marked as EOG
+0.00.303.911 D load: control token:    790 '<SPECIAL_790>' is not marked as EOG
+0.00.303.912 D load: control token:     42 '<SPECIAL_42>' is not marked as EOG
+0.00.303.914 D load: control token:    852 '<SPECIAL_852>' is not marked as EOG
+0.00.303.914 D load: control token:    467 '<SPECIAL_467>' is not marked as EOG
+0.00.303.914 D load: control token:    791 '<SPECIAL_791>' is not marked as EOG
+0.00.303.915 D load: control token:     43 '<SPECIAL_43>' is not marked as EOG
+0.00.303.915 D load: control token:    460 '<SPECIAL_460>' is not marked as EOG
+0.00.303.916 D load: control token:    855 '<SPECIAL_855>' is not marked as EOG
+0.00.303.916 D load: control token:    796 '<SPECIAL_796>' is not marked as EOG
+0.00.303.917 D load: control token:     44 '<SPECIAL_44>' is not marked as EOG
+0.00.303.917 D load: control token:    518 '<SPECIAL_518>' is not marked as EOG
+0.00.303.918 D load: control token:    461 '<SPECIAL_461>' is not marked as EOG
+0.00.303.919 D load: control token:    854 '<SPECIAL_854>' is not marked as EOG
+0.00.303.919 D load: control token:    797 '<SPECIAL_797>' is not marked as EOG
+0.00.303.920 D load: control token:     45 '<SPECIAL_45>' is not marked as EOG
+0.00.303.921 D load: control token:    519 '<SPECIAL_519>' is not marked as EOG
+0.00.303.922 D load: control token:    857 '<SPECIAL_857>' is not marked as EOG
+0.00.303.922 D load: control token:    462 '<SPECIAL_462>' is not marked as EOG
+0.00.303.923 D load: control token:    794 '<SPECIAL_794>' is not marked as EOG
+0.00.303.923 D load: control token:     46 '<SPECIAL_46>' is not marked as EOG
+0.00.303.924 D load: control token:    856 '<SPECIAL_856>' is not marked as EOG
+0.00.303.924 D load: control token:    463 '<SPECIAL_463>' is not marked as EOG
+0.00.303.925 D load: control token:     47 '<SPECIAL_47>' is not marked as EOG
+0.00.303.926 D load: control token:    795 '<SPECIAL_795>' is not marked as EOG
+0.00.303.926 D load: control token:    514 '<SPECIAL_514>' is not marked as EOG
+0.00.303.927 D load: control token:     48 '<SPECIAL_48>' is not marked as EOG
+0.00.303.929 D load: control token:    515 '<SPECIAL_515>' is not marked as EOG
+0.00.303.930 D load: control token:     49 '<SPECIAL_49>' is not marked as EOG
+0.00.303.930 D load: control token:     50 '<SPECIAL_50>' is not marked as EOG
+0.00.303.931 D load: control token:    504 '<SPECIAL_504>' is not marked as EOG
+0.00.303.931 D load: control token:     52 '<SPECIAL_52>' is not marked as EOG
+0.00.303.932 D load: control token:    506 '<SPECIAL_506>' is not marked as EOG
+0.00.303.933 D load: control token:     53 '<SPECIAL_53>' is not marked as EOG
+0.00.303.935 D load: control token:    507 '<SPECIAL_507>' is not marked as EOG
+0.00.303.935 D load: control token:     54 '<SPECIAL_54>' is not marked as EOG
+0.00.303.936 D load: control token:    500 '<SPECIAL_500>' is not marked as EOG
+0.00.303.937 D load: control token:    478 '<SPECIAL_478>' is not marked as EOG
+0.00.303.938 D load: control token:     55 '<SPECIAL_55>' is not marked as EOG
+0.00.303.939 D load: control token:    501 '<SPECIAL_501>' is not marked as EOG
+0.00.303.939 D load: control token:    479 '<SPECIAL_479>' is not marked as EOG
+0.00.303.940 D load: control token:    789 '<SPECIAL_789>' is not marked as EOG
+0.00.303.941 D load: control token:     57 '<SPECIAL_57>' is not marked as EOG
+0.00.303.941 D load: control token:    503 '<SPECIAL_503>' is not marked as EOG
+0.00.303.942 D load: control token:    444 '<SPECIAL_444>' is not marked as EOG
+0.00.303.943 D load: control token:     60 '<SPECIAL_60>' is not marked as EOG
+0.00.303.943 D load: control token:    776 '<SPECIAL_776>' is not marked as EOG
+0.00.303.944 D load: control token:    445 '<SPECIAL_445>' is not marked as EOG
+0.00.303.945 D load: control token:    777 '<SPECIAL_777>' is not marked as EOG
+0.00.303.946 D load: control token:     61 '<SPECIAL_61>' is not marked as EOG
+0.00.303.947 D load: control token:    446 '<SPECIAL_446>' is not marked as EOG
+0.00.303.948 D load: control token:     62 '<SPECIAL_62>' is not marked as EOG
+0.00.303.948 D load: control token:    774 '<SPECIAL_774>' is not marked as EOG
+0.00.303.949 D load: control token:    447 '<SPECIAL_447>' is not marked as EOG
+0.00.303.950 D load: control token:    775 '<SPECIAL_775>' is not marked as EOG
+0.00.303.950 D load: control token:     63 '<SPECIAL_63>' is not marked as EOG
+0.00.303.951 D load: control token:    440 '<SPECIAL_440>' is not marked as EOG
+0.00.303.951 D load: control token:    772 '<SPECIAL_772>' is not marked as EOG
+0.00.303.952 D load: control token:     64 '<SPECIAL_64>' is not marked as EOG
+0.00.303.953 D load: control token:    441 '<SPECIAL_441>' is not marked as EOG
+0.00.303.953 D load: control token:    773 '<SPECIAL_773>' is not marked as EOG
+0.00.303.953 D load: control token:     65 '<SPECIAL_65>' is not marked as EOG
+0.00.303.954 D load: control token:    442 '<SPECIAL_442>' is not marked as EOG
+0.00.303.955 D load: control token:    770 '<SPECIAL_770>' is not marked as EOG
+0.00.303.955 D load: control token:     66 '<SPECIAL_66>' is not marked as EOG
+0.00.303.956 D load: control token:    443 '<SPECIAL_443>' is not marked as EOG
+0.00.303.957 D load: control token:    771 '<SPECIAL_771>' is not marked as EOG
+0.00.303.957 D load: control token:     67 '<SPECIAL_67>' is not marked as EOG
+0.00.303.958 D load: control token:     68 '<SPECIAL_68>' is not marked as EOG
+0.00.303.958 D load: control token:    454 '<SPECIAL_454>' is not marked as EOG
+0.00.303.959 D load: control token:    762 '<SPECIAL_762>' is not marked as EOG
+0.00.303.959 D load: control token:     70 '<SPECIAL_70>' is not marked as EOG
+0.00.303.960 D load: control token:    455 '<SPECIAL_455>' is not marked as EOG
+0.00.303.961 D load: control token:    763 '<SPECIAL_763>' is not marked as EOG
+0.00.303.961 D load: control token:     71 '<SPECIAL_71>' is not marked as EOG
+0.00.303.962 D load: control token:    456 '<SPECIAL_456>' is not marked as EOG
+0.00.303.963 D load: control token:    760 '<SPECIAL_760>' is not marked as EOG
+0.00.303.963 D load: control token:     72 '<SPECIAL_72>' is not marked as EOG
+0.00.303.964 D load: control token:    457 '<SPECIAL_457>' is not marked as EOG
+0.00.303.965 D load: control token:    761 '<SPECIAL_761>' is not marked as EOG
+0.00.303.965 D load: control token:     73 '<SPECIAL_73>' is not marked as EOG
+0.00.303.966 D load: control token:    450 '<SPECIAL_450>' is not marked as EOG
+0.00.303.966 D load: control token:    766 '<SPECIAL_766>' is not marked as EOG
+0.00.303.967 D load: control token:     74 '<SPECIAL_74>' is not marked as EOG
+0.00.303.968 D load: control token:    451 '<SPECIAL_451>' is not marked as EOG
+0.00.303.968 D load: control token:    767 '<SPECIAL_767>' is not marked as EOG
+0.00.303.969 D load: control token:     75 '<SPECIAL_75>' is not marked as EOG
+0.00.303.969 D load: control token:    908 '<SPECIAL_908>' is not marked as EOG
+0.00.303.970 D load: control token:    452 '<SPECIAL_452>' is not marked as EOG
+0.00.303.971 D load: control token:    764 '<SPECIAL_764>' is not marked as EOG
+0.00.303.972 D load: control token:     76 '<SPECIAL_76>' is not marked as EOG
+0.00.303.973 D load: control token:    909 '<SPECIAL_909>' is not marked as EOG
+0.00.303.974 D load: control token:    453 '<SPECIAL_453>' is not marked as EOG
+0.00.303.974 D load: control token:     77 '<SPECIAL_77>' is not marked as EOG
+0.00.303.975 D load: control token:    765 '<SPECIAL_765>' is not marked as EOG
+0.00.303.976 D load: control token:     78 '<SPECIAL_78>' is not marked as EOG
+0.00.303.977 D load: control token:     79 '<SPECIAL_79>' is not marked as EOG
+0.00.303.979 D load: control token:    253 '<SPECIAL_253>' is not marked as EOG
+0.00.303.980 D load: control token:    969 '<SPECIAL_969>' is not marked as EOG
+0.00.303.980 D load: control token:     80 '<SPECIAL_80>' is not marked as EOG
+0.00.303.981 D load: control token:    252 '<SPECIAL_252>' is not marked as EOG
+0.00.303.981 D load: control token:    968 '<SPECIAL_968>' is not marked as EOG
+0.00.303.982 D load: control token:     81 '<SPECIAL_81>' is not marked as EOG
+0.00.303.982 D load: control token:    251 '<SPECIAL_251>' is not marked as EOG
+0.00.303.983 D load: control token:     82 '<SPECIAL_82>' is not marked as EOG
+0.00.303.986 D load: control token:    250 '<SPECIAL_250>' is not marked as EOG
+0.00.303.986 D load: control token:     83 '<SPECIAL_83>' is not marked as EOG
+0.00.303.987 D load: control token:    257 '<SPECIAL_257>' is not marked as EOG
+0.00.303.987 D load: control token:     84 '<SPECIAL_84>' is not marked as EOG
+0.00.303.988 D load: control token:    256 '<SPECIAL_256>' is not marked as EOG
+0.00.303.988 D load: control token:     85 '<SPECIAL_85>' is not marked as EOG
+0.00.303.989 D load: control token:    254 '<SPECIAL_254>' is not marked as EOG
+0.00.303.990 D load: control token:     87 '<SPECIAL_87>' is not marked as EOG
+0.00.303.991 D load: control token:    139 '<SPECIAL_139>' is not marked as EOG
+0.00.303.991 D load: control token:    136 '<SPECIAL_136>' is not marked as EOG
+0.00.303.992 D load: control token:    961 '<SPECIAL_961>' is not marked as EOG
+0.00.303.993 D load: control token:     88 '<SPECIAL_88>' is not marked as EOG
+0.00.303.993 D load: control token:    137 '<SPECIAL_137>' is not marked as EOG
+0.00.303.994 D load: control token:    960 '<SPECIAL_960>' is not marked as EOG
+0.00.303.995 D load: control token:     89 '<SPECIAL_89>' is not marked as EOG
+0.00.303.995 D load: control token:    261 '<SPECIAL_261>' is not marked as EOG
+0.00.303.996 D load: control token:     90 '<SPECIAL_90>' is not marked as EOG
+0.00.303.997 D load: control token:    263 '<SPECIAL_263>' is not marked as EOG
+0.00.303.998 D load: control token:    128 '<SPECIAL_128>' is not marked as EOG
+0.00.303.999 D load: control token:    919 '<SPECIAL_919>' is not marked as EOG
+0.00.303.999 D load: control token:     92 '<SPECIAL_92>' is not marked as EOG
+0.00.304.000 D load: control token:    265 '<SPECIAL_265>' is not marked as EOG
+0.00.304.000 D load: control token:     94 '<SPECIAL_94>' is not marked as EOG
+0.00.304.001 D load: control token:    264 '<SPECIAL_264>' is not marked as EOG
+0.00.304.002 D load: control token:     95 '<SPECIAL_95>' is not marked as EOG
+0.00.304.003 D load: control token:    267 '<SPECIAL_267>' is not marked as EOG
+0.00.304.004 D load: control token:     96 '<SPECIAL_96>' is not marked as EOG
+0.00.304.005 D load: control token:    266 '<SPECIAL_266>' is not marked as EOG
+0.00.304.006 D load: control token:     97 '<SPECIAL_97>' is not marked as EOG
+0.00.304.009 D load: control token:    269 '<SPECIAL_269>' is not marked as EOG
+0.00.304.010 D load: control token:    122 '<SPECIAL_122>' is not marked as EOG
+0.00.304.010 D load: control token:    913 '<SPECIAL_913>' is not marked as EOG
+0.00.304.011 D load: control token:     98 '<SPECIAL_98>' is not marked as EOG
+0.00.304.012 D load: control token:    268 '<SPECIAL_268>' is not marked as EOG
+0.00.304.013 D load: control token:    123 '<SPECIAL_123>' is not marked as EOG
+0.00.304.014 D load: control token:    912 '<SPECIAL_912>' is not marked as EOG
+0.00.304.014 D load: control token:     99 '<SPECIAL_99>' is not marked as EOG
+0.00.304.015 D load: control token:    100 '<SPECIAL_100>' is not marked as EOG
+0.00.304.015 D load: control token:    971 '<SPECIAL_971>' is not marked as EOG
+0.00.304.016 D load: control token:    973 '<SPECIAL_973>' is not marked as EOG
+0.00.304.017 D load: control token:    102 '<SPECIAL_102>' is not marked as EOG
+0.00.304.017 D load: control token:    103 '<SPECIAL_103>' is not marked as EOG
+0.00.304.018 D load: control token:    972 '<SPECIAL_972>' is not marked as EOG
+0.00.304.019 D load: control token:    975 '<SPECIAL_975>' is not marked as EOG
+0.00.304.020 D load: control token:    104 '<SPECIAL_104>' is not marked as EOG
+0.00.304.020 D load: control token:    974 '<SPECIAL_974>' is not marked as EOG
+0.00.304.021 D load: control token:    105 '<SPECIAL_105>' is not marked as EOG
+0.00.304.022 D load: control token:    106 '<SPECIAL_106>' is not marked as EOG
+0.00.304.023 D load: control token:    977 '<SPECIAL_977>' is not marked as EOG
+0.00.304.023 D load: control token:    107 '<SPECIAL_107>' is not marked as EOG
+0.00.304.024 D load: control token:    976 '<SPECIAL_976>' is not marked as EOG
+0.00.304.025 D load: control token:    108 '<SPECIAL_108>' is not marked as EOG
+0.00.304.025 D load: control token:    979 '<SPECIAL_979>' is not marked as EOG
+0.00.304.026 D load: control token:    109 '<SPECIAL_109>' is not marked as EOG
+0.00.304.027 D load: control token:    978 '<SPECIAL_978>' is not marked as EOG
+0.00.304.027 D load: control token:    110 '<SPECIAL_110>' is not marked as EOG
+0.00.304.028 D load: control token:    943 '<SPECIAL_943>' is not marked as EOG
+0.00.304.028 D load: control token:    385 '<SPECIAL_385>' is not marked as EOG
+0.00.304.029 D load: control token:    111 '<SPECIAL_111>' is not marked as EOG
+0.00.304.030 D load: control token:    942 '<SPECIAL_942>' is not marked as EOG
+0.00.304.030 D load: control token:    384 '<SPECIAL_384>' is not marked as EOG
+0.00.304.031 D load: control token:    941 '<SPECIAL_941>' is not marked as EOG
+0.00.304.032 D load: control token:    112 '<SPECIAL_112>' is not marked as EOG
+0.00.304.032 D load: control token:    387 '<SPECIAL_387>' is not marked as EOG
+0.00.304.033 D load: control token:    113 '<SPECIAL_113>' is not marked as EOG
+0.00.304.033 D load: control token:    940 '<SPECIAL_940>' is not marked as EOG
+0.00.304.034 D load: control token:    386 '<SPECIAL_386>' is not marked as EOG
+0.00.304.034 D load: control token:    947 '<SPECIAL_947>' is not marked as EOG
+0.00.304.036 D load: control token:    114 '<SPECIAL_114>' is not marked as EOG
+0.00.304.037 D load: control token:    381 '<SPECIAL_381>' is not marked as EOG
+0.00.304.038 D load: control token:    115 '<SPECIAL_115>' is not marked as EOG
+0.00.304.038 D load: control token:    946 '<SPECIAL_946>' is not marked as EOG
+0.00.304.040 D load: control token:    380 '<SPECIAL_380>' is not marked as EOG
+0.00.304.041 D load: control token:    945 '<SPECIAL_945>' is not marked as EOG
+0.00.304.042 D load: control token:    116 '<SPECIAL_116>' is not marked as EOG
+0.00.304.043 D load: control token:    383 '<SPECIAL_383>' is not marked as EOG
+0.00.304.043 D load: control token:    117 '<SPECIAL_117>' is not marked as EOG
+0.00.304.043 D load: control token:    944 '<SPECIAL_944>' is not marked as EOG
+0.00.304.044 D load: control token:    382 '<SPECIAL_382>' is not marked as EOG
+0.00.304.044 D load: control token:    118 '<SPECIAL_118>' is not marked as EOG
+0.00.304.045 D load: control token:    119 '<SPECIAL_119>' is not marked as EOG
+0.00.304.046 D load: control token:    120 '<SPECIAL_120>' is not marked as EOG
+0.00.304.046 D load: control token:    911 '<SPECIAL_911>' is not marked as EOG
+0.00.304.047 D load: control token:    121 '<SPECIAL_121>' is not marked as EOG
+0.00.304.048 D load: control token:    910 '<SPECIAL_910>' is not marked as EOG
+0.00.304.049 D load: control token:    124 '<SPECIAL_124>' is not marked as EOG
+0.00.304.049 D load: control token:    915 '<SPECIAL_915>' is not marked as EOG
+0.00.304.050 D load: control token:    125 '<SPECIAL_125>' is not marked as EOG
+0.00.304.051 D load: control token:    914 '<SPECIAL_914>' is not marked as EOG
+0.00.304.051 D load: control token:    126 '<SPECIAL_126>' is not marked as EOG
+0.00.304.053 D load: control token:    917 '<SPECIAL_917>' is not marked as EOG
+0.00.304.053 D load: control token:    916 '<SPECIAL_916>' is not marked as EOG
+0.00.304.054 D load: control token:    127 '<SPECIAL_127>' is not marked as EOG
+0.00.304.055 D load: control token:    130 '<SPECIAL_130>' is not marked as EOG
+
+[harness] trimmed 2175085 lines of per-request logging; the startup header above is what carries the offload/context evidence.

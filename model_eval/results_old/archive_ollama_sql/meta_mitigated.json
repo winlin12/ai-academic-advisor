@@ -1,0 +1,16 @@
+{
+  "tag": "mitigated",
+  "timestamp": "2026-07-18T18:29:08",
+  "ollama_version": "0.31.2",
+  "options": {
+    "num_ctx": 8192,
+    "temperature": 0.15,
+    "seed": 67,
+    "top_p": 0.9,
+    "num_predict": 1024
+  },
+  "runs_per_pair": 3,
+  "warmup_discard": 2,
+  "sql_static_hash_v1": "a6ab55976b1547e9",
+  "sql_static_hash_v2_structured": "99cbbb2314ffd312"
+}

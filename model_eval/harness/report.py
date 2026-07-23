@@ -1,362 +1,495 @@
-"""Report generation: per-model table, head-to-head (best 8GB vs reference), and the
-mitigation before/after comparison — the table the purchase decision actually reads.
+"""Report generation. Plan-of-study first, everything else after.
 
-No composite score. Metrics are reported side by side with run-to-run variance
-(the min–max spread of each rate when recomputed per run replicate) and the report
-refuses to bless gaps that the pre-registered decision rule can't distinguish from
-noise at the current sample size.
+No composite score exists. The report prints the metrics that are automatic and decidable
+(plan viability, violation mix, requirement coverage, structured-output success) as tables,
+prints the heuristic ones as clearly labelled heuristics, and routes every free-text answer
+into a manual review queue.
+
+Guards that refuse to produce a number rather than produce a misleading one:
+  * mixed static-prompt hashes  -> those records came from different prompts
+  * mixed fixture hashes        -> the scoring authority changed mid-run
+  * unverified fixture          -> banner, because prereqs/terms in it are hand-written
+  * duplicate model entries     -> a model listed twice pools two conditions into one row
+  * server n_ctx != config      -> that model was not compared at the same context size
 """
 
 from __future__ import annotations
 
 import json
-import sqlite3
 import statistics
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 
-def _pct(x: float | None) -> str:
-    return "—" if x is None else f"{100 * x:.0f}%"
-
-
-def _rate(vals: list[bool]) -> float | None:
-    return sum(vals) / len(vals) if vals else None
-
-
-class ModelStats:
-    def __init__(self) -> None:
-        self.sql_records: list[dict] = []
-        self.summary_records: list[dict] = []
-        self.e2e_records: list[dict] = []
-        self.env: dict[str, Any] = {}
-
-    # -- helpers -------------------------------------------------------------
-    def _by_run(self, key) -> list[float]:
-        """Recompute a rate per run_idx replicate — the honest variance display."""
-        buckets: dict[int, list[bool]] = defaultdict(list)
-        for r in self.sql_records:
-            v = key(r)
-            if v is not None:
-                buckets[r["run_idx"]].append(v)
-        return [_rate(v) for v in buckets.values() if v]
-
-    def _overall(self, key) -> float | None:
-        vals = [key(r) for r in self.sql_records if key(r) is not None]
-        return _rate(vals) if vals else None
-
-    @staticmethod
-    def _fmt(rate: float | None, spread: list[float]) -> str:
-        if rate is None:
-            return "—"
-        if len(spread) > 1:
-            return f"{_pct(rate)} ({_pct(min(spread))}–{_pct(max(spread))})"
-        return _pct(rate)
-
-    # -- metric keys -----------------------------------------------------------
-    @staticmethod
-    def k_valid(r):    # answerable questions only: did emitted-or-not SQL execute?
-        return r["sql_valid"] if r["expected_behavior"] == "answer" else None
-
-    @staticmethod
-    def k_correct(r):
-        return r["sql_correct"]  # None when no gold or no SQL emitted
-
-    @staticmethod
-    def k_decline(r):
-        if r["category"] in ("out_of_scope", "adversarial") and r["expected_behavior"] == "decline":
-            return r["behavior_ok"]
-        return None
-
-    @staticmethod
-    def k_clarify(r):
-        return r["behavior_ok"] if r["expected_behavior"] == "clarify" else None
-
-    def correct_honest_value(self, gold_ids: set[str]) -> float | None:
-        vals = [bool(r["sql_correct"]) for r in self.sql_records if r["question_id"] in gold_ids]
-        return _rate(vals) if vals else None
-
-    def correct_honest(self, gold_ids: set[str]) -> str:
-        """SQL_CORRECT with abstentions counted as misses, not excluded. k_correct's
-        denominator is only rows where the model actually emitted SQL against a gold
-        question — a decline/clarify/unparseable on a real question silently vanishes
-        from that rate instead of counting against it. This recomputes over every
-        gold-eligible call: r['sql_correct'] is True -> pass, anything else -> fail."""
-        def key(r):
-            return bool(r["sql_correct"]) if r["question_id"] in gold_ids else None
-        buckets: dict[int, list[bool]] = defaultdict(list)
-        vals: list[bool] = []
-        for r in self.sql_records:
-            v = key(r)
-            if v is None:
-                continue
-            vals.append(v)
-            buckets[r["run_idx"]].append(v)
-        if not vals:
-            return "—"
-        spread = [_rate(v) for v in buckets.values() if v]
-        return self._fmt(_rate(vals), spread)
-
-    def e2e_rate(self) -> str:
-        """Heuristic pass rate for the end-to-end stage (model's OWN retrieval, not gold
-        rows, fed to the summarizer). Not a verdict — see the honesty ledger in scorers.py."""
-        if not self.e2e_records:
-            return "—"
-        passed = sum(1 for r in self.e2e_records if r.get("e2e_auto_pass"))
-        return f"{passed}/{len(self.e2e_records)} heuristic-pass"
-
-    def metric(self, key) -> str:
-        return self._fmt(self._overall(key), self._by_run(key))
-
-    def metric_value(self, key) -> float | None:
-        return self._overall(key)
-
-    def latency(self) -> str:
-        ts = sorted(r["total_s"] for r in self.sql_records if r.get("total_s"))
-        if not ts:
-            return "—"
-        p50 = statistics.median(ts)
-        p95 = ts[min(len(ts) - 1, int(0.95 * len(ts)))]
-        return f"{p50:.1f}s / {p95:.1f}s"
-
-    def flagged_summaries(self) -> str:
-        if not self.summary_records:
-            return "—"
-        flagged = sum(1 for r in self.summary_records if r.get("faithfulness_flags"))
-        return f"{flagged}/{len(self.summary_records)} flagged (heuristic; grade manually)"
-
-    def consistency(self) -> str:
-        """Fraction of questions where all N runs produced the same behavior_ok outcome."""
-        buckets: dict[str, set] = defaultdict(set)
-        for r in self.sql_records:
-            buckets[r["question_id"]].add(r["behavior_ok"])
-        if not buckets:
-            return "—"
-        stable = sum(1 for v in buckets.values() if len(v) == 1)
-        return f"{stable}/{len(buckets)} questions run-stable"
-
-
-def load_stats(path: Path) -> dict[str, ModelStats]:
-    stats: dict[str, ModelStats] = defaultdict(ModelStats)
+def _load(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
-        return {}
-    for line in path.read_text().splitlines():
-        r = json.loads(line)
-        s = stats[r["model"]]
-        if r.get("stage") == "env":
-            s.env = r
-        elif r.get("stage") == "sql" and "error" not in r:
-            s.sql_records.append(r)
-        elif r.get("stage") == "summary" and "error" not in r:
-            s.summary_records.append(r)
-        elif r.get("stage") == "e2e" and "error" not in r:
-            s.e2e_records.append(r)
-    return dict(stats)
-
-
-def gold_empty_questions(root: Path, cfg: dict, questions: list[dict]) -> list[str]:
-    """Gold SQL that returns zero rows against the actual seed DB is a trap: ANY candidate
-    query that also returns nothing — right or wrong — trivially matches it, inflating
-    SQL_CORRECT for whichever model happens to give up gracefully. Flag these so they get
-    fixed (add seed rows or drop the gold) instead of silently padding scores."""
-    db_file = root / cfg["paths"]["db_file"]
-    if not db_file.exists():
         return []
-    conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
-    conn.execute("PRAGMA query_only = ON")
-    empty: list[str] = []
-    for q in questions:
-        gold = (q.get("gold_sql") or "").strip()
-        if not gold:
+    records = []
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line:
             continue
         try:
-            rows = conn.execute(gold.rstrip(";")).fetchall()
-        except sqlite3.Error:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
             continue
-        if not rows:
-            empty.append(q["id"])
-    conn.close()
-    return empty
+    return records
 
 
-def _model_table(stats: dict[str, ModelStats], cfg: dict, gold_ids: set[str]) -> list[str]:
-    bracket = {m["name"]: m.get("bracket", "?") for m in cfg["models"]}
-    lines = [
-        "| Model | Bracket | SQL_VALID | SQL_CORRECT (attempted) | SQL_CORRECT (honest) "
-        "| E2E (heuristic) | DECLINE | CLARIFY | Faithfulness | p50/p95 | Consistency | Offload |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|",
-    ]
-    def sort_key(item):
-        return -(item[1].correct_honest_value(gold_ids) or 0)
-    for name, s in sorted(stats.items(), key=sort_key):
-        off = (s.env.get("offload") or {})
-        off_s = off.get("layers") or ("full" if off.get("fully_offloaded") else "UNVERIFIED")
-        lines.append(
-            f"| {name} | {bracket.get(name, '?')} | {s.metric(ModelStats.k_valid)} "
-            f"| {s.metric(ModelStats.k_correct)} | {s.correct_honest(gold_ids)} "
-            f"| {s.e2e_rate()} | {s.metric(ModelStats.k_decline)} "
-            f"| {s.metric(ModelStats.k_clarify)} | {s.flagged_summaries()} "
-            f"| {s.latency()} | {s.consistency()} | {off_s} |"
-        )
-    return lines
+def _rate(values: list[bool]) -> str:
+    if not values:
+        return "—"
+    return f"{sum(1 for v in values if v) / len(values):.0%}"
 
 
-def best_8gb(stats: dict[str, ModelStats], cfg: dict) -> str | None:
-    names = [m["name"] for m in cfg["models"] if m.get("bracket") == "8gb"]
-    ranked = sorted(
-        (n for n in names if n in stats and stats[n].sql_records),
-        key=lambda n: (
-            stats[n].metric_value(ModelStats.k_correct) or 0,
-            stats[n].metric_value(ModelStats.k_valid) or 0,
-        ),
-        reverse=True,
-    )
-    return ranked[0] if ranked else None
+def _rate_with_range(by_run: dict[int, list[bool]]) -> str:
+    """overall (min–max across replicates). A wide range means the model is unstable at this
+    temperature, and single-run comparisons of it are meaningless."""
+    flat = [v for values in by_run.values() for v in values]
+    if not flat:
+        return "—"
+    overall = sum(1 for v in flat if v) / len(flat)
+    per_run = [sum(1 for v in vs if v) / len(vs) for vs in by_run.values() if vs]
+    if len(per_run) < 2:
+        return f"{overall:.0%}"
+    return f"{overall:.0%} ({min(per_run):.0%}–{max(per_run):.0%})"
 
 
-def _head_to_head(base: dict[str, ModelStats], mitig: dict[str, ModelStats],
-                  cfg: dict, gold_ids: set[str]) -> list[str]:
-    ref_name = next((m["name"] for m in cfg["models"] if m.get("bracket") == "reference"), None)
-    champ = best_8gb(base, cfg)
-    if not champ or not ref_name or ref_name not in base:
-        return ["*(head-to-head unavailable: need results for both a 8gb model and "
-                f"the reference model {ref_name!r})*"]
+def _group(records: list[dict], stage: str) -> dict[str, list[dict]]:
+    out: dict[str, list[dict]] = defaultdict(list)
+    for rec in records:
+        if rec.get("stage") == stage and not rec.get("error"):
+            out[rec["model"]].append(rec)
+    return out
 
-    ref, b8 = base[ref_name], base[champ]
-    m8 = mitig.get(champ)
-    lines = [
-        f"Best 8GB model by SQL_CORRECT: **{champ}**",
-        "",
-        f"| Metric | {champ} (baseline) | {champ} (mitigated) | {ref_name} (reference) |",
-        "|---|---|---|---|",
-    ]
-    for label, key in [("SQL_VALID", ModelStats.k_valid),
-                       ("SQL_CORRECT (attempted)", ModelStats.k_correct),
-                       ("DECLINE", ModelStats.k_decline),
-                       ("CLARIFY", ModelStats.k_clarify)]:
-        lines.append(f"| {label} | {b8.metric(key)} | "
-                     f"{m8.metric(key) if m8 else 'not run'} | {ref.metric(key)} |")
+
+def _by_run(recs: list[dict], key: str) -> dict[int, list[bool]]:
+    out: dict[int, list[bool]] = defaultdict(list)
+    for rec in recs:
+        if rec.get(key) is not None:
+            out[rec.get("run_idx", 0)].append(bool(rec[key]))
+    return out
+
+
+def _consistency(recs: list[dict], item_key: str, metric: str) -> str:
+    """Fraction of items where every replicate agreed. Low consistency + small gaps = noise."""
+    by_item: dict[Any, list[bool]] = defaultdict(list)
+    for rec in recs:
+        if rec.get(metric) is not None:
+            by_item[rec.get(item_key)].append(bool(rec[metric]))
+    multi = [v for v in by_item.values() if len(v) > 1]
+    if not multi:
+        return "—"
+    agreed = sum(1 for v in multi if all(v) or not any(v))
+    return f"{agreed / len(multi):.0%}"
+
+
+def _median(values: list[Any]) -> str:
+    clean = [v for v in values if isinstance(v, (int, float))]
+    return f"{statistics.median(clean):.1f}" if clean else "—"
+
+
+# --- sections ---------------------------------------------------------------------------------
+
+
+def _satisfiable(recs: list[dict]) -> list[dict]:
+    """Drop scenarios flagged `expect_unsatisfiable` in the fixture.
+
+    Those are 0% PLAN_VIABLE for every model by construction — no legal plan covers every
+    requirement in the horizon — so pooling them into the headline rate would put a floor on
+    the metric that has nothing to do with model quality. They are reported separately, on
+    what they actually test: whether the model reports honestly what didn't fit instead of
+    inventing a semester or blowing the credit cap.
+    """
+    return [r for r in recs if not r.get("expect_unsatisfiable")]
+
+
+def _plan_section(records: list[dict], mode: str, title: str, note: str) -> list[str]:
+    groups = _group(records, mode)
+    if not groups:
+        return []
+    lines = [f"### {title}", ""]
+    if note:
+        lines += [note, ""]
     lines += [
-        f"| SQL_CORRECT (honest, abstentions=miss) | {b8.correct_honest(gold_ids)} | "
-        f"{m8.correct_honest(gold_ids) if m8 else 'not run'} | {ref.correct_honest(gold_ids)} |",
-        f"| E2E (heuristic pass) | {b8.e2e_rate()} | "
-        f"{m8.e2e_rate() if m8 else 'not run'} | {ref.e2e_rate()} |",
-        f"| Faithfulness (heuristic triage) | {b8.flagged_summaries()} | "
-        f"{m8.flagged_summaries() if m8 else 'not run'} | {ref.flagged_summaries()} |",
-        f"| Latency p50/p95 | {b8.latency()} | {m8.latency() if m8 else 'not run'} "
-        f"| {ref.latency()} (5070 Ti — says NOTHING about 3090 latency) |",
+        "| Model | PLAN_VIABLE | Structure OK | Req. coverage | Violations/plan | Consistency | Median s |",
+        "|---|---|---|---|---|---|---|",
     ]
+    rows: list[tuple[float, str]] = []
+    for model, all_recs in groups.items():
+        recs = _satisfiable(all_recs) or all_recs
+        viable = _by_run(recs, "plan_viable")
+        coverage = [r["requirement_coverage"] for r in recs
+                    if r.get("requirement_coverage") is not None]
+        violations = [len(r.get("violations") or []) for r in recs]
+        flat = [v for vs in viable.values() for v in vs]
+        cov_cell = f"{(sum(coverage) / len(coverage)):.0%}" if coverage else "—"
+        vio_cell = f"{(sum(violations) / len(violations)):.1f}" if violations else "—"
+        rows.append((
+            (sum(1 for v in flat if v) / len(flat)) if flat else -1.0,
+            f"| `{model}` | {_rate_with_range(viable)} | "
+            f"{_rate([bool(r.get('structure_ok')) for r in recs])} | {cov_cell} | {vio_cell} | "
+            f"{_consistency(recs, 'scenario', 'plan_viable')} | "
+            f"{_median([r.get('total_s') for r in recs])} |",
+        ))
+    lines += [row for _, row in sorted(rows, key=lambda item: item[0], reverse=True)]
 
-    # Mechanical evaluation of the pre-registered rule.
-    dec = cfg.get("decision", {})
-    golded = len({r["question_id"] for r in b8.sql_records if r["sql_correct"] is not None})
-    lines += ["", "### Decision rule check", ""]
-    if golded < dec.get("min_gold_questions", 30):
+    # WHY plans fail is more actionable than how often.
+    lines += ["", "**Where plans break** (violation counts across ALL runs, including the "
+              "unsatisfiable scenario — a violation is a violation regardless of whether full "
+              "coverage was reachable):", "",
+              "| Model | prereq | term offering | credit cap | hallucinated | duplicate |",
+              "|---|---|---|---|---|---|"]
+    for model, recs in groups.items():
+        counts: Counter = Counter()
+        for rec in recs:
+            counts.update(rec.get("violation_counts") or {})
         lines.append(
-            f"⚠️ Only **{golded}** gold-scored questions (< {dec.get('min_gold_questions', 30)} "
-            "pre-registered minimum). Any gap below ~18pp is within binomial noise at this "
-            "sample size — **no purchase decision can be read from this run.**")
-    subject = m8 or b8
-    subj_label = "mitigated" if m8 else "BASELINE (mitigation not run yet — run it first)"
-    c8 = subject.metric_value(ModelStats.k_correct)
-    cref = ref.metric_value(ModelStats.k_correct)
-    if c8 is not None and cref is not None:
-        gap = (cref - c8) * 100
-        need_gap = dec.get("sql_correct_gap_pp", 15)
-        floor = dec.get("sql_correct_8gb_floor", 0.80)
-        lines.append(f"- 8GB ({subj_label}) SQL_CORRECT = {_pct(c8)}; "
-                     f"{ref_name} = {_pct(cref)}; gap = {gap:.0f}pp "
-                     f"(threshold: ≥{need_gap}pp AND 8GB < {_pct(floor)})")
-        if gap >= need_gap and c8 < floor and golded >= dec.get("min_gold_questions", 30):
-            lines.append("- **Rule fires: the data supports buying the 3090** "
-                         "(subject to your manual faithfulness grades).")
-        else:
-            lines.append("- **Rule does not fire: default NO holds — keep the 2060 Super.**")
-    return lines
+            f"| `{model}` | {counts.get('prereq_violation', 0)} "
+            f"| {counts.get('term_offering_violation', 0)} "
+            f"| {counts.get('credit_cap_violation', 0)} "
+            f"| {counts.get('hallucinated_course', 0)} "
+            f"| {counts.get('duplicate_course', 0)} |"
+        )
+    return lines + [""]
+
+
+def _mode_a_extra(records: list[dict]) -> list[str]:
+    groups = _group(records, "plan_mode_a")
+    if not groups:
+        return []
+    lines = [
+        "**Did the model actually help?** Mode A's plan is legal no matter what the model says "
+        "— the deterministic planner guarantees that, and a hallucinated proposal degrades to a "
+        "no-op. These columns are what separates a model that understood the student from one "
+        "that returned an empty proposal.",
+        "",
+        "| Model | Proposal parsed | Touched anything | Grounded | Ask honoured | Plan not worse |",
+        "|---|---|---|---|---|---|",
+    ]
+    for model, recs in groups.items():
+        asserts: list[bool] = []
+        for rec in recs:
+            asserts.extend((rec.get("assertions_passed") or {}).values())
+        lines.append(
+            f"| `{model}` | {_rate([not r.get('proposal_parse_failed') for r in recs])} "
+            f"| {_rate([bool(r.get('proposal_touched_anything')) for r in recs])} "
+            f"| {_rate([bool(r.get('proposal_grounded')) for r in recs])} "
+            f"| {_rate(asserts)} "
+            f"| {_rate([bool(r.get('plan_not_worse')) for r in recs])} |"
+        )
+    return lines + [""]
+
+
+def _scenario_breakdown(records: list[dict], mode: str) -> list[str]:
+    recs = [r for r in records if r.get("stage") == mode and not r.get("error")]
+    if not recs:
+        return []
+    scenarios = sorted({r.get("scenario") for r in recs if r.get("scenario")})
+    models = sorted({r["model"] for r in recs})
+    if not scenarios:
+        return []
+    lines = ["**PLAN_VIABLE by scenario** — a model that only fails the hardest scenario is a "
+             "different proposition from one that fails everywhere.", "",
+             "| Model | " + " | ".join(scenarios) + " |",
+             "|---" * (len(scenarios) + 1) + "|"]
+    for model in models:
+        cells = [
+            _rate([bool(r.get("plan_viable")) for r in recs
+                   if r["model"] == model and r.get("scenario") == scenario])
+            for scenario in scenarios
+        ]
+        lines.append(f"| `{model}` | " + " | ".join(cells) + " |")
+    return lines + [""]
+
+
+def _unsatisfiable_section(records: list[dict]) -> list[str]:
+    """The scenario where the honest answer is "this doesn't fit".
+
+    Excluded from the headline PLAN_VIABLE because coverage cannot reach 1.0 for anyone. What
+    it tests instead is what a model does when it cannot succeed: report the shortfall, or
+    fabricate room for it. Inventing an extra semester or blowing through the credit cap to
+    make the numbers work is the single most damaging behaviour on a real advising site,
+    because it looks like a complete plan.
+    """
+    recs = [r for r in records
+            if r.get("stage") == "plan_mode_b" and r.get("expect_unsatisfiable")
+            and not r.get("error")]
+    if not recs:
+        return []
+    models = sorted({r["model"] for r in recs})
+    lines = ["### When nothing fits — the honesty check", "",
+             "One scenario in the fixture is unsatisfiable by design (one semester left, more "
+             "requirements than can fit). Nobody scores PLAN_VIABLE here. The question is "
+             "whether the model says so.", "",
+             "| Model | Stayed in horizon | Respected credit cap | Declared what didn't fit | Violations/plan |",
+             "|---|---|---|---|---|"]
+    for model in models:
+        mine = [r for r in recs if r["model"] == model]
+        caps = [not (r.get("violation_counts") or {}).get("credit_cap_violation") for r in mine]
+        horizon = [not r.get("over_horizon") for r in mine]
+        declared = [bool(r.get("declared_unplanned")) for r in mine]
+        vio = [len(r.get("violations") or []) for r in mine]
+        lines.append(
+            f"| `{model}` | {_rate(horizon)} | {_rate(caps)} | {_rate(declared)} "
+            f"| {(sum(vio) / len(vio)):.1f} |"
+        )
+    return lines + [""]
+
+
+def _qa_section(records: list[dict]) -> list[str]:
+    groups = _group(records, "qa")
+    if not groups:
+        return []
+    lines = ["### Grounded QA (the RAG summarization step)", "",
+             "Retrieval is fixed and identical for every model — the chunks come from "
+             "`questions.yaml`, not a live pgvector query — so this measures the chat model "
+             "only, not the embedding model. `Faith-flagged` and `Recall-flagged` are "
+             "HEURISTICS: entity-level triage, not verdicts. Grade the review queue before "
+             "quoting a faithfulness number.", "",
+             "| Model | Behavior OK | Auto-pass | Faith-flagged | Recall-flagged | Median s |",
+             "|---|---|---|---|---|---|"]
+    for model, recs in groups.items():
+        lines.append(
+            f"| `{model}` | {_rate_with_range(_by_run(recs, 'behavior_ok'))} "
+            f"| {_rate([bool(r.get('qa_auto_pass')) for r in recs])} "
+            f"| {_rate([bool(r.get('faithfulness_flags')) for r in recs])} "
+            f"| {_rate([bool(r.get('recall_flags')) for r in recs])} "
+            f"| {_median([r.get('total_s') for r in recs])} |"
+        )
+    return lines + [""]
+
+
+def _explain_section(records: list[dict]) -> list[str]:
+    groups = _group(records, "explain")
+    if not groups:
+        return []
+    lines = ["### Explain-plan", "",
+             "Every model explains the SAME deterministic baseline plan, which isolates "
+             "explanation quality from planning quality. Faith-flagged is a heuristic.", "",
+             "| Model | Faith-flagged | Truncated | Median output tokens | Median s |",
+             "|---|---|---|---|---|"]
+    for model, recs in groups.items():
+        lines.append(
+            f"| `{model}` | {_rate([bool(r.get('faithfulness_flags')) for r in recs])} "
+            f"| {_rate([bool(r.get('truncated')) for r in recs])} "
+            f"| {_median([r.get('eval_count') for r in recs])} "
+            f"| {_median([r.get('total_s') for r in recs])} |"
+        )
+    return lines + [""]
+
+
+def _env_section(records: list[dict]) -> list[str]:
+    envs = [r for r in records if r.get("stage") == "env"]
+    if not envs:
+        return []
+    lines = ["### Environment (measured, not assumed)", "",
+             "| Model | VRAM delta MB | GPU offload | Server n_ctx | Matches config? |",
+             "|---|---|---|---|---|"]
+    for env in envs:
+        offload = env.get("offload") or {}
+        layers = offload.get("layers") or "UNVERIFIED"
+        match = env.get("ctx_matches_config")
+        lines.append(
+            f"| `{env['model']}` | {env.get('vram_delta_mb')} "
+            f"| {layers} ({offload.get('source', '?')}) | {env.get('server_n_ctx')} "
+            f"| {'yes' if match else ('**NO**' if match is False else '?')} |"
+        )
+    return lines + [""]
+
+
+def _errors_section(records: list[dict]) -> list[str]:
+    errors = [r for r in records if r.get("error")]
+    if not errors:
+        return []
+    lines = ["### Failures", "",
+             "A model that would not load, OOMed, or timed out is a finding, not a gap. Listed "
+             "here rather than silently omitted from the tables above.", ""]
+    seen = set()
+    for rec in errors:
+        key = (rec.get("model"), str(rec.get("error"))[:120])
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append(f"- `{rec.get('model')}` ({rec.get('stage')}): {str(rec.get('error'))[:300]}")
+    return lines + [""]
+
+
+def _guards(records: list[dict], cfg: dict, fixture_meta: dict) -> list[str]:
+    lines: list[str] = []
+    ok = True
+
+    names = [m["name"] for m in cfg.get("models", [])]
+    dupes = [n for n, c in Counter(names).items() if c > 1]
+    if dupes:
+        ok = False
+        lines.append(f"- ⚠️ **duplicate model entries in config.yaml**: {', '.join(dupes)} — a "
+                     "model listed twice runs twice and pools both conditions into one row.")
+
+    for stage in ("plan_mode_a", "plan_mode_b", "qa", "explain"):
+        hashes = {r.get("static_hash") for r in records
+                  if r.get("stage") == stage and r.get("static_hash")}
+        if len(hashes) > 1:
+            ok = False
+            lines.append(f"- ⚠️ **mixed static-prompt hashes in `{stage}`** ({sorted(hashes)}) — "
+                         "these records came from different prompts and MUST NOT be compared. "
+                         "Re-run, or split the file by hash.")
+
+    fixture_hashes = {r.get("fixture_hash") for r in records if r.get("fixture_hash")}
+    if len(fixture_hashes) > 1:
+        ok = False
+        lines.append(f"- ⚠️ **mixed fixture hashes** ({sorted(fixture_hashes)}) — the scoring "
+                     "authority (`plan_fixtures/*.yaml`) changed partway through.")
+
+    if fixture_meta and not fixture_meta.get("verified", False):
+        ok = False
+        lines.append("- ⚠️ **plan fixture is `verified: false`** — its prerequisite edges and "
+                     "term offerings are hand-written, because Purdue's catalog publishes "
+                     "neither. Model *rankings* are usable (every model is scored against the "
+                     "same rules); any absolute claim about real degree progress is not, until "
+                     "`python run.py fixture-check` has been run against a populated catalog DB.")
+
+    mismatched = [r["model"] for r in records
+                  if r.get("stage") == "env" and r.get("ctx_matches_config") is False]
+    if mismatched:
+        ok = False
+        lines.append(f"- ⚠️ **context-size mismatch**: {', '.join(mismatched)} ran at a context "
+                     "size the config did not ask for and are not comparable to the rest.")
+
+    n = len(fixture_meta.get("scenarios") or [])
+    floor = cfg.get("decision", {}).get("min_plan_scenarios", 8)
+    if 0 < n < floor:
+        ok = False
+        ci = int(1.96 * (0.5 / (n ** 0.5)) * 100)
+        lines.append(
+            f"- ⚠️ **statistical power**: {n} scenarios is the real sample size — the replicates "
+            f"are correlated repeats of the same item, not independent samples. A binomial 95% "
+            f"CI at n={n} is roughly ±{ci}pp, the same magnitude as any threshold worth setting. "
+            f"If two models differ by less than that, the correct response is *write more "
+            f"scenarios*, not *pick a winner*. Target: {floor}."
+        )
+
+    if ok:
+        lines.append("- All guards passed.")
+    return lines + [""]
+
+
+def _review_queue(records: list[dict], out_path: Path) -> int:
+    """Every free-text answer plus every non-viable plan, for manual grading."""
+    rows = []
+    for rec in records:
+        if rec.get("needs_review"):
+            rows.append({
+                "model": rec.get("model"), "stage": rec.get("stage"),
+                "item": rec.get("question_id") or rec.get("scenario"),
+                "run_idx": rec.get("run_idx"),
+                "faithfulness_flags": rec.get("faithfulness_flags"),
+                "recall_flags": rec.get("recall_flags"),
+                "output": rec.get("output"),
+                "grade": None, "notes": None,
+            })
+        elif rec.get("stage") in ("plan_mode_a", "plan_mode_b") and rec.get("plan_viable") is False:
+            rows.append({
+                "model": rec.get("model"), "stage": rec.get("stage"),
+                "item": rec.get("scenario"), "run_idx": rec.get("run_idx"),
+                "violations": rec.get("violations"),
+                "missing_requirements": rec.get("missing_requirements"),
+                "semesters": rec.get("semesters"),
+                "grade": None, "notes": None,
+            })
+    out_path.write_text("\n".join(json.dumps(r, default=str) for r in rows))
+    return len(rows)
 
 
 def generate_report(root: Path) -> Path:
     cfg = yaml.safe_load((root / "config.yaml").read_text())
-    results_dir = root / cfg["paths"]["results_dir"]
-    base = load_stats(results_dir / "runs_baseline.jsonl")
-    mitig = load_stats(results_dir / "runs_mitigated.jsonl")
-    if not base:
-        raise SystemExit("No baseline results found — run `python run.py run` first.")
-
-    questions = yaml.safe_load((root / cfg["paths"]["questions"]).read_text())
-    gold_ids = {q["id"] for q in questions if (q.get("gold_sql") or "").strip()}
-
-    meta_path = results_dir / "meta_baseline.json"
+    results = root / cfg["paths"]["results_dir"]
+    results.mkdir(exist_ok=True)
+    baseline = _load(results / "runs_baseline.jsonl")
+    mitigated = _load(results / "runs_mitigated.jsonl")
+    meta_path = results / "meta_baseline.json"
     meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+    fixture_meta = meta.get("fixture", {})
+    run_meta = meta.get("run", {})
 
-    lines = ["# Model Evaluation Report", ""]
-    if meta:
-        lines += [f"Ollama version: `{meta.get('ollama_version')}` · options: "
-                  f"`{meta.get('options')}` · runs/pair: {meta.get('runs_per_pair')} · "
-                  f"warmup discarded: {meta.get('warmup_discard')}", ""]
-    hashes = {r["static_hash"] for s in base.values() for r in s.sql_records}
-    if len(hashes) > 1:
-        lines += ["⚠️ **MULTIPLE STATIC-PROMPT HASHES IN ONE RESULT FILE** — someone edited "
-                  "schema.sql or prompts.py mid-run. These rows are not comparable. "
-                  "Delete results/ and re-run.", ""]
+    lines = [
+        "# Model evaluation — BoilerAdvisor",
+        "",
+        f"Fixture `{fixture_meta.get('path', '?')}` (hash `{fixture_meta.get('hash', '?')}`, "
+        f"{fixture_meta.get('courses', '?')} courses, "
+        f"{fixture_meta.get('requirement_groups', '?')} requirement groups)  ",
+        f"Run {meta.get('timestamp', '?')} · tasks {meta.get('tasks', '?')} · "
+        f"num_ctx {run_meta.get('num_ctx', '?')} · temp {run_meta.get('temperature', '?')} · "
+        f"seed {run_meta.get('seed', '?')} · "
+        f"{run_meta.get('runs_per_pair', '?')} replicates",
+        "",
+        "## 1. Plan of study — the feature this is really about",
+        "",
+        "A plan is VIABLE only if it has zero hard violations (prerequisite ordering, term "
+        "offerings, credit cap, hallucinated course codes, duplicates) **and** covers every "
+        "degree requirement. One prerequisite mistake anywhere in eight semesters fails the "
+        "whole plan. That is the correct standard: a student following it gets turned away at "
+        "registration.",
+        "",
+    ]
 
-    empty_gold = gold_empty_questions(root, cfg, questions)
-    if empty_gold:
-        lines += [f"⚠️ **{len(empty_gold)} gold quer{'y' if len(empty_gold)==1 else 'ies'} "
-                  f"return ZERO rows against the seed DB**: {', '.join(empty_gold)}. Any "
-                  "candidate SQL that also returns nothing trivially matches these and counts "
-                  "as SQL_CORRECT — add the missing seed rows or drop the gold.", ""]
+    lines += _plan_section(
+        baseline, "plan_mode_b", "Mode B — the model builds the whole schedule",
+        "No production call site does this today. It is the discriminating measurement: the "
+        "model gets the catalog and the requirements and must produce the schedule itself. "
+        "Read it as *what would we gain, or risk, by trusting the model with sequencing?*",
+    )
+    lines += _scenario_breakdown(baseline, "plan_mode_b")
+    lines += _plan_section(
+        baseline, "plan_mode_a", "Mode A — the app's real revise-plan path",
+        "This is `advisor_agent.revise_plan` as shipped: the model emits a `PlanEditProposal` "
+        "and the deterministic planner rebuilds the schedule. Viability here should be ~100% "
+        "for every model **by construction** — if it isn't, the harness's vendored planner has "
+        "drifted from the app's, and that is itself the finding.",
+    )
+    lines += _mode_a_extra(baseline)
+    lines += _unsatisfiable_section(baseline)
+    lines += _qa_section(baseline)
+    lines += _explain_section(baseline)
 
-    dupes = [m["name"] for m in cfg["models"]
-             if [x["name"] for x in cfg["models"]].count(m["name"]) > 1]
-    if dupes:
-        lines += [f"⚠️ **Model(s) listed more than once in config.yaml**: "
-                  f"{', '.join(sorted(set(dupes)))}. Each duplicate runs separately and their "
-                  "records get pooled under one name here — if the duplicates differ in "
-                  "`think` or any other option, this row is a blend of two conditions. "
-                  "Remove the duplicate entries.", ""]
+    section = 2
+    if mitigated:
+        lines += [f"## {section}. After mitigation", "",
+                  "Mitigation = the multi-iteration revise loop (`revise_max_iterations`) plus "
+                  "retry-on-unusable-proposal: the fixes that cost $0. A gap that closes here "
+                  "never justified hardware.", ""]
+        lines += _plan_section(mitigated, "plan_mode_b", "Mode B (mitigated)", "")
+        lines += _plan_section(mitigated, "plan_mode_a", "Mode A (mitigated)", "")
+        lines += _mode_a_extra(mitigated)
+        section += 1
 
-    lines += ["## Per-model results", "",
-              "Rates show overall (min–max across run replicates). SQL_CORRECT (attempted) "
-              "covers only calls where the model emitted SQL against a gold question — a "
-              "decline/clarify/unparseable silently drops out of that denominator. "
-              "SQL_CORRECT (honest) counts every gold-eligible call, scoring abstentions as "
-              "misses. E2E feeds the model's OWN retrieved rows (not gold rows) into the "
-              "summarizer — closer to what a student actually sees — and is a heuristic "
-              "pass/fail triage, not a verdict. Faithfulness numbers are heuristic triage "
-              "counts — the real grade is your manual review of `results/review_queue.jsonl`.",
-              ""]
-    lines += _model_table(base, cfg, gold_ids)
-    lines += ["", "## Head-to-head: best 8GB vs reference", ""]
-    lines += _head_to_head(base, mitig, cfg, gold_ids)
+    lines += [f"## {section}. Environment and failures", ""]
+    lines += _env_section(baseline)
+    lines += _errors_section(baseline)
 
-    # Manual review queue: every summary + e2e answer + flagged/unparseable behavior call.
-    queue = results_dir / "review_queue.jsonl"
-    with queue.open("w") as f:
-        for stats in list(base.values()) + list(mitig.values()):
-            for r in stats.summary_records:
-                f.write(json.dumps({k: r[k] for k in
-                        ("model", "question_id", "run_idx", "mitigated", "output",
-                         "rows_json", "faithfulness_flags")}) + "\n")
-            for r in stats.e2e_records:
-                if not r.get("needs_review"):
-                    continue
-                f.write(json.dumps({k: r.get(k) for k in
-                        ("model", "question_id", "run_idx", "mitigated", "output",
-                         "retrieval_correct", "rows_json", "gold_rows_json",
-                         "faithfulness_flags", "recall_flags", "e2e_auto_pass")}) + "\n")
-            for r in stats.sql_records:
-                if r.get("needs_review"):
-                    f.write(json.dumps({k: r.get(k) for k in
-                            ("model", "question_id", "run_idx", "mitigated", "category",
-                             "expected_behavior", "action", "output")}) + "\n")
-    lines += ["", f"Manual review queue written to `{queue}` — faithfulness, e2e, and "
-              "off-format decline calls are graded by you, not by this script.", ""]
+    section += 1
+    lines += [f"## {section}. Validity guards", ""]
+    lines += _guards(baseline + mitigated, cfg, fixture_meta)
 
-    out = results_dir / "report.md"
-    out.write_text("\n".join(lines))
-    print("\n".join(lines))
-    return out
+    queue_path = results / "review_queue.jsonl"
+    count = _review_queue(baseline + mitigated, queue_path)
+    section += 1
+    lines += [
+        f"## {section}. Your turn",
+        "",
+        f"`{queue_path.name}` holds {count} items awaiting manual grading: every free-text "
+        "answer (faithfulness is not machine-checkable) and every non-viable plan (so you can "
+        "confirm the violation the harness found is real and not a fixture bug — the fastest "
+        "way to discover a wrong prereq edge is to see three good models all 'fail' the same "
+        "course). The plan-viability numbers above stand on their own; the faithfulness "
+        "numbers do not until this queue is graded.",
+        "",
+    ]
+
+    report_path = results / "report.md"
+    report_path.write_text("\n".join(lines))
+    print(f"Wrote {report_path} ({count} items in the review queue)")
+    return report_path

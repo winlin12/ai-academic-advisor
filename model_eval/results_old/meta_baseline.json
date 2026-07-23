@@ -1,0 +1,79 @@
+{
+  "tag": "baseline",
+  "timestamp": "2026-07-22T22:35:00",
+  "host": "172.30.192.1",
+  "tasks": [
+    "explain",
+    "plan_a",
+    "plan_b",
+    "qa"
+  ],
+  "models": [
+    "qwen3-8b",
+    "qwen3.5-9b",
+    "qwen3.6-35b-a3b",
+    "qwen3-next",
+    "qwen3-coder-next"
+  ],
+  "run": {
+    "num_ctx": 8192,
+    "n_gpu_layers": 999,
+    "n_cpu_moe": 35,
+    "cache_type_k": "q8_0",
+    "cache_type_v": "q8_0",
+    "temperature": 0.15,
+    "seed": 67,
+    "top_p": 0.9,
+    "max_output_tokens": 1024,
+    "max_plan_tokens": 2048,
+    "runs_per_pair": 3,
+    "warmup_discard": 2,
+    "request_timeout_s": 600,
+    "revise_max_iterations": 3,
+    "explain_question": "Why is my plan sequenced this way, and where is it risky?",
+    "planning_terms": [
+      "fall",
+      "spring"
+    ],
+    "save_transcripts": true,
+    "default_tasks": [
+      "plan_a",
+      "plan_b",
+      "qa",
+      "explain"
+    ]
+  },
+  "llamacpp": {
+    "server_exe": "D:\\llm\\llama.cpp\\bin\\llama-server.exe",
+    "models_root": "D:\\llm\\models",
+    "host": "auto",
+    "port": 8099,
+    "startup_timeout_s": 900,
+    "cooldown_s": 5,
+    "log_verbosity": 5,
+    "keep_log_lines": 400
+  },
+  "fixture": {
+    "path": "cs_machine_intelligence.yaml",
+    "hash": "1ae6820982467b77",
+    "verified": false,
+    "scenarios": [
+      "mi-fresh-start",
+      "mi-sophomore-catchup",
+      "mi-light-load",
+      "mi-ai-early",
+      "mi-summer-accelerate",
+      "mi-spring-start",
+      "mi-theory-averse",
+      "mi-tight-horizon"
+    ],
+    "courses": 34,
+    "requirement_groups": 9
+  },
+  "static_hashes": {
+    "plan_mode_a": "29375e69b7444578",
+    "plan_mode_b": "298026a69c5ce46f",
+    "qa": "2622e913ee860dfd",
+    "explain": "34eec70705f9b4b5"
+  }
+}

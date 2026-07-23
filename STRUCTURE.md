@@ -4,12 +4,14 @@ A file-by-file map of this repo. See [`README.md`](README.md) for setup/usage an
 [`TODO.md`](TODO.md) for what's missing and planned next. (The repo directory is still
 named `ai-academic-advisor`; the product was renamed **BoilerAdvisor** on 2026-07-06.)
 
-The project has three independent parts that talk to each other over HTTP/Postgres:
+The project has three independent parts that talk to each other over HTTP/Postgres, plus a
+standalone benchmark that deliberately talks to none of them:
 
 ```
 catalog_ingestion/   Scrapes Purdue's catalog + PurdueIO API into Postgres
 backend/             FastAPI app: planner, LLM/RAG advisor, reads that Postgres DB
 clients/web/         Next.js UI that calls the backend over HTTP
+model_eval/          Which local model to run — measures the app's tasks, imports none of its code
 ```
 
 ---
@@ -156,6 +158,39 @@ Ships its own CLI (`catalog-ingest`), Alembic migrations, and a `Makefile` runbo
 | `test_discover_catalog_years.py` | Tests catalog-year discovery against a hand-built sample index page. |
 | `test_parse_courses.py` | Tests the course-page parser against HTML mirroring the real Acalog page structure. |
 | `test_parse_prerequisites.py` | Tests prerequisite-text parsing (single course, AND/OR combinations, confidence levels). |
+
+---
+
+## `model_eval/` — local-model benchmark
+
+Decides which GGUF the advisor should run. Standalone by design: Python 3.10+ and PyYAML,
+no FastAPI/pydantic/Postgres, so it runs on whichever box holds the GPU. It starts and stops
+`llama-server` itself, because under llama.cpp context size and GPU/KV settings are *launch*
+flags — "every model saw identical settings" is only true if one place owns the command line.
+
+The headline task is **plan of study** (CS BS, Machine Intelligence), scored for viability:
+prerequisite ordering, term offerings, credit caps, hallucinated codes, requirement coverage.
+See [`model_eval/README.md`](model_eval/README.md).
+
+| File | Description |
+|------|-------------|
+| `README.md` | What the harness measures, what is automatic vs. manual, the WSL→Windows networking fix, the pre-registered decision rule. |
+| `config.yaml` | Every knob that could pollute a comparison: `num_ctx`, KV type, GPU layers, sampling, per-model gguf paths under `D:\llm\models\`, decision thresholds. |
+| `run.py` | CLI: `doctor` (networking), `check` (fixture/prompt validity), `serve`, `run`, `report`, `parity`, `fixture-check`. |
+| `questions.yaml` | Grounded-QA items with their retrieved chunks **pinned in the file** — retrieval belongs to the embedding model, so pinning it keeps QA scores about the chat model. |
+| `plan_fixtures/cs_machine_intelligence.yaml` | **The scoring authority**: 34-course catalog with prereq edges and term offerings, 9 requirement groups, 8 student scenarios. `verified: false` — read its provenance header. |
+| `setup/allow_wsl_llamacpp.ps1` | The one Windows Firewall rule that lets WSL reach llama-server on the host. |
+| `harness/server.py` | llama-server lifecycle over WSL interop: builds argv from config, waits for `/health`, counts per-layer GPU offload from stderr, stops between models. |
+| `harness/llamacpp_client.py` | Streaming stdlib client for `/v1/chat/completions` (the same endpoint the app uses). TTFT, token counts, llama.cpp's own timings. |
+| `harness/planner.py` | **Vendored copy** of `backend/app/services/planner.py` + `advisor_agent._apply_proposal`, so Mode A replays the app's real revise-plan path without importing it. `run.py parity` guards the drift. |
+| `harness/fixtures.py` | Loads the plan fixture; ports `planner_catalog.select_remaining_courses` so Mode A starts from production's baseline. |
+| `harness/plan_scorers.py` | Plan viability, requirement coverage, scenario assertions, proposal groundedness — all automatic and decidable. |
+| `harness/prompts.py` | Static-first prompts mirroring the app's four live LLM call sites; sha256 of each static block travels with every record. |
+| `harness/scorers.py` | JSON extraction plus the *heuristic* faithfulness/recall/abstention checks. |
+| `harness/runner.py` | Orchestration: server lifecycle, warmup + discard, VRAM delta, N replicates. Plan tasks run first. |
+| `harness/report.py` | `results/report.md`: plan tables first, validity guards, manual review queue. No composite score. |
+| `results/` | Gitignored run outputs (`runs_*.jsonl`, `report.md`, `server_logs/`). |
+| `results/archive_ollama_sql/` | The retired Ollama-era text-to-SQL harness (question set, stub schema, client), kept as history. The app no longer asks a model for SQL — `rag/pipeline.py` does retrieval itself. |
 
 ---
 

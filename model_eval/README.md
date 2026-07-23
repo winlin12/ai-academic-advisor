@@ -1,137 +1,279 @@
 # Model Evaluation Harness
 
-A standalone harness that answers one question with numbers instead of vibes:
+Answers one question with numbers instead of vibes:
 
-> Is the quality gap between the best 8GB-class local model and Qwen3.6-27B large
-> enough, **on this app's two narrow tasks**, to justify ~$1,400 of used 3090 + PSU?
+> **Which local model should BoilerAdvisor run, given that generating a viable plan of study
+> is the thing students will actually use it for?**
 
-Default answer: **no**. The harness exists to overturn that default only if the data
-demands it. It talks directly to Ollama's HTTP API and depends on nothing in the app
-(the app's backend/DB are not required or touched).
+Everything else this harness measures — grounded QA, plan explanation, structured-output
+reliability — is secondary to that. The report is ordered accordingly.
 
-## Requirements
+The harness depends on nothing in the app (no FastAPI, no pydantic, no Postgres). It needs
+Python 3.10+, PyYAML, and llama.cpp. It starts and stops `llama-server` itself.
 
-- Python 3.10+, `pip install pyyaml` (only dependency)
-- A running Ollama server (`localhost:11434` or edit `config.yaml`)
-- `nvidia-smi` on the measurement boxes (absent = VRAM recorded as null)
-- Models pulled onto **SSD** storage (HDD cold-loads pollute latency)
+---
+
+## What changed, and why (read this before comparing to old results)
+
+This used to be an Ollama text-to-SQL benchmark. Both halves of that are obsolete:
+
+| Was | Is | Why |
+|---|---|---|
+| Ollama HTTP API (`/api/generate`) | llama.cpp `llama-server` (`/v1/chat/completions`) | The app moved to llama.cpp on 2026-07-21 (`backend/app/services/llamacpp_client.py`). Ollama's nanosecond timing fields, `think:` flag and `journalctl` offload parsing have no equivalent. |
+| Text-to-SQL against a stub SQLite schema | Plan of study + grounded QA | **The app never asks a model for SQL.** `services/rag/pipeline.py` does retrieval itself (exact course-code lookup + pgvector cosine search) and hands the model only the chunks it already found. Measuring SQL was measuring a call site that does not exist. |
+| `num_ctx` sent per request | `--ctx-size` fixed at launch | llama.cpp fixes context, KV type, GPU layers and reasoning mode when the process starts. The harness therefore owns the process — otherwise "every model saw identical settings" depends on whoever typed the last command line. |
+| Offload from `journalctl -u ollama` | Offload from llama-server's own stderr | Better data: build b10083 names the device for *every layer*, so offload is counted, not inferred. Requires `-lv 5`; at default verbosity llama-server prints no offload info at all. |
+
+The old SQL question set, stub schema and Ollama client are preserved under
+`results/archive_ollama_sql/`. Old `runs_*.jsonl` files are **not** comparable to new ones —
+different tasks, different prompts, different hashes.
+
+---
 
 ## Quick start
 
 ```bash
 cd model_eval
-python run.py db        # build eval.sqlite from schema.sql
-python run.py check     # verify golds execute, Ollama reachable, GPU visible
-python run.py run --brackets 8gb,small          # on the 2060 Super box
-python run.py run --models qwen3.6:27b          # on the 5070 Ti box
-python run.py report                            # tables + decision-rule check
-# then, for the champion the report names:
-python run.py run --mitigate --models <best-8gb-model>
-python run.py report                            # now includes before/after
+
+python run.py doctor              # WSL -> Windows llama-server reachability (once, first)
+python run.py refresh-offerings   # pull real term offerings into the fixture (see below)
+python run.py check               # fixture validity, prompt sizes, gguf files, GPU visible
+python run.py run        # every model, every task  (hours — see "Cost" below)
+python run.py report     # results/report.md
+
+# narrower runs
+python run.py run --brackets 8gb,coder            # deployment candidates only
+python run.py run --models qwen3.6-27b --tasks plan_b
+python run.py run --mitigate --models <champion>  # the free fixes, for before/after
 ```
 
-Results are JSONL under `results/`; runs on two machines can be merged by
-concatenating their `runs_baseline.jsonl` files (the report tolerates that — every
-record is self-describing and carries the static-prompt hash).
+### Requirements
+
+- Python 3.10+, `pip install pyyaml` (only dependency)
+- llama.cpp at `D:\llm\llama.cpp\bin\llama-server.exe`, GGUFs under `D:\llm\models\`
+- `nvidia-smi` (WSL ships it at `/usr/lib/wsl/lib/nvidia-smi`; absent = VRAM recorded as null)
+- Models on **SSD** — an HDD cold-load pollutes latency and can blow the startup timeout
+
+### The WSL networking gotcha
+
+`llama-server` is a native Windows process (CUDA 13.3 — the Blackwell 5070 Ti will not run
+the stock cuda-12.4 build). The harness runs in WSL2. In NAT mode **WSL cannot reach the
+Windows loopback**, so the server binds `0.0.0.0` and is reached at the default-gateway IP —
+a path Windows Firewall blocks by default. The symptom is a server that starts perfectly,
+logs `listening`, and is unreachable, which looks exactly like a model that failed to load.
+
+```bash
+powershell.exe -ExecutionPolicy Bypass -File setup/allow_wsl_llamacpp.ps1   # one UAC click
+```
+
+`python run.py doctor` detects this specific failure and says so. The alternative fix
+(`networkingMode=mirrored` in `.wslconfig`) is cleaner but needs `wsl --shutdown`.
+
+Note the eval port is **8099**, not llama.cpp's default 8080 — the `purdueio-api` container
+already owns 8080 on this box.
+
+---
+
+## Term offerings are observed, not invented
+
+Purdue's Acalog catalog publishes no term offerings, so the fixture's `offered_terms` started
+out hand-written — and were wrong for **17 of 34 courses**. CS 47300 was recorded spring-only
+when it is observed fall-only; CS 47100 fall-only when it runs both. Models were being charged
+term-offering violations for schedules that were legal.
+
+PurdueIO has no "offered in" field either, but it has `Classes` — a (Course, Term) pair that
+actually ran. So offerings are *inferred from sightings*:
+
+```bash
+cd ../backend && python -m app.services.offerings.sync --terms 12   # 55 terms available
+cd ../model_eval && python run.py refresh-offerings
+```
+
+That populates `advisor.course_offerings` (raw observations) and
+`advisor.course_offering_patterns` (per-course rollup) in the purdueio database, then rewrites
+the fixture. Each row carries its observation count: **9 terms is a pattern, 3 is a hint, and
+absence is the weakest signal of all** — a course seen twice says nothing reliable about the
+terms it was not seen in.
+
+Effect on the eval: term-offering violations fell from ~4.2 to 0.8 per plan, and prerequisite
+ordering became the dominant failure — which is the real problem, and the one the fixture
+still cannot state authoritatively (see threat 2).
+
+## Summer is not planned into
+
+`run.planning_terms: [fall, spring]` (mirroring the backend's `PLANNER_INCLUDE_SUMMER=false`).
+Summer is a real term with real offerings, but summer enrolment has cost, aid and residency
+consequences a course planner cannot reason about, so it is not recommended unprompted. This
+constrains **scheduling only** — the offerings data still records summer availability, and a
+course whose only offering is summer goes unplanned with a warning rather than silently
+vanishing. Mode B's response grammar restricts the term enum too, so a model cannot emit a
+summer semester at all. Add `summer` back to both settings when summer planning lands.
+
+## The plan-of-study eval
+
+The scoring authority is `plan_fixtures/cs_machine_intelligence.yaml`: a CS BS +
+Machine Intelligence catalog (34 courses with prereq edges, term offerings and credits),
+9 requirement groups, and 8 student scenarios. Nothing else decides a score.
+
+### Two modes, kept separate on purpose
+
+**Mode A — the app's real path.** `advisor_agent.revise_plan` as shipped: the model emits a
+`PlanEditProposal` (reorder / defer / avoid_tags / credit cap) under grammar-constrained
+decoding, and the deterministic planner rebuilds the schedule from it. The resulting plan is
+**legal by construction**, so viability is not the discriminator here. What is:
+
+| Metric | What it catches |
+|---|---|
+| Proposal parsed | Did grammar-constrained decoding produce usable JSON at all |
+| Touched anything | An empty proposal is a silent no-op that still returns a working plan |
+| **Grounded** | Do the course codes and tags exist? The app drops unknown ones — so a model that writes prose into `reorder` looks successful and changes nothing |
+| Ask honoured | Machine-checkable assertions per scenario (did the 12-credit cap actually get set, did CS 37300 actually move earlier) |
+| Plan not worse | Did the revision strand more courses than the baseline |
+
+**Mode B — the model builds the whole schedule.** No production call site does this. It is
+the discriminating measurement, and it answers *what would we gain, or risk, by trusting the
+model with sequencing?*
+
+### PLAN_VIABLE
+
+A plan is viable **only if** it has zero hard violations **and** covers every requirement
+group:
+
+| Hard violation | Meaning |
+|---|---|
+| `prereq_violation` | Scheduled before a prerequisite completes. Same-semester does **not** count as satisfied. |
+| `term_offering_violation` | Scheduled in a term the course isn't offered |
+| `credit_cap_violation` | Semester exceeds the student's cap |
+| `hallucinated_course` | Code not in the catalog |
+| `duplicate_course` | Scheduled twice, or already completed |
+
+One prerequisite mistake anywhere in eight semesters fails the whole plan. That is the
+correct standard: a student following it gets turned away at registration. `violations/plan`
+is reported alongside, so a near-miss is visibly different from a plan that invented six
+courses.
+
+**Deliberately not scored:** workload balance, spreading theory courses, summer usage. Those
+are preferences, not correctness, and folding them in would let a model trade a real
+prerequisite violation for a prettier credit distribution. They are recorded as diagnostics.
+
+### One scenario is unsatisfiable on purpose
+
+`mi-tight-horizon` (one semester left, 21 credits of requirements) cannot be solved. It is
+excluded from the headline rate — 0% for everyone tells you nothing about a model — and
+scored separately on the honesty question: does the model report what didn't fit, or
+fabricate a semester and blow the credit cap to make the numbers work? On a public advising
+site the second failure is far worse, because it looks like a complete plan.
+
+`python run.py check` verifies the deterministic planner *can* produce a viable plan for
+every other scenario. If it can't, every model scores 0 for reasons unrelated to the model —
+which is a fixture bug, and the check catches it before you spend GPU hours.
+
+---
 
 ## Files
 
 | File | Responsibility |
 |---|---|
-| `config.yaml` | The single source of every knob that could pollute a comparison: `num_ctx`, temperature, seed, `num_predict`, runs-per-pair, warmup count, per-model `think` switch, decision thresholds. |
-| `questions.yaml` | ~30 placeholder questions across 7 categories with `expected_behavior` and (where written) gold SQL. **Edit me** — the content is placeholder, the structure is final. |
-| `schema.sql` | SQLite **stub** adapted from the real Postgres schema (`backend/app/data/db_schema.md`) + fake seed rows. Embedded verbatim in the static prompt block. |
-| `harness/ollama_client.py` | Streaming stdlib HTTP client: TTFT, Ollama's own token/duration counters, version probe, explicit unload. |
-| `harness/prompts.py` | Static-first prompt builder. Static block = role + schema + output contract + few-shot; question (and rows) last. sha256 of the static block travels with every record. |
-| `harness/db.py` | Builds the DB; read-only execution (`mode=ro` + `PRAGMA query_only`); execution-accuracy row comparison. |
-| `harness/scorers.py` | SQL_VALID / SQL_CORRECT / behavior (decline/clarify) / faithfulness heuristic. The "honesty ledger" at the top says which are truly automatic. |
-| `harness/runner.py` | Orchestration: warmup + discard, VRAM delta via nvidia-smi, offload from server log, N runs per pair, stage A (text-to-SQL) + stage B (summarize **gold** rows) + stage C (summarize the model's **own** rows — end-to-end), mitigation mode. |
-| `harness/report.py` | Per-model table, head-to-head, variance display, mechanical decision-rule check, manual review queue, config-duplicate and empty-gold guards. No composite score exists. |
+| `config.yaml` | Every knob that could pollute a comparison: context size, KV type, GPU layers, sampling, per-model gguf paths and `think`/`mlock` flags, decision thresholds. |
+| `plan_fixtures/cs_machine_intelligence.yaml` | **The scoring authority.** Catalog, requirement groups, scenarios. Read its provenance header before quoting any number. |
+| `questions.yaml` | Grounded-QA items with their retrieved chunks **pinned in the file** — retrieval belongs to the embedding model, so letting it vary would smear a retrieval difference across every model's score. |
+| `harness/server.py` | llama-server lifecycle over WSL interop: builds argv from config, waits for `/health`, parses per-layer offload from stderr, stops between models. |
+| `harness/llamacpp_client.py` | Streaming stdlib client for `/v1/chat/completions`. TTFT from the stream, token counts from `usage`, timings from llama.cpp's own `timings`. |
+| `harness/planner.py` | **Vendored copy** of the app's deterministic planner + `_apply_proposal`. Mode A can only measure production if these match — see the drift warning below. |
+| `harness/fixtures.py` | Loads the fixture; ports `planner_catalog.select_remaining_courses` so Mode A starts from production's baseline. |
+| `harness/plan_scorers.py` | Viability, requirement coverage, scenario assertions, proposal groundedness. All automatic and decidable. |
+| `harness/prompts.py` | Static-first prompts mirroring the app's four live call sites. sha256 of each static block travels with every record. |
+| `harness/scorers.py` | JSON extraction, faithfulness/recall heuristics, abstention detection. |
+| `harness/runner.py` | Orchestration: server lifecycle, warmup + discard, VRAM delta, N replicates. Plan tasks run **first** so a cut-short run keeps the data that matters. |
+| `harness/report.py` | Plan tables first, validity guards, manual review queue. No composite score exists. |
+| `results/transcripts/` | One markdown file per (model, stage, item, replicate): system prompt, user prompt, raw output, verdict. The raw text is in the JSONL too, but a JSONL field is not something you can read — and reading what a model literally said is how you catch a metric measuring the wrong thing. Disable with `run.save_transcripts: false`. |
+| `setup/allow_wsl_llamacpp.ps1` | The one firewall rule that makes WSL → Windows llama-server work. |
 
-Data flow: `questions.yaml` → `prompts.py` (static-first prompt) → `ollama_client.py` →
-raw output → `scorers.py` (against `eval.sqlite`, read-only) → `results/runs_*.jsonl` →
-`report.py` → `results/report.md` + `results/review_queue.jsonl` (your manual grading).
+Data flow: `plan_fixtures/*.yaml` + `questions.yaml` → `prompts.py` → `server.py` +
+`llamacpp_client.py` → `plan_scorers.py` / `scorers.py` → `results/runs_*.jsonl` →
+`report.py` → `results/report.md` + `results/review_queue.jsonl`.
+
+---
 
 ## What is automatic vs. your judgment (honestly)
 
 | Metric | Status |
 |---|---|
-| SQL_VALID | **Automatic.** Parse + execute on a read-only connection. |
-| SQL_CORRECT (attempted) | **Automatic where you supply gold SQL.** Execution accuracy (row value-bags), so equivalent SQL formulations pass — but the denominator is only calls where the model actually emitted SQL. A decline/clarify/unparseable on a real gold question silently drops out instead of counting as a miss, which flatters models that abstain more often. Known false-positive mode: wrong logic returning coincidentally identical values (most commonly: gold itself returns zero rows — see `report.py`'s empty-gold warning — so ANY candidate, right or wrong, matches trivially). |
-| SQL_CORRECT (honest) | **Automatic.** Same execution-accuracy check, but scored over every gold-eligible call — an abstention or unparseable output on a real question counts as a miss. Use this one for cross-model comparisons; "(attempted)" is there so you can see how much of the gap is abstention, not capability. |
-| E2E | **Automatic pass/fail heuristic, not a verdict.** Feeds the model's OWN stage-A SQL rows (not gold rows) into the summarizer — the actual two-stage pipeline a user experiences. `e2e_auto_pass` = retrieval matched gold AND no hallucinated/omitted course codes; it's a triage filter like faithfulness, and every e2e answer with real data lands in the review queue too. |
-| DECLINE / CLARIFY | **Automatic-ish.** The output contract (`SQL:`/`CLARIFY:`/`DECLINE:`) makes it parseable; off-format outputs hit a phrase heuristic and are flagged into the review queue. Note the confound: sentinel-format compliance is itself a model skill being measured. |
-| FAITHFULNESS | **Manual, full stop.** The heuristic (course codes/numbers in the answer that aren't in the rows) is a triage filter that catches *entity* hallucination only. Relational hallucination ("X requires Y") is not machine-checkable without a judge model — which I deliberately did not add, because judging small models with another model smuggles in a second unvalidated instrument. Every summary lands in `review_queue.jsonl`; the number you quote is your manual grade. |
-| Ambiguity handling | Parsing is automatic; whether the clarifying question is *sensible* is your call (review queue). |
-| LATENCY | Automatic. Tiebreaker only. 27B latency measured on the 5070 Ti says **nothing** about 3090 latency — different architecture, bandwidth, and thermals. Only its quality scores transfer. |
+| **PLAN_VIABLE** | **Automatic and decidable.** Prereq order, term offerings, credit caps, catalog membership, requirement coverage — all checked against the fixture. The only judgment baked in is the fixture itself. |
+| **Requirement coverage** | **Automatic.** Fraction of requirement groups satisfied. |
+| **Proposal groundedness** | **Automatic.** Do the named codes/tags exist in the student's actual course list. |
+| **Ask honoured** | **Automatic**, but only for what a scenario declares as a machine-checkable assertion. "Did it understand the student" in the broad sense is not measured. |
+| **Structure OK** | **Automatic.** Under grammar-constrained decoding this should be ~100%; anything less is a real signal (truncation, a template mismatch, or a model that ignores the grammar). |
+| **Behavior OK (QA)** | **Automatic-ish.** Abstention is a phrase heuristic. A polite correction and a polite refusal look the same to it — read the adversarial items. |
+| **FAITHFULNESS** | **Manual, full stop.** The heuristic catches *entity* hallucination only (codes/numbers absent from the context). Relational hallucination ("X must come before Y") is not machine-checkable without a judge model, which is deliberately not here — judging small models with another model smuggles in a second unvalidated instrument. Quote your manual grade, not the flag rate. |
+| **LATENCY** | Automatic. Tiebreaker only. 5070 Ti latency says **nothing** about 2060 Super latency — different architecture, bandwidth and thermals. Only quality scores transfer between boxes. |
+
+---
 
 ## Validity threats already defended against
 
-- `num_ctx` set explicitly and identically for all models (config), never defaulted
-- `ollama --version` recorded in `meta_*.json` (Gemma-4 fix landed in 0.22.0)
-- text-only tags preferred; the tag used is the recorded model name
-- thinking disabled per-model via `think: false` where supported, and recorded;
-  `<think>` blocks are stripped before parsing so r1-style leakage doesn't crash scoring
-- warmup generations per model are run and discarded (count in config + meta)
-- VRAM measured as nvidia-smi **delta** around model load, after warmup
-- GPU offload parsed from the server log (`offloaded X/Y layers`) — `ollama ps` reports a
-  memory split, not a layer split, and is recorded only as a labeled fallback
-- models unloaded between blocks so VRAM baselines don't stack
-- static prompt block hashed into every record; the report refuses to compare mixed hashes
-- `config.yaml` cannot list the same model twice without the report flagging it — a model
-  entered under two brackets (e.g. two different `think` settings) silently ran twice and
-  pooled both conditions into one row until this check was added; if you add a model, make
-  sure its name is unique in `models:`
-- gold SQL that returns zero rows against the seed DB is flagged in the report — any
-  candidate query trivially matches an empty gold regardless of whether its logic is right,
-  so an unflagged empty gold quietly pads whichever model happens to give up gracefully
+- One llama-server command line, built from config, applied identically to every model — and
+  `/props` is read back so "every model ran at `num_ctx`" is **verified**, not assumed
+- GPU offload counted per layer from llama-server's own stderr; `unverified` says so
+- Warmup generations run and discarded; VRAM measured as an `nvidia-smi` delta after warmup
+- Server stopped between models so the next VRAM baseline is clean
+- Reasoning disabled at launch (`--reasoning off`) plus a per-request template kwarg, and any
+  leaked `<think>` block is stripped before scoring
+- Static prompt block hashed into every record; the report refuses to pool mixed hashes
+- The fixture is hashed into every plan record — editing it invalidates prior results by design
+- `run.py check` proves a viable plan is reachable before you spend GPU hours
+- A model listed twice in `config.yaml` is flagged (it would silently pool two conditions)
+- Retrieval is pinned in `questions.yaml`, so QA scores can't drift with the vector store
 
-## The biggest threats you had NOT listed
+## Threats that remain
 
-1. **Statistical power.** ~30 questions is the real sample size — the 3 runs per pair are
-   correlated replicates of the same item, not independent samples. A binomial 95% CI at
-   n=30 is roughly ±15–18 percentage points. That is the same magnitude as any decision
-   threshold you'd plausibly set, which is why the decision rule below demands both a
-   large gap **and** a minimum gold count, and why the report refuses to call a gap real
-   under `min_gold_questions`. If the observed gap is 10–20pp, the correct response is
-   "write 30 more gold questions," not "buy the GPU."
-2. **Prompt-template fit** (runner-up). One shared prompt + one set of few-shots will fit
-   some models' instruction tuning better than others; part of any measured gap is
-   prompt compatibility, not capacity. Mitigation mode improves the prompt only for the
-   8GB champion, which biases the final comparison *against* buying — an acceptable
-   direction given the default is NO, but be aware the 27B never gets the same favor.
-3. **Quantization confound.** Q4_K_M does not damage all architectures equally; you're
-   comparing (model × quant) pairs, not models. Acceptable — you'd deploy Q4_K_M anyway —
-   but say "quantized model" in any conclusion you write down.
+1. **Statistical power.** 8 scenarios is the real sample size; the 3 replicates are correlated
+   repeats of the same item, not independent samples. A binomial 95% CI at n=8 is roughly
+   ±35pp. If two models differ by less than that, the correct response is **write more
+   scenarios**, not pick a winner. `decision.min_plan_scenarios` encodes this and the report
+   enforces it.
+2. **Prerequisite edges are still hand-written.** Term offerings are now observed (above), but
+   prereqs are not, and they are now the dominant failure mode — so this is the biggest
+   remaining threat to the plan numbers. Purdue publishes prerequisites **only** in Banner
+   (`selfservice.mypurdue.purdue.edu`, e.g. *"Undergraduate level CS 25000 Minimum Grade of C
+   and Undergraduate level CS 25100 Minimum Grade of C"*), and that host's `robots.txt` is a
+   blanket `User-agent: * / Disallow: /`. Automated collection is therefore off the table
+   without Purdue's say-so. A wrong edge biases every model the same direction, so *rankings*
+   survive it and *absolute* claims do not.
+3. **Planner drift.** `harness/planner.py` is a copy. If the app's planner changes and this
+   one doesn't, Mode A silently stops measuring production. `run.py parity` diffs them
+   whenever the backend is importable — run it before trusting a Mode A column.
+4. **Prompt-template fit.** One prompt fits some models' instruction tuning better than
+   others; part of any measured gap is prompt compatibility, not capacity.
+5. **Quantization confound.** Q4_K_M doesn't damage all architectures equally — you are
+   comparing (model × quant) pairs. Acceptable, since you'd deploy Q4_K_M anyway, but say
+   "quantized model" in anything you write down.
 
-## Pre-registered decision rule (PROPOSAL — approve or edit before running)
+---
 
-Thresholds live in `config.yaml` under `decision:` and the report evaluates them
-mechanically. Proposed:
+## Cost
 
-**Buy the 3090 only if ALL of these hold** after mitigation:
+One model × 8 scenarios × 3 replicates × 4 tasks ≈ 130 generations. On the 5070 Ti a 7B model
+finishes in ~5 minutes; a 120B MoE with CPU expert offload is far slower and its **load** time
+alone can be minutes. Running all 15 models is an overnight job. Start with
+`--brackets 8gb,coder` — those are the only real deployment candidates; `reference` models
+exist to show what you're giving up, not what you could ship.
 
-1. `SQL_CORRECT(27B) − SQL_CORRECT(best-8GB, mitigated) ≥ 15pp`, with **≥ 30 gold-scored
-   questions** (at exactly 30, insist on ≥ 20pp — see threat #1; at 50+ golds, 15pp stands).
-2. `SQL_CORRECT(best-8GB, mitigated) < 80%` absolute. Rationale: at ≥80%, the semantic
-   cache (repeat-heavy traffic) plus retry-on-error covers the residual; users see few
-   failures even though the model has them.
-3. Your **manual** faithfulness review shows the mitigated 8GB model inventing unsupported
-   claims in >10% of summaries while the 27B stays ≤2%. This criterion can also fire the
-   purchase **alone** — unfaithful summaries are the one failure the cache actively makes
-   worse (a hallucinated answer gets cached and repeated).
+## Pre-registered decision rule
 
-**Explicitly insufficient to justify the purchase:**
-- Any DECLINE_RATE gap (decline behavior is prompt- and middleware-fixable; your
-  Turnstile/rate-limit layer is the real defense, not the model)
-- Any latency number (the 2060 Super either serves the chosen 8GB model acceptably or
-  you pick a smaller model; a 3090 bought for latency is a want, not a need — and the
-  5070 Ti's 27B latency is not evidence about the 3090's)
-- A gap that appears only without mitigation (then the fix costs $0, not $1,400)
+Thresholds live in `config.yaml` under `decision:`. The question is no longer "is a bigger GPU
+worth it" in the abstract — it is **can an 8GB-class model be trusted with the plan-of-study
+feature**:
 
-## Interpreting `results/report.md`
+1. `mode_a_grounded_floor` (0.90) — a model that can't emit a grounded `PlanEditProposal`
+   isn't a candidate, regardless of how it scores elsewhere. This is the shipped path.
+2. `mode_b_viable_floor` (0.90) — below this, keep the model out of sequencing entirely and
+   stay on today's architecture (model proposes, planner disposes). Today's architecture is
+   the *default*; Mode B has to earn its way in.
+3. `plan_viable_gap_pp` (15) — reference-tier minus best deployable. Below it, the ceiling
+   isn't worth chasing with hardware.
 
-- Rates show `overall (min–max across run replicates)` — if the range is wide, the
-  model is unstable at temperature 0.15 and single-run comparisons are meaningless.
-- "Consistency" = questions where all N runs agreed. Low consistency + small gaps = noise.
-- Anything labeled UNVERIFIED (offload) or "heuristic" (faithfulness) means exactly that.
+**Explicitly insufficient to justify hardware:** any latency number (5070 Ti latency is not
+evidence about the 2060 Super), and any gap that closes under `--mitigate` (then the fix costs
+$0). A faithfulness failure *can* justify action alone — a hallucinated answer gets cached by
+the semantic cache and repeated.

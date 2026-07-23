@@ -1,0 +1,595 @@
+# =============================================================================
+# PLAN-OF-STUDY GROUND TRUTH — Computer Science BS, Machine Intelligence track
+#
+#   verified: false     <-- READ THIS BEFORE QUOTING ANY NUMBER FROM A RUN
+#
+# This file is the scoring authority for the plan-of-study eval: every viability
+# check (prereqs, term offerings, credit caps, requirement coverage) is decided
+# against the rows below and nothing else. If a row here is wrong, every model is
+# scored wrong in the same direction — which is survivable for RANKING models
+# against each other, and fatal for any claim about real Purdue degree progress.
+#
+# PROVENANCE, honestly (this box's catalog Postgres is empty — the 2026-2027
+# crawl did not come with the machine, so none of this was derived from it):
+#
+#   credits, titles, course codes ...... from the Purdue catalog as I know it.
+#                                        Spot-check against catalog.purdue.edu.
+#   prereqs ........................... NOT PUBLISHED in Acalog (TODO.md §2.5 —
+#                                        this is why the app's own catalog has no
+#                                        prereq edges at all). Hand-written here
+#                                        because a plan eval without prereq edges
+#                                        cannot measure sequencing, which is the
+#                                        single most important thing a plan of
+#                                        study has to get right. These are the
+#                                        highest-risk rows in the file.
+#   offered_terms ..................... OBSERVED from PurdueIO Classes rows via
+#                                        `run.py refresh-offerings` — a course is
+#                                        'offered in fall' because it RAN in falls,
+#                                        not because anything declares it. The count
+#                                        in each row's comment is the evidence: 9
+#                                        terms is a pattern, 3 is a hint, and absence
+#                                        is the weakest signal of all. Previously
+#                                        hand-written, and wrong (CS 47300 was
+#                                        recorded spring-only; it runs fall-only).
+#   (superseded note) ................. The
+#                                        "fall only" / "spring only" entries are
+#                                        the ones that make sequencing non-trivial;
+#                                        if they are wrong, models are being
+#                                        penalised for a constraint that does not
+#                                        exist. Treat term-violation counts as the
+#                                        softest metric in the report.
+#   workload_score .................... invented (1-5). Used only for tie-breaking
+#                                        inside the deterministic planner, never
+#                                        for scoring.
+#
+# HOW TO VERIFY (do this before the write-up, not before the run — the run is
+# still useful for ranking while unverified):
+#   1. Restore/re-crawl the catalog DB (catalog_ingestion: `make restore`, or
+#      `make sync-programs YEAR=2026-2027`).
+#   2. `python run.py fixture-check` diffs codes/credits/titles in this file
+#      against the `courses` + `requirement_options` tables and prints a report.
+#   3. Prereqs and offered_terms will NOT be verifiable that way — the catalog
+#      has neither. Those need the course scheduler / department plan of study.
+#
+# Editing this file changes scores. The harness hashes it into every plan record
+# (`fixture_hash`) and the report refuses to pool records with different hashes.
+# =============================================================================
+
+program:
+  name: "Computer Science, BS — Machine Intelligence concentration"
+  catalog_year: "2026-2027"
+  campus: "West Lafayette"
+  total_credits_min: 120
+  verified: false
+
+# --- catalog -----------------------------------------------------------------
+# The complete palette a model is allowed to schedule. Any code a model emits
+# that is NOT in this list is scored as a hallucination — so this list must be
+# generous enough that a *correct* plan is expressible, and no more.
+#
+# `requirement_tags` are the vocabulary the revise-plan agent's `avoid_tags`
+# knob operates over (see backend/app/services/advisor_agent.py), so they are
+# deliberately shaped like the app's tags, not like catalog metadata.
+
+courses:
+  # ---- CS core ----
+  - code: "CS 18000"
+    title: "Problem Solving And Object-Oriented Programming"
+    credits: 4
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # observed in 9 PurdueIO terms
+    requirement_tags: [required, cs-core, programming]
+    workload_score: 4
+  - code: "CS 18200"
+    title: "Foundations Of Computer Science"
+    credits: 3
+    prereqs: ["CS 18000", "MA 16100"]
+    offered_terms: [fall, spring, summer]   # observed in 9 PurdueIO terms
+    requirement_tags: [required, cs-core, theory-heavy]
+    workload_score: 4
+  - code: "CS 24000"
+    title: "Programming In C"
+    credits: 3
+    prereqs: ["CS 18000"]
+    offered_terms: [fall, spring, summer]   # observed in 9 PurdueIO terms
+    requirement_tags: [required, cs-core, programming]
+    workload_score: 3
+  - code: "CS 25000"
+    title: "Computer Architecture"
+    credits: 4
+    prereqs: ["CS 18200", "CS 24000"]
+    offered_terms: [fall, spring, summer]   # observed in 9 PurdueIO terms
+    requirement_tags: [required, cs-core, systems]
+    workload_score: 4
+  - code: "CS 25100"
+    title: "Data Structures And Algorithms"
+    credits: 3
+    prereqs: ["CS 18200", "CS 24000"]
+    offered_terms: [fall, spring, summer]   # observed in 9 PurdueIO terms
+    requirement_tags: [required, cs-core, theory-heavy]
+    workload_score: 4
+  - code: "CS 25200"
+    title: "Systems Programming"
+    credits: 4
+    prereqs: ["CS 25000", "CS 25100"]
+    offered_terms: [fall, spring, summer]   # observed in 9 PurdueIO terms
+    requirement_tags: [required, cs-core, systems, project-heavy]
+    workload_score: 5
+  - code: "CS 38100"
+    title: "Introduction To The Analysis Of Algorithms"
+    credits: 3
+    prereqs: ["CS 25100", "MA 26100"]
+    offered_terms: [fall, spring]   # observed in 6 PurdueIO terms
+    requirement_tags: [required, cs-core, theory-heavy]
+    workload_score: 5
+
+  # ---- Machine Intelligence: required ----
+  - code: "CS 37300"
+    title: "Data Mining And Machine Learning"
+    credits: 3
+    prereqs: ["CS 25100", "STAT 35000"]
+    offered_terms: [fall, spring]   # observed in 6 PurdueIO terms
+    requirement_tags: [required, machine-intelligence, ai, project-heavy]
+    workload_score: 4
+  - code: "CS 47100"
+    title: "Introduction To Artificial Intelligence"
+    credits: 3
+    prereqs: ["CS 25100"]
+    offered_terms: [fall, spring]   # observed in 6 PurdueIO terms
+    requirement_tags: [machine-intelligence, ai]
+    workload_score: 4
+  - code: "CS 47300"
+    title: "Web Information Search And Management"
+    credits: 3
+    prereqs: ["CS 25100"]
+    offered_terms: [fall]   # observed in 3 PurdueIO terms
+    requirement_tags: [machine-intelligence, ai]
+    workload_score: 4
+
+  # ---- Machine Intelligence: selectives ----
+  - code: "CS 43900"
+    title: "Introduction To Data Visualization"
+    credits: 3
+    prereqs: ["CS 25100"]
+    offered_terms: [fall]   # observed in 3 PurdueIO terms
+    requirement_tags: [machine-intelligence, ai, project-heavy]
+    workload_score: 3
+  - code: "CS 44800"
+    title: "Introduction To Relational Database Systems"
+    credits: 3
+    prereqs: ["CS 25100"]
+    offered_terms: [fall, spring]   # observed in 6 PurdueIO terms
+    requirement_tags: [machine-intelligence, systems, project-heavy]
+    workload_score: 4
+  - code: "CS 45600"
+    title: "Programming Languages"
+    credits: 3
+    prereqs: ["CS 25200"]
+    offered_terms: [fall, spring]   # observed in 4 PurdueIO terms
+    requirement_tags: [machine-intelligence, theory-heavy]
+    workload_score: 4
+  - code: "CS 45800"
+    title: "Introduction To Robotics"
+    credits: 3
+    prereqs: ["CS 25100", "MA 26500"]
+    offered_terms: [fall, spring]   # observed in 4 PurdueIO terms
+    requirement_tags: [machine-intelligence, ai, project-heavy]
+    workload_score: 4
+  - code: "CS 48300"
+    title: "Introduction To The Theory Of Computation"
+    credits: 3
+    prereqs: ["CS 38100"]
+    offered_terms: [fall, spring]   # observed in 3 PurdueIO terms
+    requirement_tags: [machine-intelligence, theory-heavy]
+    workload_score: 5
+
+  # ---- additional 400-level CS electives ----
+  - code: "CS 35200"
+    title: "Compilers: Principles And Practice"
+    credits: 3
+    prereqs: ["CS 25200"]
+    offered_terms: [fall, spring]   # observed in 6 PurdueIO terms
+    requirement_tags: [cs-elective, systems, project-heavy]
+    workload_score: 5
+  - code: "CS 35400"
+    title: "Operating Systems"
+    credits: 3
+    prereqs: ["CS 25200"]
+    offered_terms: [fall, spring]   # observed in 6 PurdueIO terms
+    requirement_tags: [cs-elective, systems, project-heavy]
+    workload_score: 5
+  - code: "CS 42200"
+    title: "Computer Networks"
+    credits: 3
+    prereqs: ["CS 25200"]
+    offered_terms: [fall, spring]   # observed in 6 PurdueIO terms
+    requirement_tags: [cs-elective, systems]
+    workload_score: 4
+  - code: "CS 42600"
+    title: "Computer Security"
+    credits: 3
+    prereqs: ["CS 25200"]
+    offered_terms: [fall, spring]   # observed in 6 PurdueIO terms
+    requirement_tags: [cs-elective, systems]
+    workload_score: 4
+  - code: "CS 44000"
+    title: "Large Scale Data Analytics"
+    credits: 3
+    prereqs: ["CS 37300"]
+    offered_terms: [fall, spring]   # observed in 6 PurdueIO terms
+    requirement_tags: [cs-elective, ai, project-heavy]
+    workload_score: 4
+  - code: "CS 49000"
+    title: "Topics In Computer Science For Undergraduates"
+    credits: 3
+    prereqs: ["CS 25200"]
+    offered_terms: [fall, spring, summer]   # observed in 8 PurdueIO terms
+    requirement_tags: [cs-elective]
+    workload_score: 3
+
+  # ---- mathematics ----
+  - code: "MA 16100"
+    title: "Plane Analytic Geometry And Calculus I"
+    credits: 5
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # observed in 9 PurdueIO terms
+    requirement_tags: [required, mathematics]
+    workload_score: 4
+  - code: "MA 16200"
+    title: "Plane Analytic Geometry And Calculus II"
+    credits: 5
+    prereqs: ["MA 16100"]
+    offered_terms: [fall, spring, summer]   # observed in 9 PurdueIO terms
+    requirement_tags: [required, mathematics]
+    workload_score: 4
+  - code: "MA 26100"
+    title: "Multivariate Calculus"
+    credits: 4
+    prereqs: ["MA 16200"]
+    offered_terms: [fall, spring, summer]   # observed in 9 PurdueIO terms
+    requirement_tags: [required, mathematics]
+    workload_score: 4
+  - code: "MA 26500"
+    title: "Linear Algebra"
+    credits: 3
+    prereqs: ["MA 16200"]
+    offered_terms: [fall, spring, summer]   # observed in 9 PurdueIO terms
+    requirement_tags: [required, mathematics]
+    workload_score: 3
+  - code: "STAT 35000"
+    title: "Introduction To Statistics"
+    credits: 3
+    prereqs: ["MA 16200"]
+    offered_terms: [fall, spring, summer]   # observed in 10 PurdueIO terms
+    requirement_tags: [required, mathematics, statistics]
+    workload_score: 3
+
+  # ---- laboratory science sequence ----
+  - code: "PHYS 17200"
+    title: "Modern Mechanics"
+    credits: 4
+    prereqs: ["MA 16100"]
+    offered_terms: [fall, spring, summer]   # observed in 9 PurdueIO terms
+    requirement_tags: [required, science]
+    workload_score: 4
+  - code: "PHYS 24100"
+    title: "Electricity And Optics"
+    credits: 3
+    prereqs: ["PHYS 17200", "MA 16200"]
+    offered_terms: [fall, spring, summer]   # observed in 9 PurdueIO terms
+    requirement_tags: [required, science]
+    workload_score: 4
+
+  # ---- general education ----
+  - code: "ENGL 10600"
+    title: "First-Year Composition"
+    credits: 4
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # observed in 9 PurdueIO terms
+    requirement_tags: [required, gen-ed, writing]
+    workload_score: 2
+  - code: "COM 11400"
+    title: "Fundamentals Of Speech Communication"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # observed in 9 PurdueIO terms
+    requirement_tags: [required, gen-ed, oral-communication]
+    workload_score: 2
+  - code: "SCLA 10100"
+    title: "Transformative Texts: Critical Thinking And Communication I"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # observed in 9 PurdueIO terms
+    requirement_tags: [required, gen-ed, humanities]
+    workload_score: 2
+  - code: "PHIL 15000"
+    title: "Principles Of Logic"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # observed in 8 PurdueIO terms
+    requirement_tags: [gen-ed, humanities]
+    workload_score: 2
+  - code: "ECON 25100"
+    title: "Microeconomics"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # observed in 9 PurdueIO terms
+    requirement_tags: [gen-ed, social-science]
+    workload_score: 2
+  - code: "PSY 12000"
+    title: "Elementary Psychology"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # observed in 12 PurdueIO terms
+    requirement_tags: [gen-ed, social-science]
+    workload_score: 2
+
+# --- degree requirements -----------------------------------------------------
+# `kind: all`    -> every listed course must appear in the plan (or be completed)
+# `kind: choose` -> enough listed courses to reach `choose_credits`
+#
+# A plan is COMPLETE only when every group below is satisfied. Groups are what
+# `requirement_coverage` is computed over, so a model that schedules 8 pretty
+# semesters of electives and skips CS 38100 scores badly no matter how legal the
+# sequencing is — which is the point.
+
+requirement_groups:
+  - id: cs-core
+    name: "Computer Science Core"
+    kind: all
+    courses: ["CS 18000", "CS 18200", "CS 24000", "CS 25000", "CS 25100", "CS 25200", "CS 38100"]
+
+  - id: mi-required
+    name: "Machine Intelligence — required"
+    kind: all
+    courses: ["CS 37300"]
+
+  - id: mi-ai-choice
+    name: "Machine Intelligence — AI course (choose one)"
+    kind: choose
+    choose_credits: 3
+    courses: ["CS 47100", "CS 47300"]
+
+  - id: mi-selective
+    name: "Machine Intelligence — selectives (choose two)"
+    kind: choose
+    choose_credits: 6
+    courses: ["CS 43900", "CS 44800", "CS 45600", "CS 45800", "CS 48300", "CS 47100", "CS 47300"]
+
+  - id: cs-elective
+    name: "Additional CS courses at the 400 level"
+    kind: choose
+    choose_credits: 6
+    # ORDER MATTERS, and not for the reason you'd expect. The app's selective picker
+    # (planner_catalog.select_remaining_courses, ported in harness/fixtures.py) is greedy:
+    # it takes options in catalog order until the credit target is met, with no lookahead
+    # about whether the courses it picked are actually schedulable. CS 35200 is fall-only
+    # AND gated behind CS 25200, so putting it first made the deterministic baseline
+    # unsatisfiable in five of eight scenarios — `run.py check` caught it. The flexible
+    # fall/spring options lead here so the baseline is reachable; the greedy-picker
+    # weakness is real and worth fixing in the app, but it is not what this eval measures.
+    courses: ["CS 35400", "CS 49000", "CS 42200", "CS 42600", "CS 44000", "CS 35200"]
+
+  - id: mathematics
+    name: "Mathematics And Statistics"
+    kind: all
+    courses: ["MA 16100", "MA 16200", "MA 26100", "MA 26500", "STAT 35000"]
+
+  - id: science
+    name: "Laboratory Science Sequence"
+    kind: all
+    courses: ["PHYS 17200", "PHYS 24100"]
+
+  - id: gen-ed-core
+    name: "University Core — written, oral, humanities"
+    kind: all
+    courses: ["ENGL 10600", "COM 11400", "SCLA 10100"]
+
+  - id: gen-ed-selective
+    name: "University Core — additional selectives"
+    kind: choose
+    choose_credits: 6
+    courses: ["PHIL 15000", "ECON 25100", "PSY 12000"]
+
+# --- scenarios ---------------------------------------------------------------
+# Each scenario is one (profile, ask) pair run against every model, N times.
+#
+# `feedback` drives MODE A (the app's real revise-plan path: the model returns a
+# PlanEditProposal and the deterministic planner rebuilds the schedule).
+# `assertions` are machine-checkable statements about whether the student's ask
+# was actually honoured — this is what stops Mode A from scoring every model
+# identically just because the planner guarantees legality.
+#
+# MODE B (free-form: the model emits the whole schedule itself) uses the same
+# profile and the same feedback as a stated preference, and is scored on plan
+# viability directly.
+
+scenarios:
+  - id: mi-fresh-start
+    label: "Incoming CS major, MI track, nothing completed"
+    profile:
+      name: "Avery"
+      degree_program: "Computer Science, BS — Machine Intelligence"
+      completed_courses: []
+      start_term: fall
+      start_year: 2026
+      semesters_to_plan: 8
+      max_credits_per_semester: 16
+    feedback: >-
+      I'm starting from scratch and I want to concentrate in machine intelligence.
+      Please get me into the AI and machine learning courses as early as the
+      prerequisites allow, and keep every semester at 16 credits or under.
+    assertions:
+      - kind: scheduled_before
+        course: "CS 37300"
+        semester_index: 6
+        why: "MI's anchor course; a plan that defers it to the last year is a bad MI plan."
+      - kind: max_credits_at_most
+        value: 16
+
+  - id: mi-sophomore-catchup
+    label: "Second-year student switching into the MI track"
+    profile:
+      name: "Jordan"
+      degree_program: "Computer Science, BS — Machine Intelligence"
+      completed_courses: ["CS 18000", "CS 18200", "CS 24000", "MA 16100", "MA 16200", "ENGL 10600"]
+      start_term: fall
+      start_year: 2026
+      semesters_to_plan: 6
+      max_credits_per_semester: 15
+    feedback: >-
+      I just switched into the machine intelligence concentration and I have three
+      years left. I care most about finishing the CS core on time so the AI
+      electives aren't blocked, and I'd rather not stack two project-heavy courses
+      in the same semester.
+    assertions:
+      - kind: scheduled_before
+        course: "CS 25100"
+        semester_index: 2
+        why: "CS 25100 gates every MI course; late placement cascades into an unfinishable plan."
+      - kind: max_credits_at_most
+        value: 15
+
+  - id: mi-light-load
+    label: "MI student who needs a reduced credit load"
+    profile:
+      name: "Sam"
+      degree_program: "Computer Science, BS — Machine Intelligence"
+      completed_courses: ["CS 18000", "MA 16100", "ENGL 10600", "COM 11400"]
+      start_term: fall
+      start_year: 2026
+      semesters_to_plan: 8
+      max_credits_per_semester: 15
+    feedback: >-
+      I'm working part time, so please cap me at 12 credits a semester and push the
+      theory-heavy courses later if that's possible.
+    assertions:
+      - kind: max_credits_at_most
+        value: 12
+        why: "The student named an explicit cap; honouring it is the whole ask."
+      - kind: proposal_sets_credit_cap
+        value: 12
+
+  - id: mi-ai-early
+    label: "MI student who wants AI coursework front-loaded"
+    profile:
+      name: "Riley"
+      degree_program: "Computer Science, BS — Machine Intelligence"
+      completed_courses: ["CS 18000", "CS 18200", "CS 24000", "CS 25000", "CS 25100",
+                          "MA 16100", "MA 16200", "MA 26100", "STAT 35000", "ENGL 10600"]
+      start_term: fall
+      start_year: 2026
+      semesters_to_plan: 4
+      max_credits_per_semester: 16
+    feedback: >-
+      I've finished the intro sequence and I want CS 37300 and the AI course in my
+      first two semesters if the prerequisites are already satisfied.
+    assertions:
+      - kind: scheduled_before
+        course: "CS 37300"
+        semester_index: 2
+        why: "Prereqs (CS 25100 + STAT 35000) are already complete — there is no legal excuse to defer it."
+      - kind: any_scheduled_before
+        courses: ["CS 47100", "CS 47300"]
+        semester_index: 2
+
+  - id: mi-summer-accelerate
+    label: "MI student compressing the degree using summers"
+    profile:
+      name: "Casey"
+      degree_program: "Computer Science, BS — Machine Intelligence"
+      completed_courses: ["CS 18000", "MA 16100", "ENGL 10600"]
+      start_term: summer
+      start_year: 2026
+      semesters_to_plan: 9
+      max_credits_per_semester: 16
+    feedback: >-
+      I want to graduate as fast as possible and I'm happy to take summer classes.
+      Please use every term available, including summers.
+    notes: >-
+      Starting in SUMMER is the trap: several CS core courses are fall/spring only,
+      so a model that ignores offered_terms will stuff the first semester and fail.
+    assertions:
+      - kind: max_credits_at_most
+        value: 16
+
+  - id: mi-spring-start
+    label: "Spring-start transfer student"
+    profile:
+      name: "Devin"
+      degree_program: "Computer Science, BS — Machine Intelligence"
+      completed_courses: ["MA 16100", "MA 16200", "ENGL 10600", "COM 11400", "PSY 12000"]
+      start_term: spring
+      start_year: 2027
+      semesters_to_plan: 8
+      max_credits_per_semester: 16
+    feedback: >-
+      I transferred in with my math and gen-ed credits done and I'm starting in the
+      spring. Get me through the CS core and into the machine intelligence courses.
+    notes: >-
+      A spring start shifts every fall-only course by one position. Models that
+      memorised a canonical fall-start plan-of-study reproduce it verbatim here and
+      collect term violations.
+    assertions:
+      - kind: scheduled_before
+        course: "CS 18200"
+        semester_index: 2
+      - kind: max_credits_at_most
+        value: 16
+
+  - id: mi-theory-averse
+    label: "MI student who wants theory pushed back"
+    profile:
+      name: "Emerson"
+      degree_program: "Computer Science, BS — Machine Intelligence"
+      completed_courses: ["CS 18000", "CS 18200", "CS 24000", "MA 16100", "MA 16200",
+                          "ENGL 10600", "COM 11400"]
+      start_term: fall
+      start_year: 2026
+      semesters_to_plan: 6
+      max_credits_per_semester: 15
+    feedback: >-
+      Theory-heavy courses are my weakest area. Please schedule them as late as you
+      legally can and keep the AI courses early — but I still need to graduate in
+      six semesters.
+    notes: >-
+      Tests whether the model can express a preference (avoid_tags: theory-heavy in
+      Mode A) WITHOUT breaking completion — CS 38100 is both theory-heavy and a hard
+      prerequisite for CS 48300, so deferring it too far makes the plan unfinishable.
+    assertions:
+      - kind: max_credits_at_most
+        value: 15
+      - kind: any_scheduled_before
+        courses: ["CS 47100", "CS 47300"]
+        semester_index: 4
+
+  - id: mi-tight-horizon
+    label: "One semester left, more requirements than fit"
+    # Declares to `run.py check` that a viable plan is IMPOSSIBLE here by design, so the
+    # reachability check doesn't flag it as a broken scenario. The report reads the same
+    # flag and scores this row on violations and honest reporting, not on PLAN_VIABLE.
+    expect_unsatisfiable: true
+    profile:
+      name: "Frankie"
+      degree_program: "Computer Science, BS — Machine Intelligence"
+      completed_courses: ["CS 18000", "CS 18200", "CS 24000", "CS 25000", "CS 25100",
+                          "CS 25200", "MA 16100", "MA 16200", "MA 26100", "MA 26500",
+                          "STAT 35000", "ENGL 10600", "COM 11400", "SCLA 10100",
+                          "PHYS 17200", "PHYS 24100", "PSY 12000", "ECON 25100"]
+      start_term: fall
+      start_year: 2026
+      semesters_to_plan: 1
+      max_credits_per_semester: 15
+    feedback: >-
+      I have one semester left. Tell me the best I can do and be honest about what
+      won't fit.
+    notes: >-
+      DELIBERATELY UNSATISFIABLE — 21 credits of requirements remain and one
+      15-credit semester cannot hold them. The right behaviour is a legal partial plan plus an honest
+      "unplanned" list, NOT an invented extra semester or a 21-credit term. Expect
+      PLAN_VIABLE = 0% for every model (coverage cannot reach 1.0); the signal here
+      is the violation counts and `over_horizon`, so read this row differently from
+      the others.
+    assertions:
+      - kind: max_credits_at_most
+        value: 15

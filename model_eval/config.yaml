@@ -1,123 +1,182 @@
-# Harness configuration. Everything that could differ between models and
-# thereby pollute the comparison lives HERE, once, and is applied identically.
+# Harness configuration. Everything that could differ between models and thereby pollute the
+# comparison lives HERE, once, and is applied identically.
+#
+# THE BIG CHANGE FROM THE OLLAMA ERA: under Ollama, num_ctx and friends were per-REQUEST, so a
+# config value was enough. Under llama.cpp they are LAUNCH flags — one process serves exactly
+# one model — so the harness starts and stops llama-server itself from the values below and
+# reads /props back to verify the server really honoured them. If you launch a server by hand
+# (D:\llm\run-model.ps1) and point the harness at it, that verification is what will catch a
+# mismatch instead of silently comparing models at different context sizes.
 
-ollama:
-  base_url: "http://localhost:11434"
-  # Shell command that prints recent Ollama server logs, used to parse the
-  # authoritative "offloaded X/Y layers to GPU" line (`ollama ps` reports a
-  # memory split, not a layer split — do not trust it for offload).
-  # Linux systemd install:   "journalctl -u ollama -n 4000 --no-pager"
-  # Docker:                  "docker logs --tail 4000 ollama"
-  # null = skip log parsing; the report will say offload is UNVERIFIED.
-  server_log_cmd: "journalctl -u ollama -n 4000 --no-pager"
+llamacpp:
+  # Native Windows build (CUDA 13.3 — Blackwell/sm_120 needs 12.8+; the default cuda-12.4
+  # release will NOT run on the 5070 Ti). Executed directly from WSL over Windows interop, so
+  # it is a real Windows process with full native GPU and PCIe5 access to D:.
+  server_exe: "D:\\llm\\llama.cpp\\bin\\llama-server.exe"
+  models_root: "D:\\llm\\models"
+
+  # llama-server binds 0.0.0.0 (see harness/server.py) because WSL2 in NAT mode cannot reach
+  # the Windows loopback. "auto" resolves to WSL's default gateway = the Windows host.
+  # Windows Firewall blocks that path by default: run
+  #     powershell.exe -ExecutionPolicy Bypass -File setup/allow_wsl_llamacpp.ps1
+  # once (it self-elevates; one UAC click). `python run.py doctor` diagnoses it.
+  host: "auto"
+  # NOT 8080: the purdueio-api container already publishes 8080 on this box, and llama.cpp's
+  # default would collide with it the moment mirrored networking or a port-proxy is involved.
+  port: 8099
+  # gpt-oss-120b (63 GB) and llama4-scout (65 GB) take minutes to page in from D: on a cold
+  # start. Too short a timeout here shows up as a bogus "model failed to load".
+  startup_timeout_s: 900
+  cooldown_s: 5          # let VRAM actually free before the next model's baseline is taken
+  # `-lv 5`. Below 5, build b10083 logs NO offload information whatsoever — at the default
+  # verbosity a model running half on the CPU is indistinguishable from a fully offloaded
+  # one in the results. The cost is a multi-MB log per model under results/server_logs/.
+  log_verbosity: 5
+  # ...and then keep only the startup header once the model has been measured. `-lv 5` also
+  # logs every slot operation of every request (~90 MB per model, >1 GB for a full sweep) and
+  # none of that is evidence of anything. Device selection, per-layer assignment, context size
+  # and the chat template all land in the first few hundred lines. 0 = keep everything.
+  keep_log_lines: 400
 
 run:
-  # THE critical knob. Applied identically to every model. If a model can't
-  # fit this context at Q4_K_M in 8GB, that is itself a finding — record it,
-  # don't silently shrink the context for that one model.
+  # THE critical knob. Applied identically to every model as `--ctx-size`. If a model can't
+  # fit this context at Q4_K_M, that is itself a finding — record it, don't silently shrink
+  # the context for that one model. Note the plan prompts are the long ones (~35-course
+  # catalog + requirement groups); 8192 fits them with room to generate.
   num_ctx: 8192
+  n_gpu_layers: 999           # offload everything that fits; actual layers are read from stderr
+  n_cpu_moe: 35               # MoE expert offload; a no-op on dense models, so applied uniformly
+  cache_type_k: "q8_0"        # near-lossless, halves KV memory
+  cache_type_v: "q8_0"        # requires --flash-attn on, which server.py always passes
   temperature: 0.15
   seed: 67
   top_p: 0.9
-  max_output_tokens: 1024   # num_predict; generous, so truncation is a model fault
-  runs_per_pair: 3          # N runs per (model x question) — variance, not luck
-  warmup_discard: 2         # generations per model discarded before measurement
-  keep_alive: "15m"         # keep model warm within its block; never restart Ollama
-  request_timeout_s: 300
+  max_output_tokens: 1024     # mirrors backend LLAMACPP_MAX_TOKENS — generous, so truncation is a model fault
+  # A whole 8-semester plan is a lot of JSON and 1024 tokens truncates it. Separate budget,
+  # identical across models, recorded in meta. `finish_reason == "length"` is still scored as
+  # truncation so a model that rambles is not rescued by the bigger ceiling.
+  max_plan_tokens: 2048
+  runs_per_pair: 3            # N replicates per (model x item) — variance, not luck
+  warmup_discard: 2           # generations per model discarded before measurement
+  request_timeout_s: 600
+  # Mode A only, and only under --mitigate: the app's revise_plan retry loop
+  # (advisor_agent.DEFAULT_MAX_ITERATIONS). Baseline runs use 1 so the un-helped model is
+  # visible; mitigation shows what the free fix buys.
+  revise_max_iterations: 3
+  explain_question: "Why is my plan sequenced this way, and where is it risky?"
+  # Terms the planner may schedule into. Summer is OUT for now — it is a real term with real
+  # offerings, but summer enrolment has cost/aid/residency consequences the planner cannot
+  # reason about, so it is not recommended unprompted. Must match the backend's
+  # PLANNER_INCLUDE_SUMMER, or the eval and the app disagree about what a valid semester is.
+  # Add "summer" back here (and set PLANNER_INCLUDE_SUMMER=true) when summer planning lands.
+  planning_terms: [fall, spring]
+  # One markdown file per (model, stage, item, replicate) under results/transcripts/.
+  # The raw text is in the JSONL too, but a JSONL field is not something you can read.
+  save_transcripts: true
+  # plan_a | plan_b | qa | explain
+  default_tasks: [plan_a, plan_b, qa, explain]
 
-# Models. I do NOT assume knowledge of models that postdate my training
-# (lfm2.5, gemma4, qwen3.5, qwen3.6, granite4.1, ministral-3, ornith, rnj-1,
-# olmo-3, glm4:9b, minicpm-v4.5) — verify each tag exists on ollama.com/library
-# and prefer TEXT-ONLY tags (multimodal tags waste ~1.4GB VRAM on a vision
-# encoder). Fields:
-#   think: false = explicitly disable thinking (sent as "think": false)
-#          null  = model has no known thinking switch; nothing is sent
-#          "VERIFY" = I don't actually know; check the model card before the run
-#   bracket: 8gb | small | coder | reference | new
+# Models. `name` is the harness's key; `gguf` is the path under models_root (identical to the
+# mapping in D:\llm\run-model.ps1 — keep them in sync). Fields:
+#   think:   false = disable reasoning (`--reasoning off --reasoning-budget 0` at launch, plus
+#                    enable_thinking=false per request as a template-level backstop)
+#            null  = model has no reasoning switch; nothing is sent
+#   mlock:   false for models that exceed this box's ~58 GB RAM — --mlock OOMs on those
+#   bracket: 8gb | coder | server | reference
+#
+# BRACKETS ARE NOT INTERCHANGEABLE. `8gb`/`coder` are candidates for the RTX 2060 Super
+# deployment box; `server` needs CPU-MoE expert offload; `reference` exists only to establish
+# a quality ceiling on this 5070 Ti workstation and is NOT a deployment candidate. Compare
+# within a bracket, and treat reference-tier scores as "what we're giving up", never as
+# "what we could ship".
 models:
-  - name: "lfm2.5"
-    bracket: 8gb
-    think: false          # brief says LFM2.5 reasons; verify the switch works
-  - name: "gemma4:e4b"
-    bracket: 8gb
-    think: false          # brief says Gemma 4 has a thinking mode
-  - name: "qwen3.5:9b"
-    bracket: 8gb
-    think: false
-  - name: "qwen3:8b"
-    bracket: 8gb
-    think: false          # qwen3 thinking is toggleable; harness sends think:false
-  - name: "qwen2.5:7b"
-    bracket: 8gb
-    think: null
-  - name: "granite4.1:8b"
-    bracket: 8gb
-    think: null           # unknown to me — check and correct
-  - name: "ministral-3:8b"
-    bracket: 8gb
-    think: null           # unknown to me — check and correct
-  - name: "mistral:7b"
-    bracket: 8gb
-    think: null
-  - name: "llama3.1:8b"   # control
-    bracket: 8gb
-    think: null
-  - name: "deepseek-r1:8b" # expected latency counterexample
-    bracket: 8gb
-    think: false          # if disabling fails, r1 output will show <think> anyway
-  - name: "minicpm-v4.5:8b"  # CAUTION: vision-language model, no known text-only
-    bracket: 8gb              # tag as of this writing — pays the ~1.4GB vision-
-    think: null      # encoder tax your own note above warns about
-  - name: "olmo-3:7b"
-    bracket: 8gb
-    think: null        # AI2 Olmo — no thinking switch known to me, confirm
-  - name: "olmo2:7b"
-    bracket: 8gb
-    think: null            # prior Olmo gen, no known thinking mode
-  - name: "glm4:9b"
-    bracket: 8gb
-    think: null        # later GLM gens (4.5/4.6) have thinking modes;
-  - name: "ornith:8b"
-    bracket: 8gb
-    think: false
-  - name: "rnj-2:8b"
-    bracket: 8gb
-    think: false
-                       # unclear if this base glm4:9b tag does — confirm
-
-  # --- coder-tuned models: added to test whether code-specific pretraining
-  # helps SQL generation over general chat models of similar size ---
-  #- name: "qwen2.5-coder:7b"
-  #  bracket: coder
-  #  think: null
-  #- name: "deepseek-coder:6.7b"  # NOT the R1 reasoning distill — base coder model
-  #  bracket: coder
-  #  think: null
-  - name: "sqlcoder:7b"    # purpose-built for text-to-SQL — most relevant addition
+  # --- 8GB-class deployment candidates (the real decision) ---
+  - name: "qwen2.5-coder-7b-instruct"     # the app's current default (backend LLAMACPP_MODEL)
+    gguf: "qwen2.5-coder-7b-instruct\\Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf"
     bracket: coder
-    think: null
-
-  - name: "phi4-mini:3.8b"  # small-tier, not 8gb-tier — parameter count is well
-    bracket: small           # under the others; compare within its own bracket
-    think: null
-  - name: "gemma4:e2b"    # small-tier sanity check
-    bracket: small
     think: false
-  - name: "qwen3.6:27b"   # reference tier — run on the 5070 Ti box only
+  - name: "qwen2.5-7b"
+    gguf: "qwen2.5-7b\\Qwen2.5-7B-Instruct-Q4_K_M.gguf"
+    bracket: 8gb
+    think: null
+  
+
+
+  # --- MoE / larger, for the server envelope with expert offload ---
+  - name: "gpt-oss-20b"
+    gguf: "gpt-oss-20b\\gpt-oss-20b-MXFP4.gguf"
+    bracket: server
+    think: false          # gpt-oss reasoning may not fully disable; --reasoning off is best effort
+  - name: "qwen3-coder-30b"
+    gguf: "qwen3-coder-30b\\Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"
+    bracket: server
+    think: false
+  - name: "qwen3.6-27b"
+    gguf: "qwen3.6-27b\\Qwen3.6-27B-Q4_K_M.gguf"
+    bracket: server
+    think: false
+  
+  - name: "glm-4.7-flash"
+    gguf: "glm-4.7-flash\\zai-org_GLM-4.7-Flash-Q4_K_M.gguf"
+    bracket: server
+    think: false
+  - name: "gemma4-26b"
+    gguf: "gemma4-26b\\google_gemma-4-26B-A4B-it-Q4_K_M.gguf"
+    bracket: server
+    think: false
+  - name: "nemotron-cascade-2"
+    gguf: "nemotron-cascade-2\\nvidia_Nemotron-Cascade-2-30B-A3B-Q4_K_M.gguf"
+    bracket: server
+    think: false
+
+  # --- quality ceiling only: 5070 Ti box (16GB VRAM + ~58GB RAM). Not deployable. ---
+  - name: "qwen3-8b"
+    gguf: "qwen3-8b\\Qwen_Qwen3-8B-Q4_K_M.gguf"
     bracket: reference
     think: false
+  - name: "qwen3.5-9b"
+    gguf: "qwen3.5-9b\\Qwen_Qwen3.5-9B-Q4_K_M.gguf"
+    bracket: reference
+    think: false
+  - name: "qwen3.6-35b-a3b"
+    gguf: "qwen3.6-35b-a3b\\Qwen_Qwen3.6-35B-A3B-Q4_K_M.gguf"
+    bracket: reference
+    think: false
+  - name: "qwen3-next"
+    gguf: "qwen3-next\\Qwen3-Next-80B-A3B-Instruct-Q4_K_M.gguf"
+    bracket: reference
+    think: false
+    mlock: false          # ~46GB — locking it OOMs at 58GB RAM
+  - name: "qwen3-coder-next"
+    # Qwen3NextForCausalLM, 48 layers / 512 experts / 10 active — same architecture family as
+    # qwen3-next above, hence the same constraints. Split into four shards; point at part 1
+    # and llama.cpp loads the rest itself.
+    gguf: "qwen3-coder-next\\Qwen3-Coder-Next-Q4_K_M\\Qwen3-Coder-Next-Q4_K_M-00001-of-00004.gguf"
+    bracket: reference
+    think: false
+    mlock: false          # ~48GB across shards — locking it OOMs at 58GB RAM
 
-  # nomic-embed-text intentionally excluded — it's the embedding model behind
-  # the semantic cache, not a chat/SQL competitor. Don't give it a bracket.
 paths:
-  schema_sql: "schema.sql"
+  plan_fixture: "plan_fixtures/cs_machine_intelligence.yaml"
   questions: "questions.yaml"
-  db_file: "eval.sqlite"
   results_dir: "results"
 
-# Pre-registered decision thresholds (see README.md "Decision rule").
-# Edit BEFORE running; the report evaluates the rule mechanically from these.
+# Pre-registered decision thresholds. Edit BEFORE running; the report evaluates what it can
+# mechanically and refuses to call a gap real below min_plan_scenarios.
+#
+# The question has changed since the Ollama version of this file. It is no longer "is the
+# 27B worth a used 3090" in the abstract — it is: **can an 8GB-class model be trusted with
+# the plan-of-study feature**, which is the thing students will use most.
 decision:
-  sql_correct_gap_pp: 15        # 27B minus mitigated-best-8GB, percentage points
-  sql_correct_8gb_floor: 0.80   # if mitigated 8GB >= this, cache+retry covers the rest
-  min_gold_questions: 30        # below this, the report refuses to call the gap real
+  # Below this, the app should keep the model out of the sequencing loop entirely (Mode A
+  # only — model proposes, planner disposes, which is exactly today's architecture).
+  mode_b_viable_floor: 0.90
+  # Mode A is the shipped path; a model that can't even produce a grounded proposal isn't a
+  # candidate regardless of how it does elsewhere.
+  mode_a_grounded_floor: 0.90
+  # Reference-tier minus best deployable, in percentage points of PLAN_VIABLE. Below this the
+  # ceiling isn't worth chasing with hardware.
+  plan_viable_gap_pp: 15
+  # Real sample size = scenarios, NOT scenarios x replicates (replicates are correlated
+  # repeats of the same item). The report refuses to call a gap real below this.
+  min_plan_scenarios: 8
