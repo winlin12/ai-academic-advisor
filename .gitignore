@@ -21,6 +21,8 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+models
+llama.cpp
 
 # Frontend build/deps
 /clients/web/node_modules/

@@ -435,12 +435,29 @@ def run_explain(
     """Explain the deterministic baseline plan. Every model explains the SAME plan — feeding
     each model its own Mode B plan would confound explanation quality with planning quality."""
     plan = generate_plan(scenario.profile, ctx.fixture.catalog)
+    # Shape this exactly like ``PlanResponse.model_dump_json()`` — the router hands the model
+    # ``PlannedCourse`` objects (code + title + credits + workload), NOT bare course codes.
+    # Sending codes alone was a harness-only bug with a measurable cost: with no title in the
+    # payload, models fill the gap from parametric memory and tell the student CS 35400 is
+    # "Theory of Computation" (it is Operating Systems). That failure mode is an artifact of
+    # the harness, not something production can produce, so scoring it was scoring a fiction.
+    by_code = {c.code: c for c in ctx.fixture.catalog}
+    def _planned_course(code: str) -> dict:
+        course = by_code.get(code)
+        if course is None:  # a plan can only hold catalog codes; be explicit if that breaks
+            return {"code": code, "title": "", "credits": 0, "workload_score": 0}
+        return {
+            "code": course.code, "title": course.title,
+            "credits": course.credits, "workload_score": course.workload_score,
+        }
+
     plan_json = json.dumps(
         {
             "student_name": scenario.profile.name,
             "degree_program": scenario.profile.degree_program,
             "semesters": [
-                {"term": s.term, "year": s.year, "courses": s.courses,
+                {"term": s.term, "year": s.year,
+                 "courses": [_planned_course(code) for code in s.courses],
                  "total_credits": s.total_credits, "warnings": s.warnings}
                 for s in plan.semesters
             ],

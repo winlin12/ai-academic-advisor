@@ -73,6 +73,7 @@ class PlanScore:
     planned_credits: int = 0
     semester_credits: list[int] = field(default_factory=list)
     credit_spread: int = 0              # max - min across non-empty semesters (diagnostic)
+    idle_credits: int = 0               # unused capacity while requirements went unmet
     hallucinated: list[str] = field(default_factory=list)
     assertions_passed: dict[str, bool] = field(default_factory=dict)
 
@@ -87,6 +88,7 @@ class PlanScore:
             "planned_credits": self.planned_credits,
             "semester_credits": self.semester_credits,
             "credit_spread": self.credit_spread,
+            "idle_credits": self.idle_credits,
             "hallucinated_courses": self.hallucinated,
             "assertions_passed": self.assertions_passed,
         }
@@ -215,6 +217,19 @@ def score_plan(
     )
     score.violation_counts = counts
     score.viable = not counts and score.requirement_coverage >= 1.0
+
+    # Idle capacity: credits the student could legally have taken but was not given, counted
+    # only while requirements are still unmet. Without this, "schedule almost nothing" scores
+    # as the cleanest strategy in the whole harness — a 1-course plan has zero violations and
+    # the lowest violations-per-plan of any model. It is the failure mode the prompt's
+    # "a short legal plan is better than a long illegal one" actively invites, and no existing
+    # column made it visible. Zero when coverage is complete: an under-full plan that satisfied
+    # the degree is not wasting anything.
+    if score.requirement_coverage < 1.0:
+        cap = profile.max_credits_per_semester
+        horizon = max(profile.semesters_to_plan, len(score.semester_credits))
+        padded = score.semester_credits + [0] * (horizon - len(score.semester_credits))
+        score.idle_credits = sum(max(cap - c, 0) for c in padded[:horizon])
 
     if assertions:
         score.assertions_passed = check_assertions(assertions, semesters, score)

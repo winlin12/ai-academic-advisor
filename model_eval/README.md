@@ -35,7 +35,7 @@ different tasks, different prompts, different hashes.
 ```bash
 cd model_eval
 
-python run.py doctor              # WSL -> Windows llama-server reachability (once, first)
+python run.py doctor              # local llama-server setup: binary, models, GPU (once, first)
 python run.py refresh-offerings   # pull real term offerings into the fixture (see below)
 python run.py check               # fixture validity, prompt sizes, gguf files, GPU visible
 python run.py run        # every model, every task  (hours — see "Cost" below)
@@ -50,24 +50,16 @@ python run.py run --mitigate --models <champion>  # the free fixes, for before/a
 ### Requirements
 
 - Python 3.10+, `pip install pyyaml` (only dependency)
-- llama.cpp at `D:\llm\llama.cpp\bin\llama-server.exe`, GGUFs under `D:\llm\models\`
+- `llama-server` built from `../llama.cpp` (`cmake -B build -DGGML_CUDA=on && cmake --build
+  build --config Release -j`; lands at `llama.cpp/build/bin/llama-server`), GGUFs under
+  `../models/`
 - `nvidia-smi` (WSL ships it at `/usr/lib/wsl/lib/nvidia-smi`; absent = VRAM recorded as null)
 - Models on **SSD** — an HDD cold-load pollutes latency and can blow the startup timeout
 
-### The WSL networking gotcha
-
-`llama-server` is a native Windows process (CUDA 13.3 — the Blackwell 5070 Ti will not run
-the stock cuda-12.4 build). The harness runs in WSL2. In NAT mode **WSL cannot reach the
-Windows loopback**, so the server binds `0.0.0.0` and is reached at the default-gateway IP —
-a path Windows Firewall blocks by default. The symptom is a server that starts perfectly,
-logs `listening`, and is unreachable, which looks exactly like a model that failed to load.
-
-```bash
-powershell.exe -ExecutionPolicy Bypass -File setup/allow_wsl_llamacpp.ps1   # one UAC click
-```
-
-`python run.py doctor` detects this specific failure and says so. The alternative fix
-(`networkingMode=mirrored` in `.wslconfig`) is cleaner but needs `wsl --shutdown`.
+`llama-server` runs as a native Linux process directly in this WSL box — no Windows interop,
+no cross-VM networking, so it binds plain loopback (`127.0.0.1`). `python run.py doctor`
+checks the binary, the models directory, GPU visibility and whether the configured port is
+already in use.
 
 Note the eval port is **8099**, not llama.cpp's default 8080 — the `purdueio-api` container
 already owns 8080 on this box.
@@ -177,7 +169,7 @@ which is a fixture bug, and the check catches it before you spend GPU hours.
 | `config.yaml` | Every knob that could pollute a comparison: context size, KV type, GPU layers, sampling, per-model gguf paths and `think`/`mlock` flags, decision thresholds. |
 | `plan_fixtures/cs_machine_intelligence.yaml` | **The scoring authority.** Catalog, requirement groups, scenarios. Read its provenance header before quoting any number. |
 | `questions.yaml` | Grounded-QA items with their retrieved chunks **pinned in the file** — retrieval belongs to the embedding model, so letting it vary would smear a retrieval difference across every model's score. |
-| `harness/server.py` | llama-server lifecycle over WSL interop: builds argv from config, waits for `/health`, parses per-layer offload from stderr, stops between models. |
+| `harness/server.py` | llama-server lifecycle as a native local process: builds argv from config, waits for `/health`, parses per-layer offload from stderr, stops between models. |
 | `harness/llamacpp_client.py` | Streaming stdlib client for `/v1/chat/completions`. TTFT from the stream, token counts from `usage`, timings from llama.cpp's own `timings`. |
 | `harness/planner.py` | **Vendored copy** of the app's deterministic planner + `_apply_proposal`. Mode A can only measure production if these match — see the drift warning below. |
 | `harness/fixtures.py` | Loads the fixture; ports `planner_catalog.select_remaining_courses` so Mode A starts from production's baseline. |
@@ -187,7 +179,7 @@ which is a fixture bug, and the check catches it before you spend GPU hours.
 | `harness/runner.py` | Orchestration: server lifecycle, warmup + discard, VRAM delta, N replicates. Plan tasks run **first** so a cut-short run keeps the data that matters. |
 | `harness/report.py` | Plan tables first, validity guards, manual review queue. No composite score exists. |
 | `results/transcripts/` | One markdown file per (model, stage, item, replicate): system prompt, user prompt, raw output, verdict. The raw text is in the JSONL too, but a JSONL field is not something you can read — and reading what a model literally said is how you catch a metric measuring the wrong thing. Disable with `run.save_transcripts: false`. |
-| `setup/allow_wsl_llamacpp.ps1` | The one firewall rule that makes WSL → Windows llama-server work. |
+| `setup/allow_wsl_llamacpp.ps1` | Leftover from the Windows-interop era; not needed now that llama-server runs natively in WSL. |
 
 Data flow: `plan_fixtures/*.yaml` + `questions.yaml` → `prompts.py` → `server.py` +
 `llamacpp_client.py` → `plan_scorers.py` / `scorers.py` → `results/runs_*.jsonl` →

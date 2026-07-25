@@ -50,10 +50,13 @@ def _sha256(text: str) -> str:
 PROPOSAL_SYSTEM = (
     "You are an assistant that tunes a college course plan from a student's feedback. You are "
     "NOT an official advisor and you must not invent courses, prerequisites, or requirements. "
-    "A deterministic planner owns legality (prerequisites, term offerings, credit caps); you "
-    "only express preferences over the courses already listed. Only use course codes and tags "
-    "that appear in the context. Leave a list empty if it does not apply. Never put a course "
-    "in both reorder and defer."
+    "A deterministic planner ENFORCES legality (prerequisites, term offerings, credit caps); "
+    "you only express preferences over the courses already listed. Only use course codes and "
+    "tags that appear in the context. Leave a list empty if it does not apply. Never put a "
+    "course in both reorder and defer. "
+    "The credit cap is the exception: when the student asks for a specific per-semester credit "
+    "load, you MUST set max_credits_per_semester to that number. Writing it only in the "
+    "rationale has no effect."
 )
 
 # Mirrors app.models.schemas.PlanEditProposal. The app sends this schema to llama.cpp as a
@@ -80,7 +83,10 @@ PROPOSAL_SCHEMA: dict[str, Any] = {
         },
         "max_credits_per_semester": {
             "type": ["integer", "null"], "minimum": 1, "maximum": 24,
-            "description": "New per-semester credit cap, only if the student asked for one.",
+            "description": (
+                "Set this to the number of credits the student asked for whenever they name a "
+                "per-semester load (e.g. 'keep me at 12 credits'). Null only if they did not ask."
+            ),
         },
     },
     "required": ["rationale", "reorder", "defer", "avoid_tags"],
@@ -110,9 +116,14 @@ Build the plan ONLY from the course catalog given to you. Every rule below is ha
 - Cover every degree requirement listed. For a "choose" requirement, schedule enough of its
   options to reach the stated credits.
 
-If the requirements cannot all fit in the number of semesters available, still produce the
-best legal plan you can and list what did not fit in "unplanned". A short legal plan is
-better than a long illegal one."""
+- Do not leave a semester far below the credit limit while requirements are still unplanned.
+  Fill the earliest semester a course is legally allowed in. An empty early semester wastes
+  the whole prerequisite chain behind it, so front-load whatever the prerequisites permit.
+
+If the requirements genuinely cannot all fit in the number of semesters available, still
+produce the best legal plan you can and list what did not fit in "unplanned". Prefer the legal
+plan over the complete one — but "legal" is not a reason to schedule less than you can: only
+drop a course when scheduling it would break a rule above or leave no room in any term."""
 
 def plan_schema(planning_terms: list[str]) -> dict[str, Any]:
     """Mode B's response schema, with the term enum restricted to schedulable terms.
@@ -284,7 +295,8 @@ class PromptBuilder:
         """Returns (system, user, static_hash). Port of ``advisor_agent._user_prompt``."""
         parts = [
             f"STUDENT: {scenario.profile.name} — {scenario.profile.degree_program}",
-            f"Current credit cap: {scenario.profile.max_credits_per_semester} per semester.",
+            f"Current credit cap: {scenario.profile.max_credits_per_semester} per semester "
+            f"(change it via max_credits_per_semester if the student asks for a different load).",
             "",
             "COURSES THAT CAN BE MOVED:",
             _course_context(scenario.profile, self.fixture.catalog),

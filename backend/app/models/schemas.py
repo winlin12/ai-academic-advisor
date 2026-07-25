@@ -265,7 +265,13 @@ class PlanEditProposal(BaseModel):
         default=None,
         ge=1,
         le=24,
-        description="New per-semester credit cap, only if the student asked for one.",
+        # "only if the student asked for one" read as discouragement: models left this null and
+        # put the requested number in the rationale, where the planner never sees it. Phrased
+        # as an obligation instead, since this field is the only path a requested load has.
+        description=(
+            "Set this to the number of credits the student asked for whenever they name a "
+            "per-semester load (e.g. 'keep me at 12 credits'). Null only if they did not ask."
+        ),
     )
 
 

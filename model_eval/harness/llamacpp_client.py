@@ -73,9 +73,7 @@ class LlamaCppClient:
             raise LlamaCppError(f"{method} {path} -> HTTP {exc.code}: {body}") from exc
         except urllib.error.URLError as exc:
             raise LlamaCppError(
-                f"Cannot reach llama-server at {self.base_url} ({exc.reason}). "
-                f"From WSL this is almost always the Windows Firewall blocking the WSL "
-                f"subnet — run `python run.py doctor`."
+                f"Cannot reach llama-server at {self.base_url} ({exc.reason})."
             ) from exc
 
     # --- probes ---------------------------------------------------------------------------

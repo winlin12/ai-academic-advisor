@@ -5,22 +5,18 @@
 # config value was enough. Under llama.cpp they are LAUNCH flags — one process serves exactly
 # one model — so the harness starts and stops llama-server itself from the values below and
 # reads /props back to verify the server really honoured them. If you launch a server by hand
-# (D:\llm\run-model.ps1) and point the harness at it, that verification is what will catch a
-# mismatch instead of silently comparing models at different context sizes.
+# and point the harness at it, that verification is what will catch a mismatch instead of
+# silently comparing models at different context sizes.
 
 llamacpp:
-  # Native Windows build (CUDA 13.3 — Blackwell/sm_120 needs 12.8+; the default cuda-12.4
-  # release will NOT run on the 5070 Ti). Executed directly from WSL over Windows interop, so
-  # it is a real Windows process with full native GPU and PCIe5 access to D:.
-  server_exe: "D:\\llm\\llama.cpp\\bin\\llama-server.exe"
-  models_root: "D:\\llm\\models"
+  # Native Linux build, checked out at ./llama.cpp and run directly in this WSL box (no
+  # Windows interop) — build it with the usual `cmake -B build -DGGML_CUDA=on && cmake --build
+  # build --config Release -j`; the binary lands at build/bin/llama-server.
+  server_exe: "/home/wylin/ai-academic-advisor/llama.cpp/build/bin/llama-server"
+  models_root: "/home/wylin/ai-academic-advisor/models"
 
-  # llama-server binds 0.0.0.0 (see harness/server.py) because WSL2 in NAT mode cannot reach
-  # the Windows loopback. "auto" resolves to WSL's default gateway = the Windows host.
-  # Windows Firewall blocks that path by default: run
-  #     powershell.exe -ExecutionPolicy Bypass -File setup/allow_wsl_llamacpp.ps1
-  # once (it self-elevates; one UAC click). `python run.py doctor` diagnoses it.
-  host: "auto"
+  # Native local process — no WSL/Windows interop, so plain loopback works.
+  host: "127.0.0.1"
   # NOT 8080: the purdueio-api container already publishes 8080 on this box, and llama.cpp's
   # default would collide with it the moment mirrored networking or a port-proxy is involved.
   port: 8099
@@ -43,19 +39,28 @@ run:
   # fit this context at Q4_K_M, that is itself a finding — record it, don't silently shrink
   # the context for that one model. Note the plan prompts are the long ones (~35-course
   # catalog + requirement groups); 8192 fits them with room to generate.
-  num_ctx: 8192
+  #
+  # MEASURED, 2026-07-25 — 8192/1024/2048 vs 32768/4096/8182, same seed, qwen3.5-9b:
+  # 111 of 126 outputs came back BYTE-IDENTICAL. Mode B did not move by one character
+  # (237 violations both runs, coverage 0.88 both runs, 0/24 viable both runs); QA did not
+  # move; median explain length stayed at 1001 tokens even with 4x the room. The only records
+  # that changed were the 15 that had been hitting the ceiling mid-sentence.
+  # Conclusion: context is NOT the binding constraint on this workload — the prompts fit in
+  # 8192 with room to spare, and extra context buys nothing but VRAM cost. The token budgets
+  # below are what actually mattered, and only for truncation, not for quality.
+  num_ctx: 16384
   n_gpu_layers: 999           # offload everything that fits; actual layers are read from stderr
-  n_cpu_moe: 35               # MoE expert offload; a no-op on dense models, so applied uniformly
-  cache_type_k: "q8_0"        # near-lossless, halves KV memory
-  cache_type_v: "q8_0"        # requires --flash-attn on, which server.py always passes
+  n_cpu_moe: 24             # MoE expert offload; a no-op on dense models, so applied uniformly
+  cache_type_k: "f16"        # near-lossless, halves KV memory
+  cache_type_v: "f16"        # requires --flash-attn on, which server.py always passes
   temperature: 0.15
   seed: 67
   top_p: 0.9
-  max_output_tokens: 1024     # mirrors backend LLAMACPP_MAX_TOKENS — generous, so truncation is a model fault
+  max_output_tokens: 4096     # mirrors backend LLAMACPP_MAX_TOKENS — generous, so truncation is a model fault
   # A whole 8-semester plan is a lot of JSON and 1024 tokens truncates it. Separate budget,
   # identical across models, recorded in meta. `finish_reason == "length"` is still scored as
   # truncation so a model that rambles is not rescued by the bigger ceiling.
-  max_plan_tokens: 2048
+  max_plan_tokens: 8182
   runs_per_pair: 3            # N replicates per (model x item) — variance, not luck
   warmup_discard: 2           # generations per model discarded before measurement
   request_timeout_s: 600
@@ -76,85 +81,157 @@ run:
   # plan_a | plan_b | qa | explain
   default_tasks: [plan_a, plan_b, qa, explain]
 
-# Models. `name` is the harness's key; `gguf` is the path under models_root (identical to the
-# mapping in D:\llm\run-model.ps1 — keep them in sync). Fields:
+# Models. `name` is the harness's key; `gguf` is the path under models_root. Fields:
 #   think:   false = disable reasoning (`--reasoning off --reasoning-budget 0` at launch, plus
 #                    enable_thinking=false per request as a template-level backstop)
 #            null  = model has no reasoning switch; nothing is sent
-#   mlock:   false for models that exceed this box's ~58 GB RAM — --mlock OOMs on those
+#   mlock:   false for models that exceed this box's RAM — --mlock OOMs on those
 #   bracket: 8gb | coder | server | reference
 #
-# BRACKETS ARE NOT INTERCHANGEABLE. `8gb`/`coder` are candidates for the RTX 2060 Super
-# deployment box; `server` needs CPU-MoE expert offload; `reference` exists only to establish
-# a quality ceiling on this 5070 Ti workstation and is NOT a deployment candidate. Compare
-# within a bracket, and treat reference-tier scores as "what we're giving up", never as
-# "what we could ship".
+# BRACKETS ARE NOT INTERCHANGEABLE. `8gb`/`coder` are candidates for the deployment box;
+# `server` needs CPU-MoE expert offload; `reference` exists only to establish a quality
+# ceiling and is NOT a deployment candidate. Compare within a bracket, and treat
+# reference-tier scores as "what we're giving up", never as "what we could ship".
+#
+# Trimmed to what's actually present under ./models (flat, not the D:\llm\models\<name>\<file>
+# layout the old Windows box used) after moving off the Windows/WSL-interop llama-server.
+# The rest of the old roster is commented out below — re-add an entry once its gguf is
+# downloaded into ./models, matching the flat layout.
 models:
-  # --- 8GB-class deployment candidates (the real decision) ---
+  
+  # THE ONE MODEL THAT BEAT gemma4-e4b ON THE SHIPPED PATH. In results_old (2026-07-22, the
+  # 16 GB gaming box) it scored 24/24 grounded Mode A proposals with 0 parse failures at a
+  # 5.2s median — the best Mode A result anywhere in the corpus, better than qwen3-next (80B,
+  # 18/24) and better than gemma4-e4b (18/24). And it did it at a 2621 MB VRAM delta, LOWER
+  # than gemma4-e4b's 3287 MB, because A4B routes ~4B active params and --n-cpu-moe puts the
+  # rest of the experts in system RAM. That is the whole reason this entry exists: it tests
+  # "does scale help?" without needing a bigger GPU.
+  #
+  # RAM: satisfied as of 2026-07-25. The box went 15.9 GB -> 31.9 GB physical (WSL now sees
+  # 27 GB total / 25 GB available, so the .wslconfig memory=28GB request finally binds against
+  # hardware instead of being silently capped). The file is 16.95 GB, which on the old 15.9 GB
+  # box would have paged to swap — the same thing that made qwen3.6-35b-a3b look like a 45s
+  # model when it was really a memory-pressure measurement. mlock stays off regardless: it
+  # buys nothing here and locking 17 GB plus KV cache is how you OOM the box.
+  #
+  # Quant matched to results_old (Q4_K_M) on purpose — comparing a Q3 build against that
+  # 24/24 would confound quantisation with scale and answer nothing.
+  - name: "gemma4-26b"
+    gguf: "gemma4-26b/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"
+    bracket: server          # needs CPU-MoE expert offload; not an 8gb-bracket candidate
+    think: false
+    mlock: false             # 16.95 GB — locking it OOMs unless the box has RAM to spare
+
+  # RE-ENABLED FOR A SECOND ATTEMPT. The 32 GB is installed as of 2026-07-25, so both of the
+  # blockers below are now lifted. Its previous numbers are not a verdict on the model:
+  #
+  #   1. MEMORY PRESSURE. 21 GB of weights, ~7.4 GB in VRAM, leaving ~13.6 GB wanting system
+  #      RAM on a box that then had ~14 GB available and 4 GB of swap. The 45s Mode A median
+  #      and 30.5s Mode B median were substantially a swap measurement, not a model
+  #      measurement. With 25 GB now available this is the first run where its latency means
+  #      anything — expect it to drop, and do not compare the new median to the old one as if
+  #      the model changed.
+  #   2. TOKEN BUDGET. It parse-failed Mode A on 21/24 runs by writing multi-paragraph
+  #      reasoning into `rationale` and never reaching the `reorder` key, against the old
+  #      2048-token max_plan_tokens. That ceiling is now 8182.
+  #
+  # So both of its headline failures had non-model explanations. What to check this time:
+  #   - proposal_parse_failed: if still high at 8182 tokens, it genuinely cannot follow the
+  #     schema and it is done — drop it for good.
+  #   - idle_credits NEXT TO violations/plan: last time it posted the field-best 1.4
+  #     violations/plan alongside the field-WORST 47 idle credits/plan. Low violations bought
+  #     by scheduling almost nothing is not quality, and only reading both columns shows it.
+  #   - median s: even a flawless proposal is not shippable here at tens of seconds.
+  # Still `reference` bracket — a quality ceiling to measure, never a deployment candidate.
+  - name: "qwen3.6-35b-a3b"
+    gguf: "qwen3.6-35b-a3b/Qwen_Qwen3.6-35B-A3B-Q4_K_M.gguf"
+    bracket: reference
+    think: false
+    mlock: false             # 21 GB — locking it OOMs even with 32 GB once KV cache is added
+
+  - name: "qwen3.5-9b"
+    gguf: "qwen3.5-9b/Qwen3.5-9B-Q4_K_M.gguf"
+    bracket: 8gb
+    think: false
+  - name: "gemma4-e4b"
+    gguf: "gemma4-e4b/gemma-4-E4B-it-Q4_K_M.gguf"
+    bracket: 8gb
+    think: false
   - name: "qwen2.5-coder-7b-instruct"     # the app's current default (backend LLAMACPP_MODEL)
-    gguf: "qwen2.5-coder-7b-instruct\\Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf"
+    gguf: "Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf"
     bracket: coder
     think: false
-  - name: "qwen2.5-7b"
-    gguf: "qwen2.5-7b\\Qwen2.5-7B-Instruct-Q4_K_M.gguf"
-    bracket: 8gb
-    think: null
-  
-
-
-  # --- MoE / larger, for the server envelope with expert offload ---
-  - name: "gpt-oss-20b"
-    gguf: "gpt-oss-20b\\gpt-oss-20b-MXFP4.gguf"
-    bracket: server
-    think: false          # gpt-oss reasoning may not fully disable; --reasoning off is best effort
-  - name: "qwen3-coder-30b"
-    gguf: "qwen3-coder-30b\\Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"
-    bracket: server
-    think: false
-  - name: "qwen3.6-27b"
-    gguf: "qwen3.6-27b\\Qwen3.6-27B-Q4_K_M.gguf"
-    bracket: server
-    think: false
-  
-  - name: "glm-4.7-flash"
-    gguf: "glm-4.7-flash\\zai-org_GLM-4.7-Flash-Q4_K_M.gguf"
-    bracket: server
-    think: false
-  - name: "gemma4-26b"
-    gguf: "gemma4-26b\\google_gemma-4-26B-A4B-it-Q4_K_M.gguf"
-    bracket: server
-    think: false
-  - name: "nemotron-cascade-2"
-    gguf: "nemotron-cascade-2\\nvidia_Nemotron-Cascade-2-30B-A3B-Q4_K_M.gguf"
-    bracket: server
-    think: false
-
-  # --- quality ceiling only: 5070 Ti box (16GB VRAM + ~58GB RAM). Not deployable. ---
   - name: "qwen3-8b"
-    gguf: "qwen3-8b\\Qwen_Qwen3-8B-Q4_K_M.gguf"
-    bracket: reference
+    gguf: "qwen3-8b/Qwen_Qwen3-8B-Q4_K_M.gguf"
+    bracket: 8gb
     think: false
-  - name: "qwen3.5-9b"
-    gguf: "qwen3.5-9b\\Qwen_Qwen3.5-9B-Q4_K_M.gguf"
-    bracket: reference
-    think: false
-  - name: "qwen3.6-35b-a3b"
-    gguf: "qwen3.6-35b-a3b\\Qwen_Qwen3.6-35B-A3B-Q4_K_M.gguf"
-    bracket: reference
-    think: false
-  - name: "qwen3-next"
-    gguf: "qwen3-next\\Qwen3-Next-80B-A3B-Instruct-Q4_K_M.gguf"
-    bracket: reference
-    think: false
-    mlock: false          # ~46GB — locking it OOMs at 58GB RAM
-  - name: "qwen3-coder-next"
-    # Qwen3NextForCausalLM, 48 layers / 512 experts / 10 active — same architecture family as
-    # qwen3-next above, hence the same constraints. Split into four shards; point at part 1
-    # and llama.cpp loads the rest itself.
-    gguf: "qwen3-coder-next\\Qwen3-Coder-Next-Q4_K_M\\Qwen3-Coder-Next-Q4_K_M-00001-of-00004.gguf"
-    bracket: reference
-    think: false
-    mlock: false          # ~48GB across shards — locking it OOMs at 58GB RAM
+  # --- not present locally yet; re-enable once downloaded into ./models ---
+  # - name: "qwen2.5-7b"
+  #   gguf: "qwen2.5-7b/Qwen2.5-7B-Instruct-Q4_K_M.gguf"
+  #   bracket: 8gb
+  #   think: null
+  # - name: "gpt-oss-20b"
+  #   gguf: "gpt-oss-20b/gpt-oss-20b-MXFP4.gguf"
+  #   bracket: server
+  #   think: false          # gpt-oss reasoning may not fully disable; --reasoning off is best effort
+  # - name: "qwen3-coder-30b"
+  #   gguf: "qwen3-coder-30b/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"
+  #   bracket: server
+  #   think: false
+  # - name: "qwen3.6-27b"
+  #   gguf: "qwen3.6-27b/Qwen3.6-27B-Q4_K_M.gguf"
+  #   bracket: server
+  #   think: false
+  # - name: "glm-4.7-flash"
+  #   gguf: "glm-4.7-flash/zai-org_GLM-4.7-Flash-Q4_K_M.gguf"
+  #   bracket: server
+  #   think: false
+  # - name: "gemma4-26b"
+  #   gguf: "gemma4-26b/google_gemma-4-26B-A4B-it-Q4_K_M.gguf"
+  #   bracket: server
+  #   think: false
+  # - name: "nemotron-cascade-2"
+  #   gguf: "nemotron-cascade-2/nvidia_Nemotron-Cascade-2-30B-A3B-Q4_K_M.gguf"
+  #   bracket: server
+  #   think: false
+  # - name: "qwen3.5-9b"
+  #   gguf: "qwen3.5-9b/Qwen_Qwen3.5-9B-Q4_K_M.gguf"
+  #   bracket: reference
+  #   think: false
+  # NOT a deployment candidate — 21 GB of GGUF needing ~32 GB RAM to hold with CPU-MoE offload
+  # (only 7.4 GB lands in VRAM), for a 45s median on the path the app actually ships vs 2.7s
+  # for gemma4-e4b. Kept as a ceiling measurement only.
+  #
+  # RETEST BEFORE JUDGING IT. At 8192/1024/2048 it parse-failed Mode A on 21 of 24 runs, and
+  # every one of those failures was the same shape: it wrote multi-paragraph reasoning into the
+  # `rationale` string, exhausted max_plan_tokens, and never emitted the `reorder` key. That is
+  # a budget failure, not a reasoning failure, so the numbers in results_32gb/report.md do not
+  # yet say whether the model is good. The current 4096/8182 budgets are the retest — re-run
+  # with `python run.py run --models qwen3.6-35b-a3b` and check three things:
+  #   1. proposal_parse_failed  — if still high with 8182 tokens, it is unusable, drop it.
+  #   2. idle_credits           — its 1.4 violations/plan came with 47 idle credits/plan, the
+  #                               worst in the field. Low violations by scheduling nothing is
+  #                               not quality; read those two columns together.
+  #   3. median s               — even a perfect proposal at 45s is not shippable here.
+  # Note num_ctx does not need to be 32768 for this (see the A/B above); 8192 would be cheaper
+  # and is known not to change the outcome.
+  #- name: "qwen3.6-35b-a3b"
+  #  gguf: "qwen3.6-35b-a3b/Qwen_Qwen3.6-35B-A3B-Q4_K_M.gguf"
+  #  bracket: reference
+  #  think: false
+  # - name: "qwen3-next"
+  #   gguf: "qwen3-next/Qwen3-Next-80B-A3B-Instruct-Q4_K_M.gguf"
+  #   bracket: reference
+  #   think: false
+  #   mlock: false          # large — locking it can OOM depending on host RAM
+  # - name: "qwen3-coder-next"
+  #   # Qwen3NextForCausalLM, 48 layers / 512 experts / 10 active — same architecture family as
+  #   # qwen3-next above, hence the same constraints. Split into four shards; point at part 1
+  #   # and llama.cpp loads the rest itself.
+  #   gguf: "qwen3-coder-next/Qwen3-Coder-Next-Q4_K_M/Qwen3-Coder-Next-Q4_K_M-00001-of-00004.gguf"
+  #   bracket: reference
+  #   think: false
+  #   mlock: false          # large across shards — locking it can OOM depending on host RAM
 
 paths:
   plan_fixture: "plan_fixtures/cs_machine_intelligence.yaml"

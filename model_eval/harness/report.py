@@ -115,8 +115,8 @@ def _plan_section(records: list[dict], mode: str, title: str, note: str) -> list
     if note:
         lines += [note, ""]
     lines += [
-        "| Model | PLAN_VIABLE | Structure OK | Req. coverage | Violations/plan | Consistency | Median s |",
-        "|---|---|---|---|---|---|---|",
+        "| Model | PLAN_VIABLE | Structure OK | Req. coverage | Violations/plan | Idle cr | Consistency | Median s |",
+        "|---|---|---|---|---|---|---|---|",
     ]
     rows: list[tuple[float, str]] = []
     for model, all_recs in groups.items():
@@ -125,13 +125,18 @@ def _plan_section(records: list[dict], mode: str, title: str, note: str) -> list
         coverage = [r["requirement_coverage"] for r in recs
                     if r.get("requirement_coverage") is not None]
         violations = [len(r.get("violations") or []) for r in recs]
+        # Read Idle cr NEXT TO Violations/plan, never on its own. A model that schedules almost
+        # nothing wins the violations column by default; this is the column that shows the bill.
+        idle = [r["idle_credits"] for r in recs if r.get("idle_credits") is not None]
         flat = [v for vs in viable.values() for v in vs]
         cov_cell = f"{(sum(coverage) / len(coverage)):.0%}" if coverage else "—"
         vio_cell = f"{(sum(violations) / len(violations)):.1f}" if violations else "—"
+        idle_cell = f"{(sum(idle) / len(idle)):.0f}" if idle else "—"
         rows.append((
             (sum(1 for v in flat if v) / len(flat)) if flat else -1.0,
             f"| `{model}` | {_rate_with_range(viable)} | "
             f"{_rate([bool(r.get('structure_ok')) for r in recs])} | {cov_cell} | {vio_cell} | "
+            f"{idle_cell} | "
             f"{_consistency(recs, 'scenario', 'plan_viable')} | "
             f"{_median([r.get('total_s') for r in recs])} |",
         ))
@@ -378,24 +383,50 @@ def _guards(records: list[dict], cfg: dict, fixture_meta: dict) -> list[str]:
 
 
 def _review_queue(records: list[dict], out_path: Path) -> int:
-    """Every free-text answer plus every non-viable plan, for manual grading."""
+    """Every free-text answer plus every non-viable plan, for manual grading.
+
+    Each row carries ``reason`` — what a grader is being asked to decide. Without it the file
+    is an undifferentiated pile and the expensive judgements (does this answer contradict the
+    context? is this prereq edge real?) are indistinguishable from filler.
+    """
     rows = []
     for rec in records:
         if rec.get("needs_review"):
+            flags = rec.get("faithfulness_flags") or []
+            if rec.get("behavior_mixed"):
+                # Refused AND delivered grounded content — behavior_ok cannot adjudicate it.
+                reason = "mixed: refused but also answered — did it answer the question asked?"
+            elif flags:
+                reason = "flagged: unsupported entity in the answer"
+            else:
+                reason = "routine faithfulness check"
             rows.append({
                 "model": rec.get("model"), "stage": rec.get("stage"),
                 "item": rec.get("question_id") or rec.get("scenario"),
                 "run_idx": rec.get("run_idx"),
-                "faithfulness_flags": rec.get("faithfulness_flags"),
+                "reason": reason,
+                "expected_behavior": rec.get("expected_behavior"),
+                "behavior_mixed": rec.get("behavior_mixed"),
+                "faithfulness_flags": flags,
                 "recall_flags": rec.get("recall_flags"),
                 "output": rec.get("output"),
                 "grade": None, "notes": None,
             })
         elif rec.get("stage") in ("plan_mode_a", "plan_mode_b") and rec.get("plan_viable") is False:
+            violations = rec.get("violations") or []
+            # A plan for the deliberately-unsatisfiable scenario is non-viable BY DESIGN. With
+            # no violations to confirm there is nothing for a human to decide, and queueing it
+            # anyway buried the real items: every Mode A "failure" in the 2026-07-25 run was
+            # this case, 12 rows of nothing.
+            if rec.get("expect_unsatisfiable") and not violations:
+                continue
             rows.append({
                 "model": rec.get("model"), "stage": rec.get("stage"),
                 "item": rec.get("scenario"), "run_idx": rec.get("run_idx"),
-                "violations": rec.get("violations"),
+                "reason": ("confirm each violation is real and not a wrong fixture edge"
+                           if violations else "no violations — confirm the coverage gap is real"),
+                "expect_unsatisfiable": bool(rec.get("expect_unsatisfiable")),
+                "violations": violations,
                 "missing_requirements": rec.get("missing_requirements"),
                 "semesters": rec.get("semesters"),
                 "grade": None, "notes": None,

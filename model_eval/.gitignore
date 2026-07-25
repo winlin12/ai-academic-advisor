@@ -4,6 +4,7 @@
 # results/archive_ollama_sql/ is deliberately NOT ignored, so the old SQL question set, stub
 # schema and Ollama client stay in version control as history.
 results/*
+results*
 !results/archive_ollama_sql/
 
 __pycache__/

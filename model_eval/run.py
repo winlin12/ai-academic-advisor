@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Evaluation harness CLI. Standalone: Python 3.10+ and PyYAML, nothing from the app.
 
-  python run.py doctor                      diagnose WSL -> Windows llama-server reachability
+  python run.py doctor                      diagnose local llama-server reachability
   python run.py check                       validate fixture, prompts, GPU, model files
   python run.py serve <model>               launch llama-server for one model and hold it
   python run.py run [--models a,b] [--brackets 8gb,coder] [--tasks plan_b,qa]
@@ -20,7 +20,6 @@ from __future__ import annotations
 import argparse
 import json
 import socket
-import subprocess
 import sys
 from pathlib import Path
 
@@ -33,7 +32,7 @@ def main() -> None:
     )
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("doctor", help="diagnose WSL -> Windows llama-server networking")
+    sub.add_parser("doctor", help="diagnose local llama-server setup")
     sub.add_parser("check", help="validate fixture, prompts, GPU, and model files")
     sub.add_parser("report", help="generate results/report.md")
     sub.add_parser("parity", help="check the vendored planner against the app's")
@@ -98,27 +97,28 @@ def _cfg() -> dict:
 
 
 def doctor() -> None:
-    """The single most likely reason a run fails on this box, diagnosed explicitly.
+    """The most likely reasons a run fails on this box, diagnosed explicitly.
 
-    llama-server is a native Windows process; the harness runs in WSL2 NAT mode. WSL cannot
-    reach the Windows loopback, so the server binds 0.0.0.0 and is reached at the default
-    gateway — a path Windows Firewall blocks by default. Left undiagnosed this looks exactly
-    like "the model failed to load", which sends you debugging the wrong thing.
+    llama-server now runs as a native Linux process in this same WSL box (built from
+    ./llama.cpp), so there is no cross-VM networking to diagnose — just: does the binary
+    exist, is a GPU visible, and is the configured port free (or already serving what you
+    expect).
     """
-    from harness.server import gpu_memory_used_mb, windows_host_ip
+    from harness.server import gpu_memory_used_mb, resolve_host
 
     cfg = _cfg()
     port = cfg["llamacpp"]["port"]
-    print("=== WSL -> Windows llama-server reachability ===\n")
+    host = resolve_host(cfg["llamacpp"].get("host", "auto"))
+    print("=== local llama-server setup ===\n")
 
-    host = windows_host_ip()
-    print(f"Windows host (WSL default gateway): {host or 'NOT FOUND'}")
-    if not host:
-        print("  Could not read a default route. Set llamacpp.host explicitly in config.yaml.")
-        return
+    exe = Path(cfg["llamacpp"]["server_exe"])
+    print(f"llama-server: {'found' if exe.exists() else 'NOT FOUND at ' + str(exe)}")
+    if not exe.exists():
+        print("  Build it: cd llama.cpp && cmake -B build -DGGML_CUDA=on && "
+              "cmake --build build --config Release -j")
 
-    exe = Path(cfg["llamacpp"]["server_exe"].replace("\\", "/").replace("D:", "/mnt/d"))
-    print(f"llama-server.exe: {'found' if exe.exists() else 'NOT FOUND at ' + str(exe)}")
+    models_root = Path(cfg["llamacpp"]["models_root"])
+    print(f"models_root: {'found' if models_root.exists() else 'NOT FOUND at ' + str(models_root)}")
 
     gpu = gpu_memory_used_mb()
     print(f"nvidia-smi: {'available, ' + str(gpu) + ' MB used' if gpu else 'NOT available'}")
@@ -129,38 +129,9 @@ def doctor() -> None:
     if listening:
         print("\nA server is already reachable on that port. If it is not the model you want to "
               "test, stop it — `run.py run` will start its own.")
-        return
-
-    print("\nNo server is listening there right now, which is expected when one isn't running.")
-    print("Testing whether WSL can reach the Windows host AT ALL (independent of llama.cpp):\n")
-
-    probe_port = 8123
-    proc = subprocess.Popen(
-        ["powershell.exe", "-NoProfile", "-Command",
-         f"$l=[System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Any,{probe_port});"
-         f"$l.Start(); Start-Sleep -Seconds 10; $l.Stop()"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    try:
-        import time
-        time.sleep(4)
-        reachable = _port_open(host, probe_port, timeout=3)
-    finally:
-        proc.terminate()
-
-    if reachable:
-        print(f"  ✅ WSL reached the Windows host on :{probe_port}. Networking is fine — start a "
-              f"model with `python run.py serve <model>` or just `python run.py run`.")
-        return
-
-    print(f"  ❌ WSL could NOT reach the Windows host on :{probe_port}, even though a listener "
-          f"was running there.")
-    print("\n     This is Windows Firewall blocking inbound connections from the WSL adapter.")
-    print("     Fix it once, with one UAC click:\n")
-    print("         powershell.exe -ExecutionPolicy Bypass -File setup/allow_wsl_llamacpp.ps1\n")
-    print("     Alternative (survives WSL IP changes, but needs `wsl --shutdown`, which ends")
-    print("     any running WSL session): add `networkingMode=mirrored` under [wsl2] in")
-    print("     C:\\Users\\<you>\\.wslconfig, then set llamacpp.host to 127.0.0.1 here.")
+    else:
+        print("\nNo server is listening there right now, which is expected when one isn't "
+              "running. `python run.py serve <model>` or `python run.py run` will start one.")
 
 
 def _port_open(host: str, port: int, timeout: float = 2.0) -> bool:
@@ -282,10 +253,10 @@ def check() -> None:
             )
 
     print("\nmodel files:")
-    root = cfg["llamacpp"]["models_root"].replace("\\", "/").replace("D:", "/mnt/d")
+    root = Path(cfg["llamacpp"]["models_root"])
     missing = 0
     for model in cfg["models"]:
-        path = Path(root) / model["gguf"].replace("\\", "/")
+        path = root / model["gguf"]
         if not path.exists():
             missing += 1
             print(f"  MISSING  {model['name']}: {path}")

@@ -1,4 +1,5 @@
-"""llama-server process lifecycle, driven from WSL over Windows interop.
+"""llama-server process lifecycle: a native Linux process built from ./llama.cpp, run directly
+in this WSL box (no Windows interop, no cross-VM networking).
 
 WHY THE HARNESS OWNS THE PROCESS. Under Ollama, one long-lived daemon served every model and
 ``num_ctx`` travelled with each request. llama.cpp inverts that: one process serves exactly
@@ -7,18 +8,6 @@ at launch. If the harness merely *connected* to whatever server happened to be r
 central promise — "every model sees identical settings" — would depend on whoever typed the
 last command line. So the harness starts and stops the server itself, from ``config.yaml``,
 and records the resulting command line in ``meta_*.json``.
-
-WHY THE ARGV IS BUILT HERE AND NOT IN ``D:\\llm\\run-model.ps1``. That launcher is a fine
-hand-driving convenience, but it lives outside the repo, so a run driven by it is not
-reproducible from a checkout. ``llama-server.exe`` is directly executable from WSL (Windows
-interop), so this module invokes the binary with argv it builds itself. run-model.ps1 is left
-untouched for manual use.
-
-NETWORKING. llama-server is a native Windows process; the harness runs in WSL2 NAT mode.
-WSL cannot reach the Windows loopback, so the server is bound to 0.0.0.0 and reached at the
-default-gateway address — which Windows Firewall blocks by default. ``setup/allow_wsl_llamacpp.ps1``
-adds the one inbound rule that fixes it; ``run.py doctor`` detects the failure and says so
-instead of reporting a generic timeout.
 """
 
 from __future__ import annotations
@@ -64,42 +53,15 @@ def gpu_memory_used_mb() -> list[int] | None:
         return None
 
 
-def windows_host_ip() -> str | None:
-    """The Windows host as seen from WSL2 NAT mode: the default gateway."""
-    try:
-        out = subprocess.run(
-            ["ip", "route", "show", "default"], capture_output=True, text=True, timeout=5
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
-        return None
-    match = re.search(r"default via (\d+\.\d+\.\d+\.\d+)", out)
-    return match.group(1) if match else None
-
-
-def win_to_wsl(path: str) -> str:
-    """``D:\\llm\\...`` -> ``/mnt/d/llm/...``.
-
-    Only the EXECUTABLE needs this: WSL's exec resolves argv[0] itself and cannot open a
-    Windows drive path, while every other argument is consumed by the Windows binary and must
-    stay in Windows form. Getting this backwards silently hands llama-server a POSIX model
-    path it cannot open, which surfaces as a confusing load failure rather than an exec error.
-    """
-    if len(path) > 1 and path[1] == ":":
-        return f"/mnt/{path[0].lower()}/" + path[2:].lstrip("\\/").replace("\\", "/")
-    return path
-
-
 def resolve_host(configured: str) -> str:
-    """``host: auto`` -> the Windows gateway IP; anything else is taken literally."""
+    """``host: auto`` -> loopback; anything else is taken literally.
+
+    llama-server is a native process on this same box, so there is no gateway/interop
+    resolution to do — "auto" just means "the sensible local default".
+    """
     if configured and configured != "auto":
         return configured
-    host = windows_host_ip()
-    if not host:
-        raise RuntimeError(
-            "Could not determine the Windows host IP from `ip route`. Set "
-            "llamacpp.host explicitly in config.yaml."
-        )
-    return host
+    return "127.0.0.1"
 
 
 @dataclass
@@ -196,14 +158,13 @@ def build_argv(cfg: dict[str, Any], model_cfg: dict[str, Any], host: str) -> lis
     """
     llama = cfg["llamacpp"]
     run = cfg["run"]
-    models_root = llama["models_root"].rstrip("\\/")
-    gguf = f"{models_root}\\{model_cfg['gguf']}"
+    gguf = str(Path(llama["models_root"]) / model_cfg["gguf"])
 
     argv = [
-        win_to_wsl(llama["server_exe"]),   # argv[0] is resolved by WSL, so it must be POSIX
-        "-m", gguf,                        # every other arg is parsed by the Windows binary
+        llama["server_exe"],
+        "-m", gguf,
 
-        "--host", "0.0.0.0",             # WSL reaches the Windows box by IP, never loopback
+        "--host", host,
         "--port", str(llama["port"]),
         "-c", str(run["num_ctx"]),       # fixed at launch under llama.cpp — the whole reason
         "--n-gpu-layers", str(run["n_gpu_layers"]),
@@ -264,6 +225,5 @@ def start_server(
     tail = "\n".join(handle.log_text().splitlines()[-25:])
     raise TimeoutError(
         f"llama-server for {model_cfg['name']} never became healthy at {base_url}. "
-        f"If the log below shows the server listening, WSL cannot reach it — run "
-        f"`python run.py doctor`. Last lines:\n{tail}"
+        f"Last lines:\n{tail}"
     )

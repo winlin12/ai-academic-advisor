@@ -50,10 +50,19 @@ DEFAULT_MAX_ITERATIONS = 3
 _SYSTEM_PROMPT = (
     "You are an assistant that tunes a college course plan from a student's feedback. You are "
     "NOT an official advisor and you must not invent courses, prerequisites, or requirements. "
-    "A deterministic planner owns legality (prerequisites, term offerings, credit caps); you "
-    "only express preferences over the courses already listed. Only use course codes and tags "
-    "that appear in the context. Leave a list empty if it does not apply. Never put a course "
-    "in both reorder and defer."
+    "A deterministic planner ENFORCES legality (prerequisites, term offerings, credit caps); "
+    "you only express preferences over the courses already listed. Only use course codes and "
+    "tags that appear in the context. Leave a list empty if it does not apply. Never put a "
+    "course in both reorder and defer. "
+    # The credit cap is the one number the planner cannot infer from the feedback: it enforces
+    # whatever cap it is given, and the only way a student's "keep me at 12 credits" reaches it
+    # is this field. Saying only that the planner "owns credit caps" read as "not your job" —
+    # in the eval every model on every replicate of the explicit-cap scenario left
+    # max_credits_per_semester null and wrote the number into the rationale instead, where
+    # nothing consumes it.
+    "The credit cap is the exception: when the student asks for a specific per-semester credit "
+    "load, you MUST set max_credits_per_semester to that number. Writing it only in the "
+    "rationale has no effect."
 )
 
 
@@ -100,7 +109,8 @@ def _user_prompt(
 ) -> str:
     parts = [
         f"STUDENT: {profile.name} — {profile.degree_program}",
-        f"Current credit cap: {profile.max_credits_per_semester} per semester.",
+        f"Current credit cap: {profile.max_credits_per_semester} per semester "
+        f"(change it via max_credits_per_semester if the student asks for a different load).",
         "",
         "COURSES THAT CAN BE MOVED:",
         _course_context(profile, catalog),
