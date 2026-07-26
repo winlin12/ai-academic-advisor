@@ -126,6 +126,31 @@ decoding, and the deterministic planner rebuilds the schedule from it. The resul
 the discriminating measurement, and it answers *what would we gain, or risk, by trusting the
 model with sequencing?*
 
+#### Tried and dropped: a "Mode C" with the published sample plan
+
+Mode B's failures are almost entirely prerequisite *ordering*, and Purdue publishes a sample
+four-year plan per major — which is exactly a known-good topological order with term labels
+on it. So an arm was built that added that plan to Mode B's prompt, changing nothing else,
+and run on gemma4-26b and gemma4-e4b (3 replicates, 8 scenarios). **It did not pay for
+itself, and it is gone.** Recorded here so nobody rebuilds it:
+
+- Viability did not improve. gemma4-26b went 43% → 29%; gemma4-e4b stayed at 0%.
+- Models anchored on the template. The share of courses placed in the sample plan's own
+  semester slot rose on the scenarios the plan *doesn't* describe — `mi-light-load`, the
+  12-credit-cap student, went 15% → 53% — and term-offering violations rose with it.
+- The one clear win was the small model filling its schedule (coverage 75% → 92%, idle
+  credits 31 → 6), which is not what the arm was built to buy.
+- Only one of eight scenarios is the full-time fall-start student a published plan describes,
+  so most of the fixture asks the model to *transform* the template, not reuse it.
+
+The upkeep was the deciding factor: catalog.purdue.edu sits behind an AWS WAF JS challenge
+(automated GET returns HTTP 202 + interstitial), so the plan cannot be fetched by the
+ingester and has to be hand-saved from a browser per major. And a sample plan written by hand
+instead of scraped agrees with the fixture's hand-written prereq edges by construction, which
+makes the arm measure copying rather than planning. Real hoops, no benefit.
+
+The run that produced these numbers is kept under `results_old5/`.
+
 ### PLAN_VIABLE
 
 A plan is viable **only if** it has zero hard violations **and** covers every requirement
@@ -159,6 +184,26 @@ site the second failure is far worse, because it looks like a complete plan.
 `python run.py check` verifies the deterministic planner *can* produce a viable plan for
 every other scenario. If it can't, every model scores 0 for reasons unrelated to the model —
 which is a fixture bug, and the check catches it before you spend GPU hours.
+
+### How long the student waits
+
+Every record carries `ttft_s` (wall-clock from request sent to the first content token) and
+`total_s`. The report prints them in **What a student waits for**, split by call site, because
+one number for both would misdescribe the product:
+
+| Call site | What the student experiences | Read |
+|---|---|---|
+| `qa`, `explain` | Prose streams into the browser token by token | **TTFT** — the answer starts moving at TTFT and the total is just how long it kept growing |
+| `plan_mode_a/b/c` | A grammar-constrained JSON object; half a plan renders as nothing | **Total** — TTFT here only measures prompt processing |
+
+p50, mean and p95 are all printed for TTFT: the mean is the "average wait" but it is dragged
+around by the occasional slow request, so the median leads and p95 is what the unlucky
+student gets. Mode A records the TTFT of its **first** request only — under `--mitigate` it
+can make several round trips, but the student's wait starts once.
+
+All of it excludes model load. The warmup generations run before anything is measured and are
+discarded, so these are warm-server numbers; a student who hits a cold server also waits for
+the weights to page in from disk, which for the larger ggufs is minutes, not seconds.
 
 ---
 

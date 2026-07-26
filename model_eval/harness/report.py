@@ -92,6 +92,31 @@ def _median(values: list[Any]) -> str:
     return f"{statistics.median(clean):.1f}" if clean else "—"
 
 
+def _numbers(values: list[Any]) -> list[float]:
+    return [float(v) for v in values if isinstance(v, (int, float))]
+
+
+def _stat(values: list[Any], kind: str, places: int = 1) -> str:
+    """p50 / mean / p95 over whatever survived as a number.
+
+    p95 is nearest-rank rather than interpolated, so the value printed is one that was
+    actually observed: with 24 samples per (model, stage) an interpolated p95 is a number
+    no student ever waited.
+    """
+    clean = sorted(_numbers(values))
+    if not clean:
+        return "—"
+    if kind == "p50":
+        value = statistics.median(clean)
+    elif kind == "mean":
+        value = statistics.fmean(clean)
+    elif kind == "p95":
+        value = clean[min(len(clean) - 1, int(0.95 * len(clean)))]
+    else:
+        raise ValueError(kind)
+    return f"{value:.{places}f}"
+
+
 # --- sections ---------------------------------------------------------------------------------
 
 
@@ -211,6 +236,82 @@ def _scenario_breakdown(records: list[dict], mode: str) -> list[str]:
     return lines + [""]
 
 
+def _mode_label(stage: str) -> str:
+    return "Mode " + stage.removeprefix("plan_mode_").upper()
+
+
+def _latency_section(records: list[dict]) -> list[str]:
+    """What a student actually waits for.
+
+    TTFT and total are NOT interchangeable here, and reporting one number for both kinds of
+    call would misdescribe the product. The QA and explain call sites stream prose straight
+    to the browser, so TTFT is the perceived wait and the total is just how long the answer
+    kept growing. The plan modes return a JSON object under a grammar constraint — half a plan
+    is not a plan, nothing can be rendered until the object closes, so the perceived wait is
+    the total and TTFT only measures prompt processing.
+
+    All figures exclude model load: the warmup generations run before anything is measured and
+    are discarded. A student hitting a cold server waits for the weights on top of this.
+    """
+    stages = [s for s in ("qa", "explain") if _group(records, s)]
+    plan_stages = [s for s in ("plan_mode_a", "plan_mode_b") if _group(records, s)]
+    if not stages and not plan_stages:
+        return []
+
+    lines = ["### What a student waits for", "",
+             "Wall-clock seconds, measured after warmup so model load is excluded. **TTFT** = "
+             "request sent → first content token.", ""]
+
+    if stages:
+        lines += [
+            "*Streaming call sites* — the student sees prose appear at TTFT, so this is the "
+            "perceived wait.", "",
+            "| Model | Stage | TTFT p50 | TTFT mean | TTFT p95 | Total p50 | n |",
+            "|---|---|---|---|---|---|---|",
+        ]
+        for model in sorted({r["model"] for r in records if r.get("stage") in stages}):
+            for stage in stages:
+                recs = [r for r in records if r.get("stage") == stage
+                        and r["model"] == model and not r.get("error")]
+                if not recs:
+                    continue
+                ttft = [r.get("ttft_s") for r in recs]
+                lines.append(
+                    f"| `{model}` | {stage} | {_stat(ttft, 'p50', 2)} "
+                    f"| {_stat(ttft, 'mean', 2)} | {_stat(ttft, 'p95', 2)} "
+                    f"| {_stat([r.get('total_s') for r in recs], 'p50')} | {len(recs)} |"
+                )
+        lines.append("")
+
+    if plan_stages:
+        lines += [
+            "*Structured plan call sites* — grammar-constrained JSON. Nothing is renderable "
+            "until the object closes, so **total** is the wait and TTFT is prompt processing "
+            "only. Mode A's TTFT is its first request's; under `--mitigate` its total covers "
+            "every retry, which is also what the student would sit through.", "",
+            "| Model | " + " | ".join(
+                f"{_mode_label(s)} TTFT p50 | {_mode_label(s)} total p50 | "
+                f"{_mode_label(s)} total p95"
+                for s in plan_stages
+            ) + " |",
+            "|---" * (3 * len(plan_stages) + 1) + "|",
+        ]
+        for model in sorted({r["model"] for r in records if r.get("stage") in plan_stages}):
+            cells = []
+            for stage in plan_stages:
+                recs = [r for r in records if r.get("stage") == stage
+                        and r["model"] == model and not r.get("error")]
+                cells += [
+                    _stat([r.get("ttft_s") for r in recs], "p50", 2),
+                    _stat([r.get("total_s") for r in recs], "p50"),
+                    _stat([r.get("total_s") for r in recs], "p95"),
+                ]
+            lines.append(f"| `{model}` | " + " | ".join(cells) + " |")
+        lines.append("")
+
+    return lines
+
+
 def _unsatisfiable_section(records: list[dict]) -> list[str]:
     """The scenario where the honest answer is "this doesn't fit".
 
@@ -326,6 +427,7 @@ def _errors_section(records: list[dict]) -> list[str]:
 def _guards(records: list[dict], cfg: dict, fixture_meta: dict) -> list[str]:
     lines: list[str] = []
     ok = True
+
 
     names = [m["name"] for m in cfg.get("models", [])]
     dupes = [n for n, c in Counter(names).items() if c > 1]
@@ -485,6 +587,7 @@ def generate_report(root: Path) -> Path:
     lines += _unsatisfiable_section(baseline)
     lines += _qa_section(baseline)
     lines += _explain_section(baseline)
+    lines += _latency_section(baseline)
 
     section = 2
     if mitigated:

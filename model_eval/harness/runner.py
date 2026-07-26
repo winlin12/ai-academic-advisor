@@ -113,7 +113,8 @@ def load_context(root: Path) -> EvalContext:
         fixture=fixture,
         prompts=PromptBuilder(fixture),
         questions=questions or [],
-        host=resolve_host(cfg["llamacpp"].get("host", "auto")),
+        host=resolve_host(cfg["llamacpp"].get("host", "auto"),
+                          cfg["llamacpp"].get("server_exe")),
     )
 
 
@@ -209,6 +210,10 @@ def run_mode_a(
     parse_failures = 0
     total_s = 0.0
     static_hash = ""
+    # TTFT of the FIRST call only. Under --mitigate this stage can make several round trips,
+    # but the student's wait begins once, and averaging a retry's TTFT into it would report a
+    # latency nobody experiences.
+    first_ttft: float | None = None
 
     last_exchange: tuple[str, str, str] = ("", "", "")
     for iteration in range(1, max_iterations + 1):
@@ -226,6 +231,8 @@ def run_mode_a(
                 "run_idx": run_idx, "mitigated": mitigate, "error": str(exc)}) + "\n")
             return
         total_s += res.total_s
+        if first_ttft is None:
+            first_ttft = res.ttft_s
         last_exchange = (system, user, res.text)
 
         parsed = scorers.extract_json(res.text)
@@ -274,6 +281,7 @@ def run_mode_a(
         "expect_unsatisfiable": scenario.expect_unsatisfiable,
         "static_hash": static_hash,
         "fixture_hash": ctx.fixture.fixture_hash,
+        "ttft_s": first_ttft,
         "total_s": total_s,
         "iterations": accepted,
         "proposal_parse_failed": best_proposal is None,

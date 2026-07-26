@@ -9,14 +9,27 @@
 # silently comparing models at different context sizes.
 
 llamacpp:
-  # Native Linux build, checked out at ./llama.cpp and run directly in this WSL box (no
-  # Windows interop) — build it with the usual `cmake -B build -DGGML_CUDA=on && cmake --build
-  # build --config Release -j`; the binary lands at build/bin/llama-server.
-  server_exe: "/home/wylin/ai-academic-advisor/llama.cpp/build/bin/llama-server"
-  models_root: "/home/wylin/ai-academic-advisor/models"
+  # The Windows CUDA 13.3 build (b10083), driven from WSL over interop. CUDA 13.x is not
+  # optional on this box: the 5070 Ti is Blackwell/sm_120 and the stock cuda-12.4 builds will
+  # not run on it (see setup/allow_wsl_llamacpp.ps1). A native Linux build would need the CUDA
+  # toolkit installed in WSL, which is not present — ./llama.cpp is an empty directory.
+  #
+  # server.py keys off the `.exe` suffix and switches topology: Windows-style paths via
+  # `wslpath -w`, bind 0.0.0.0 + connect to the NAT gateway, and taskkill.exe to stop. Point
+  # this back at a Linux binary and all three revert automatically.
+  server_exe: "/mnt/d/llm/llama.cpp/bin/llama-server.exe"
+  # The weights live on the Windows disk and are read through the WSL /mnt bridge. A native
+  # Linux llama-server opens these paths directly; the /mnt bridge is slower than ext4 on a
+  # cold load, which is what startup_timeout_s below is sized for.
+  models_root: "/mnt/d/llm/models"
 
-  # Native local process — no WSL/Windows interop, so plain loopback works.
-  host: "127.0.0.1"
+  # `auto` = let server.py resolve it: loopback for a native Linux binary, the NAT gateway
+  # (172.30.192.1 here) for the Windows .exe. VERIFIED 2026-07-25: from WSL, 127.0.0.1:8099
+  # refuses and 172.30.192.1:8099 answers, with no firewall rule needed — so
+  # setup/allow_wsl_llamacpp.ps1 did not have to be run on this machine.
+  # Set this to 127.0.0.1 ONLY if you switch .wslconfig to networkingMode=mirrored; an
+  # explicit value is always honoured verbatim.
+  host: "auto"
   # NOT 8080: the purdueio-api container already publishes 8080 on this box, and llama.cpp's
   # default would collide with it the moment mirrored networking or a port-proxy is involved.
   port: 8099
@@ -93,12 +106,17 @@ run:
 # ceiling and is NOT a deployment candidate. Compare within a bracket, and treat
 # reference-tier scores as "what we're giving up", never as "what we could ship".
 #
-# Trimmed to what's actually present under ./models (flat, not the D:\llm\models\<name>\<file>
-# layout the old Windows box used) after moving off the Windows/WSL-interop llama-server.
-# The rest of the old roster is commented out below — re-add an entry once its gguf is
-# downloaded into ./models, matching the flat layout.
+# LAYOUT: D:\llm\models\<name>\<file>.gguf, i.e. `gguf` is always "<dir>/<file>". An earlier
+# revision of this file assumed a flat ./models directory in WSL; that directory never
+# existed and several `gguf` values had drifted from the real filenames. Every entry below
+# was verified against `ls /mnt/d/llm/models` on 2026-07-25 — the enabled ones are byte-for-byte
+# present, the commented ones are not on the disk. Re-enable an entry only after its file
+# lands under models_root.
+#
+# HARDWARE, 2026-07-25 (the numbers the mlock/bracket choices below are made against):
+#   RTX 5070 Ti, 16 GB VRAM | 58 GB RAM visible to WSL (.wslconfig memory=60GB) | 406 GB free on D:
 models:
-  
+
   # THE ONE MODEL THAT BEAT gemma4-e4b ON THE SHIPPED PATH. In results_old (2026-07-22, the
   # 16 GB gaming box) it scored 24/24 grounded Mode A proposals with 0 parse failures at a
   # 5.2s median — the best Mode A result anywhere in the corpus, better than qwen3-next (80B,
@@ -116,11 +134,17 @@ models:
   #
   # Quant matched to results_old (Q4_K_M) on purpose — comparing a Q3 build against that
   # 24/24 would confound quantisation with scale and answer nothing.
+  #
+  # QUANT NOTE: this entry used to name `gemma-4-26B-A4B-it-UD-Q4_K_M.gguf` (an Unsloth UD
+  # build). What is actually on the disk is Google's own `google_gemma-4-26B-A4B-it-Q4_K_M`,
+  # 17.0 GB, and that is what runs. Both are Q4_K_M, so the results_old comparison still
+  # holds at the quant level, but they are not the same file — if a UD-vs-stock difference
+  # ever matters, download the UD build rather than relabelling this one.
   - name: "gemma4-26b"
-    gguf: "gemma4-26b/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"
+    gguf: "gemma4-26b/google_gemma-4-26B-A4B-it-Q4_K_M.gguf"
     bracket: server          # needs CPU-MoE expert offload; not an 8gb-bracket candidate
     think: false
-    mlock: false             # 16.95 GB — locking it OOMs unless the box has RAM to spare
+    mlock: false             # 17.0 GB — locking it plus KV cache is not worth the OOM risk
 
   # RE-ENABLED FOR A SECOND ATTEMPT. The 32 GB is installed as of 2026-07-25, so both of the
   # blockers below are now lifted. Its previous numbers are not a verdict on the model:
@@ -149,89 +173,114 @@ models:
     think: false
     mlock: false             # 21 GB — locking it OOMs even with 32 GB once KV cache is added
 
+  # PRESENT AS Qwen_Qwen3.5-9B-Q4_K_M.gguf — the `Qwen_` publisher prefix was missing from
+  # this entry, so it pointed at a file that does not exist.
   - name: "qwen3.5-9b"
-    gguf: "qwen3.5-9b/Qwen3.5-9B-Q4_K_M.gguf"
-    bracket: 8gb
-    think: false
-  - name: "gemma4-e4b"
-    gguf: "gemma4-e4b/gemma-4-E4B-it-Q4_K_M.gguf"
+    gguf: "qwen3.5-9b/Qwen_Qwen3.5-9B-Q4_K_M.gguf"
     bracket: 8gb
     think: false
   - name: "qwen2.5-coder-7b-instruct"     # the app's current default (backend LLAMACPP_MODEL)
-    gguf: "Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf"
+    gguf: "qwen2.5-coder-7b-instruct/Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf"
     bracket: coder
     think: false
   - name: "qwen3-8b"
     gguf: "qwen3-8b/Qwen_Qwen3-8B-Q4_K_M.gguf"
     bracket: 8gb
     think: false
-  # --- not present locally yet; re-enable once downloaded into ./models ---
-  # - name: "qwen2.5-7b"
-  #   gguf: "qwen2.5-7b/Qwen2.5-7B-Instruct-Q4_K_M.gguf"
-  #   bracket: 8gb
-  #   think: null
-  # - name: "gpt-oss-20b"
-  #   gguf: "gpt-oss-20b/gpt-oss-20b-MXFP4.gguf"
-  #   bracket: server
-  #   think: false          # gpt-oss reasoning may not fully disable; --reasoning off is best effort
-  # - name: "qwen3-coder-30b"
-  #   gguf: "qwen3-coder-30b/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"
-  #   bracket: server
-  #   think: false
-  # - name: "qwen3.6-27b"
-  #   gguf: "qwen3.6-27b/Qwen3.6-27B-Q4_K_M.gguf"
-  #   bracket: server
-  #   think: false
-  # - name: "glm-4.7-flash"
-  #   gguf: "glm-4.7-flash/zai-org_GLM-4.7-Flash-Q4_K_M.gguf"
-  #   bracket: server
-  #   think: false
-  # - name: "gemma4-26b"
-  #   gguf: "gemma4-26b/google_gemma-4-26B-A4B-it-Q4_K_M.gguf"
-  #   bracket: server
-  #   think: false
-  # - name: "nemotron-cascade-2"
-  #   gguf: "nemotron-cascade-2/nvidia_Nemotron-Cascade-2-30B-A3B-Q4_K_M.gguf"
-  #   bracket: server
-  #   think: false
-  # - name: "qwen3.5-9b"
-  #   gguf: "qwen3.5-9b/Qwen_Qwen3.5-9B-Q4_K_M.gguf"
+  - name: "qwen2.5-7b"
+    gguf: "qwen2.5-7b/Qwen2.5-7B-Instruct-Q4_K_M.gguf"
+    bracket: 8gb
+    think: null              # no reasoning switch — nothing is sent
+
+  - name: "qwen3-coder-30b"
+    gguf: "qwen3-coder-30b/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"
+    bracket: server
+    think: false
+    mlock: false             # 18.6 GB
+
+  # ON THE DISK BUT NEVER IN THIS FILE — downloaded 2026-07-24, added here 2026-07-25 so the
+  # roster matches the box. Architecture reads as `qwen35moe`: 40 blocks, 256 experts,
+  # 262144 native context, 21.4 GB at Q4_K_M. Same MoE shape as the qwen3.6-35b-a3b entry,
+  # hence the same bracket and the same --n-cpu-moe treatment. UNMEASURED — there is no
+  # results_old history for it, so its first sweep is its baseline, not a regression check.
+  - name: "nex-n2-mini"
+    gguf: "nex-agi_Nex-N2-mini/nex-agi_Nex-N2-mini-Q4_K_M.gguf"
+    bracket: server
+    think: false             # Qwen3.5-MoE lineage; --reasoning off is best effort, verify in the log
+    mlock: false             # 21.4 GB
+
+  # 48.5 GB — the largest thing on the disk. Fits in 58 GB of RAM with CPU-MoE offload, but
+  # only just once the KV cache is added, and essentially none of it lands in VRAM. Reference
+  # ceiling only; expect a latency that disqualifies it as a deployment candidate regardless
+  # of how good the plans are.
+  - name: "qwen3-next"
+    gguf: "qwen3-next/Qwen3-Next-80B-A3B-Instruct-Q4_K_M.gguf"
+    bracket: server
+    think: false
+    mlock: false             # 48.5 GB — locking this OOMs the box, full stop
+
+  # --- present on disk, deliberately NOT enabled ---
+  # Same model as the enabled qwen3.6-35b-a3b entry, at Q8 instead of Q4_K_M (38.5 GB). Running
+  # both answers "how much does quantisation cost us", which is a different question from the
+  # one this harness is pre-registered for — and doing it by accident would confound quant with
+  # scale everywhere in the report. Uncomment only to run that A/B on purpose.
+  # - name: "qwen3.6-35b-a3b-q8"
+  #   gguf: "qwen3.6-35b-a3b/Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf"
   #   bracket: reference
   #   think: false
-  # NOT a deployment candidate — 21 GB of GGUF needing ~32 GB RAM to hold with CPU-MoE offload
-  # (only 7.4 GB lands in VRAM), for a 45s median on the path the app actually ships vs 2.7s
-  # for gemma4-e4b. Kept as a ceiling measurement only.
+  #   mlock: false
+
+  # --- re-downloaded 2026-07-25; absent from the disk before that ---
+
+  # THE MODEL THAT WON THE SHIPPED PATH. results_old (2026-07-22) has it at 18/24 grounded
+  # Mode A proposals, a 2.7s median and a 3287 MB VRAM delta — the 8gb-bracket baseline every
+  # other candidate is measured against, which is why it was the first thing re-fetched.
   #
-  # RETEST BEFORE JUDGING IT. At 8192/1024/2048 it parse-failed Mode A on 21 of 24 runs, and
-  # every one of those failures was the same shape: it wrote multi-paragraph reasoning into the
-  # `rationale` string, exhausted max_plan_tokens, and never emitted the `reorder` key. That is
-  # a budget failure, not a reasoning failure, so the numbers in results_32gb/report.md do not
-  # yet say whether the model is good. The current 4096/8182 budgets are the retest — re-run
-  # with `python run.py run --models qwen3.6-35b-a3b` and check three things:
-  #   1. proposal_parse_failed  — if still high with 8182 tokens, it is unusable, drop it.
-  #   2. idle_credits           — its 1.4 violations/plan came with 47 idle credits/plan, the
-  #                               worst in the field. Low violations by scheduling nothing is
-  #                               not quality; read those two columns together.
-  #   3. median s               — even a perfect proposal at 45s is not shippable here.
-  # Note num_ctx does not need to be 32768 for this (see the A/B above); 8192 would be cheaper
-  # and is known not to change the outcome.
-  #- name: "qwen3.6-35b-a3b"
-  #  gguf: "qwen3.6-35b-a3b/Qwen_Qwen3.6-35B-A3B-Q4_K_M.gguf"
-  #  bracket: reference
-  #  think: false
-  # - name: "qwen3-next"
-  #   gguf: "qwen3-next/Qwen3-Next-80B-A3B-Instruct-Q4_K_M.gguf"
-  #   bracket: reference
-  #   think: false
-  #   mlock: false          # large — locking it can OOM depending on host RAM
-  # - name: "qwen3-coder-next"
-  #   # Qwen3NextForCausalLM, 48 layers / 512 experts / 10 active — same architecture family as
-  #   # qwen3-next above, hence the same constraints. Split into four shards; point at part 1
-  #   # and llama.cpp loads the rest itself.
-  #   gguf: "qwen3-coder-next/Qwen3-Coder-Next-Q4_K_M/Qwen3-Coder-Next-Q4_K_M-00001-of-00004.gguf"
-  #   bracket: reference
-  #   think: false
-  #   mlock: false          # large across shards — locking it can OOM depending on host RAM
+  # PROVENANCE CAVEAT: pulled from unsloth/gemma-4-E4B-it-GGUF (4.98 GB). Which repo produced
+  # the results_old copy was not recorded, and lmstudio-community (5.34 GB) and bartowski
+  # (5.41 GB) both publish a Q4_K_M under a near-identical name at a different size. If the new
+  # numbers diverge sharply from results_old, suspect the build before the model.
+  - name: "gemma4-e4b"
+    gguf: "gemma4-e4b/gemma-4-E4B-it-Q4_K_M.gguf"
+    bracket: server
+    think: false
+
+  # OpenAI's native MXFP4 build from ggml-org (12.1 GB) — not a Q4_K_M requant, so it is the
+  # one entry in the roster whose quantisation is not comparable to the rest by construction.
+  # It fits the 16 GB card whole, which is the point: reasoning-tier quality at a latency that
+  # could actually ship. Note the bracket is `server` for continuity with the old roster even
+  # though it does not need CPU-MoE offload.
+  - name: "gpt-oss-20b"
+    gguf: "gpt-oss-20b/gpt-oss-20b-MXFP4.gguf"
+    bracket: server
+    think: false          # gpt-oss reasoning may not fully disable; --reasoning off is best effort
+
+  # 30B-A3B, ~3.6B active, 18.5 GB. Published benchmarks put it top of the 30B class on
+  # reasoning (91.6 AIME25, 75.2 GPQA), so it is the strongest new candidate here — but those
+  # are thinking-mode numbers and this harness runs think: false, so expect the gap to the
+  # rest of the field to be much smaller than the leaderboards suggest.
+  - name: "glm-4.7-flash"
+    gguf: "glm-4.7-flash/zai-org_GLM-4.7-Flash-Q4_K_M.gguf"
+    bracket: server
+    think: false
+    mlock: false          # 18.5 GB
+
+  - name: "nemotron-cascade-2"
+    gguf: "nemotron-cascade-2/nvidia_Nemotron-Cascade-2-30B-A3B-Q4_K_M.gguf"
+    bracket: server
+    think: false
+    mlock: false          # 24.7 GB
+
+  # Qwen3NextForCausalLM, 48 layers / 512 experts / 10 active — same architecture family as
+  # qwen3-next above, hence the same constraints.
+  #
+  # NO LONGER SHARDED. The old entry pointed at part 1 of a 4-way split; upstream now ships a
+  # single 48.5 GB Q4_K_M file, so the path is the plain filename.
+  - name: "qwen3-coder-next"
+    gguf: "qwen3-coder-next/Qwen3-Coder-Next-Q4_K_M.gguf"
+    bracket: server
+    think: false
+    mlock: false          # 48.5 GB — locking it OOMs the box
 
 paths:
   plan_fixture: "plan_fixtures/cs_machine_intelligence.yaml"

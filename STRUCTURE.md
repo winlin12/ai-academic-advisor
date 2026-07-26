@@ -170,6 +170,9 @@ flags — "every model saw identical settings" is only true if one place owns th
 
 The headline task is **plan of study** (CS BS, Machine Intelligence), scored for viability:
 prerequisite ordering, term offerings, credit caps, hallucinated codes, requirement coverage.
+Latency is reported per call site: TTFT for the streaming ones (QA, explain-plan), total for
+the grammar-constrained JSON ones (the plan modes), because half a JSON plan renders as
+nothing.
 See [`model_eval/README.md`](model_eval/README.md).
 
 | File | Description |

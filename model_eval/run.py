@@ -108,7 +108,8 @@ def doctor() -> None:
 
     cfg = _cfg()
     port = cfg["llamacpp"]["port"]
-    host = resolve_host(cfg["llamacpp"].get("host", "auto"))
+    host = resolve_host(cfg["llamacpp"].get("host", "auto"),
+                        cfg["llamacpp"].get("server_exe"))
     print("=== local llama-server setup ===\n")
 
     exe = Path(cfg["llamacpp"]["server_exe"])
