@@ -1,0 +1,203 @@
+# =============================================================================
+# PUBLISHED SAMPLE 4-YEAR PLAN — Computer Science BS, Machine Intelligence track
+#
+#   THIS FILE IS PROMPT INPUT, NOT SCORING AUTHORITY.
+#
+# Nothing here decides whether a plan is viable. The scoring authority is and
+# remains `cs_machine_intelligence.yaml` — its catalog, its prereq edges, its
+# requirement groups. This file only supplies the reference plan that MODE C
+# puts in front of the model, and the slot map that the template-anchoring
+# diagnostic is computed against. It is therefore hashed into the Mode C
+# STATIC PROMPT hash (like every other prompt block), and deliberately NOT into
+# `fixture_hash` — adding it must not invalidate the Mode A/B results already on
+# disk, because it cannot change how they were scored.
+#
+# PROVENANCE:
+#   source ..... https://catalog.purdue.edu/preview_program.php?catoid=18&poid=33880
+#                "Sample 4-Year Plan", Computer Science, BS / Machine Intelligence
+#   catalog year  2026-2027, matching the scoring fixture's `program.catalog_year`.
+#                An earlier revision of this file transcribed the 2025-2026 plan
+#                by mistake. The two differ ONLY in placeholder rows — every named
+#                course and every cited alternative is identical — so the slot map
+#                and the anchoring metric are unaffected, but the prompt bytes and
+#                therefore the Mode C static hash are not. See "WHAT CHANGED"
+#                below; do not pool Mode C records across that edit.
+#   retrieved .. 2026-07-27, BY HAND. catalog.purdue.edu sits behind an AWS WAF
+#                JS challenge — an automated GET returns HTTP 202 and an
+#                interstitial, never the program page — so the ingester cannot
+#                fetch this and it has to be pasted from a browser per major.
+#                That upkeep cost is real; see README's Mode C section.
+#   transcription ... `text` is the catalog's own wording, condensed to one line
+#                per row. `code` is the fixture-catalog course that row places;
+#                rows without a `code` are placeholders the catalog itself does
+#                not resolve ("Elective", "Science Core Selection: Lab Science I").
+#                `also_cites` lists codes a row names that are NOT in the fixture
+#                catalog; it is what lets the harness tell a copied-from-the-
+#                template code apart from a free-hand invention.
+#
+#                AS OF 2026-07-27 `also_cites` IS EMPTY THROUGHOUT, and that is a
+#                deliberate outcome, not an oversight. All nine codes this plan
+#                cited — the five equivalents (MA 16500/16600/27101/35100,
+#                STAT 51100) and the four suggestions (CS 19300, CS 29100,
+#                CS 39100, COM 21700) — were adopted into the scoring fixture on
+#                that date, because charging a model a `hallucinated_course` for
+#                scheduling a course this very document dangled in front of it was
+#                scoring a legal plan as illegal. The field and the
+#                `off_catalog_from_reference` diagnostic stay in place for the next
+#                major's plan, but they read zero here by construction.
+#
+#                The four suggestions now carry `code:`, so they enter the slot
+#                map: the plan really does put CS 19300 in semester 1. They remain
+#                SUGGESTIONS filling generic Elective rows — they satisfy no
+#                requirement group — which is exactly what the `mi-no-filler`
+#                scenario tests a model's willingness to decline.
+#
+# WHAT CHANGED, 2025-2026 -> 2026-2027 (all in the placeholder rows):
+#   - Written Communication and the first-year composition slot are relabelled
+#     under the UCC (Science Core Selection: Written Communication (UCC: WC)).
+#   - NEW: "AI Working Competency (UCC: AI)", 1-3 cr, spring of year 1.
+#   - NEW: "Science, Technology & Society (UCC: STS)", 1-3 cr, spring of year 2,
+#     replacing a 3-credit elective there (term total 16-17 -> 14-18).
+#   - The generic "Science Core Selection" rows are now individually named:
+#     Language or Culture I/II/III, Technical Writing & Presentation, General
+#     Education I/II/III, Great Issues In Science, Lab Science I/II.
+#   - LAB SCIENCE MOVED TO YEAR 4. Both lab-science slots now sit in fall/spring
+#     of the 4th year. The scoring fixture's PHYS 17200 -> PHYS 24100 sequence is
+#     a prereq chain, so a model that anchors on this plan will schedule the
+#     science sequence very late — which is legal here, and worth watching in the
+#     per-scenario slot-match table for the short-horizon scenarios where it is
+#     not.
+#   - Spring of year 4 drops a Science Core row for an elective; year-3 spring
+#     and year-4 fall totals tighten by one credit (15-17 -> 15-16, 16-18 ->
+#     16-17).
+#
+# TWO KNOWN DISAGREEMENTS WITH THE SCORING FIXTURE — read before quoting a
+# Mode C number. `run.py check` prints both, so they are not a surprise:
+#
+#   1. FOLLOWING THIS PLAN LITERALLY DOES NOT COMPLETE THE DEGREE. Seven courses
+#      the fixture requires are never named in it: CS 37300, CS 38100,
+#      COM 11400, ENGL 10600, SCLA 10100, PHYS 17200, PHYS 24100. Most hide
+#      behind a placeholder ("Machine Intelligence Concentration course",
+#      "Science Core Selection: Lab Science I", "Written Communication") — but
+#      CS 38100 is a `cs-core` requirement that the published plan simply does
+#      not print. That is a property of the real document, not a transcription
+#      error, and noticing it is part of what Mode C tests.
+#   2. The generic rows still outnumber the named ones — 15 of 42 rows name a
+#      course the fixture knows (11 required, plus the 4 suggestions adopted on
+#      2026-07-27). A model "following the sample plan" is therefore still
+#      choosing most of the schedule itself.
+# =============================================================================
+
+source:
+  program: "Computer Science, BS — Machine Intelligence concentration"
+  url: "https://catalog.purdue.edu/preview_program.php?catoid=18&poid=33880"
+  catalog_year: "2026-2027"
+  retrieved: "2026-07-27"
+  title: "Sample 4-Year Plan"
+  # The catalog's own preamble, kept because it is the document telling the
+  # reader the thing Mode C is testing whether the model understands.
+  preamble: >-
+    The following sample plan of study is a suggested arrangement of courses.
+    Consultation with an advisor may result in an altered plan customized for an
+    individual student.
+  # The profile this plan describes. Mode C's prompt states it, because the
+  # eval's scenarios mostly do NOT match it and the model has to notice.
+  assumes: "a full-time student starting in fall with nothing completed"
+
+semesters:
+  - label: "Fall 1st Year"
+    term: fall
+    credits: "15-17"
+    entries:
+      - text: "CS 18000 - Problem Solving And Object-Oriented Programming — 4.00 cr"
+        code: "CS 18000"
+      - text: "MA 16100 - Plane Analytic Geometry And Calculus I (UCC: QR) — 5.00 cr, or MA 16500 - Analytic Geometry And Calculus I (UCC: QR) — 4.00 cr"
+        code: "MA 16100"
+      - text: "Science Core Selection: Written Communication (UCC: WC) — 3.00-4.00 cr"
+      - text: "Elective — 3.00 cr"
+      - text: "Elective — 1.00 cr (CS 19300 suggested.)"
+        code: "CS 19300"   # a suggestion, not a mandate — see header
+
+  - label: "Spring 1st Year"
+    term: spring
+    credits: "14-18"
+    entries:
+      - text: "CS 18200 - Foundations Of Computer Science — 3.00 cr"
+        code: "CS 18200"
+      - text: "CS 24000 - Programming In C — 3.00 cr"
+        code: "CS 24000"
+      - text: "MA 16200 - Plane Analytic Geometry And Calculus II (UCC: QR) — 5.00 cr, or MA 16600 - Analytic Geometry And Calculus II (UCC: QR) — 4.00 cr"
+        code: "MA 16200"
+      - text: "AI Working Competency (UCC: AI) — 1.00-3.00 cr"
+      - text: "Science Core Selection: Language or Culture I — 3.00-4.00 cr"
+
+  - label: "Fall 2nd Year"
+    term: fall
+    credits: "15-17"
+    entries:
+      - text: "CS 25000 - Computer Architecture — 4.00 cr"
+        code: "CS 25000"
+      - text: "CS 25100 - Data Structures And Algorithms — 3.00 cr"
+        code: "CS 25100"
+      - text: "MA 26100 - Multivariate Calculus (UCC: QR) — 4.00 cr, or MA 27101 - Honors Multivariate Calculus (UCC: QR) — 5.00 cr"
+        code: "MA 26100"
+      - text: "Science Core Selection: Language or Culture II — 3.00-4.00 cr"
+      - text: "Elective — 1.00 cr (CS 29100 recommended)"
+        code: "CS 29100"   # a suggestion, not a mandate — see header
+
+  - label: "Spring 2nd Year"
+    term: spring
+    credits: "14-18"
+    entries:
+      - text: "CS 25200 - Systems Programming — 4.00 cr"
+        code: "CS 25200"
+      - text: "MA 26500 - Linear Algebra (UCC: QR) — 3.00 cr, or MA 35100 - Elementary Linear Algebra (UCC: QR) — 3.00 cr"
+        code: "MA 26500"
+      - text: "Science Core Selection: Technical Writing & Presentation — 3.00-4.00 cr (COM 21700 suggested.)"
+        code: "COM 21700"   # a suggestion, not a mandate — see header
+      - text: "Science Core Selection: Language & Culture III — 3.00-4.00 cr"
+      - text: "Science Core Selection: Science, Technology & Society (UCC: STS) — 1.00-3.00 cr"
+
+  - label: "Fall 3rd Year"
+    term: fall
+    credits: "16-17"
+    entries:
+      - text: "STAT 35000 - Introduction To Statistics — 3.00 cr, or STAT 51100 - Statistical Methods — 3.00 cr"
+        code: "STAT 35000"
+      - text: "Machine Intelligence Concentration course — 3.00 cr"
+      - text: "Machine Intelligence Concentration course — 3.00 cr"
+      - text: "Science Core Selection: General Education I — 3.00-4.00 cr"
+      - text: "Elective — 1.00 cr (CS 39100 recommended)"
+        code: "CS 39100"   # a suggestion, not a mandate — see header
+      - text: "Elective — 3.00 cr"
+
+  - label: "Spring 3rd Year"
+    term: spring
+    credits: "15-16"
+    entries:
+      - text: "Machine Intelligence Concentration course — 3.00 cr"
+      - text: "Machine Intelligence Concentration course — 3.00 cr"
+      - text: "Science Core Selection: Great Issues In Science — 3.00 cr"
+      - text: "Science Core Selection: General Education II — 3.00-4.00 cr"
+      - text: "Elective — 3.00 cr"
+
+  - label: "Fall 4th Year"
+    term: fall
+    credits: "16-17"
+    entries:
+      - text: "Machine Intelligence Concentration course — 3.00 cr"
+      - text: "Science Core Selection: General Education III — 3.00 cr"
+      - text: "Science Core Selection: Lab Science I — 3.00-4.00 cr"
+      - text: "Elective — 3.00 cr"
+      - text: "Elective — 3.00 cr"
+      - text: "Elective — 1.00 cr"
+
+  - label: "Spring 4th Year"
+    term: spring
+    credits: "15-17"
+    entries:
+      - text: "Machine Intelligence Concentration course — 3.00 cr"
+      - text: "Science Core Selection: Lab Science II — 3.00-4.00 cr"
+      - text: "Elective — 3.00-4.00 cr"
+      - text: "Elective — 3.00 cr"
+      - text: "Elective — 3.00 cr"

@@ -25,7 +25,9 @@ worse).
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 
 from pydantic import ValidationError
 
@@ -50,20 +52,93 @@ DEFAULT_MAX_ITERATIONS = 3
 _SYSTEM_PROMPT = (
     "You are an assistant that tunes a college course plan from a student's feedback. You are "
     "NOT an official advisor and you must not invent courses, prerequisites, or requirements. "
-    "A deterministic planner ENFORCES legality (prerequisites, term offerings, credit caps); "
-    "you only express preferences over the courses already listed. Only use course codes and "
-    "tags that appear in the context. Leave a list empty if it does not apply. Never put a "
-    "course in both reorder and defer. "
-    # The credit cap is the one number the planner cannot infer from the feedback: it enforces
-    # whatever cap it is given, and the only way a student's "keep me at 12 credits" reaches it
-    # is this field. Saying only that the planner "owns credit caps" read as "not your job" —
-    # in the eval every model on every replicate of the explicit-cap scenario left
-    # max_credits_per_semester null and wrote the number into the rationale instead, where
-    # nothing consumes it.
-    "The credit cap is the exception: when the student asks for a specific per-semester credit "
-    "load, you MUST set max_credits_per_semester to that number. Writing it only in the "
-    "rationale has no effect."
+    "A deterministic planner ENFORCES legality (prerequisites, term offerings, credit caps, "
+    "and a limit on how many of the major's own courses share a semester); "
+    "you only express preferences over the courses already listed. "
+    # Without this, `reorder` reads as "put these in the first semester" and a model asked to
+    # prioritise the CS track lists five CS courses expecting all five to land at once. The
+    # planner spreads them instead, so the rationale it writes has to describe what will
+    # actually happen. Kept UP HERE, next to the other "what the planner does for you" text,
+    # so it is nowhere near the credit-cap paragraph below — see that comment.
+    "It will not put more than the stated number of major-subject courses in one semester, so "
+    "reordering several of them to the front moves them earlier in the ORDER — it does not "
+    "stack them into the same term. "
+    "Only use course codes and tags that appear in the context. Leave a list empty if it does "
+    "not apply. Never put a course in both reorder and defer. "
+    # LAST, AND SELF-CONTAINED. It used to open "The credit cap is the exception:" — fine when
+    # the preceding sentence was about the planner owning legality, ambiguous once a
+    # major-course sentence sat between them, because "the exception" then had two possible
+    # referents. model_eval 2026-07-29: gemma4-e4b went 2/3 -> 0/3 on the explicit-cap scenario
+    # when that text landed, while every other model held 3/3. Small models are evidently
+    # sensitive to anything nearby that reads as "caps are not your job", which is the exact
+    # failure this paragraph was written to fix. Name the field as the model's own job, and
+    # leave nothing after it.
+    "One thing IS yours to set: when the student asks for a specific per-semester credit load, "
+    "you MUST set max_credits_per_semester to that number. Writing it only in the rationale "
+    "has no effect."
 )
+
+
+# A student naming a number is a parsing problem, not a planning problem, and a regex is right
+# 100% of the time where the best model measured was right 0/3. model_eval 2026-07-29:
+# gemma4-e4b left max_credits_per_semester null on every replicate of the explicit-cap scenario
+# while the student had written "cap me at 12 credits a semester".
+#
+# FALLBACK, NOT AN OVERRIDE. The model's own value wins whenever it set one — this only fills
+# the field the model left empty, so a model that understood the request is never second-guessed
+# and the eval can still measure whether it understood.
+_CREDIT_CAP_PATTERNS = [
+    # "cap me at 12 credits", "keep me at/under 12 credits", "limit ... to 12 credits"
+    re.compile(r"(?:cap|keep|limit|hold|stay|max(?:imum)?|no more than|at most|under|below)"
+               r"[^.\n]{0,40}?(\b\d{1,2}\b)\s*(?:cr\b|credits?\b|credit hours?\b)", re.I),
+    # "12 credits a semester" / "12 credit semesters" with no leading verb
+    re.compile(r"\b(\d{1,2})\s*(?:cr\b|credits?\b|credit hours?\b)"
+               r"[^.\n]{0,20}?(?:a|per|each|every)\s+(?:semester|term)", re.I),
+]
+
+
+def extract_credit_cap(text: str, *, low: int = 1, high: int = 24) -> int | None:
+    """The per-semester credit load a student explicitly asked for, or None.
+
+    Deliberately conservative: it fires only on phrasings that name a number next to a credit
+    word, and it refuses anything outside a plausible course load, so "I finished 120 credits"
+    or "MA 16100 is 5 credits" cannot be mistaken for a cap.
+    """
+    if not text:
+        return None
+    for pattern in _CREDIT_CAP_PATTERNS:
+        for match in pattern.finditer(text):
+            value = int(match.group(1))
+            if low <= value <= high:
+                return value
+    return None
+
+
+def _proposal_schema(profile: StudentProfile, catalog: list[Course]) -> dict:
+    """PlanEditProposal's schema, narrowed to the codes and tags this student actually has.
+
+    Grammar-level grounding, not prompt-level. Free-form string fields let a model write a whole
+    semester layout ("FALL 2026:CS25000,CS25200,MA26100[14CR]") into a field that expects one
+    course code, or invent a tag like 'seminar' that no course carries — 16% of parsed proposals
+    in model_eval did exactly that, and ``_apply_proposal`` silently drops every one of them, so
+    the student's request disappears with no error anywhere. An enum makes those strings
+    undecodable instead, and costs nothing: constrained decoding over a short enum is cheaper
+    than free-form text.
+
+    Empty enums are skipped — an enum with no members is not a legal grammar.
+    """
+    schema = json.loads(PlanEditProposal.model_json_schema_json()) \
+        if hasattr(PlanEditProposal, "model_json_schema_json") \
+        else json.loads(json.dumps(PlanEditProposal.model_json_schema()))
+    known = {course.code for course in catalog}
+    codes = [code for code in profile.remaining_courses if code in known]
+    tags = sorted({tag for course in catalog for tag in course.requirement_tags})
+    if codes:
+        for field in ("reorder", "defer"):
+            schema["properties"][field]["items"] = {"type": "string", "enum": list(codes)}
+    if tags:
+        schema["properties"]["avoid_tags"]["items"] = {"type": "string", "enum": tags}
+    return schema
 
 
 def _course_context(profile: StudentProfile, catalog: list[Course]) -> str:
@@ -109,6 +184,12 @@ def _user_prompt(
 ) -> str:
     parts = [
         f"STUDENT: {profile.name} — {profile.degree_program}",
+        # Major load first, credit cap second: the credit cap is the only line here the model
+        # has to act on, so nothing sits between it and the feedback that could read as
+        # "somebody else handles the caps". See _SYSTEM_PROMPT's closing paragraph.
+        f"{profile.major_subject} courses per semester: at most "
+        f"{profile.max_major_courses_per_semester} (hard limit), "
+        f"{profile.preferred_major_courses_per_semester} or fewer preferred.",
         f"Current credit cap: {profile.max_credits_per_semester} per semester "
         f"(change it via max_credits_per_semester if the student asks for a different load).",
         "",
@@ -196,12 +277,26 @@ async def revise_plan(
     for iteration in range(1, max_iterations + 1):
         prompt = _user_prompt(profile, best_plan, catalog, feedback, prior_warnings)
         try:
-            proposal = await client.propose(_SYSTEM_PROMPT, prompt, PlanEditProposal)
+            proposal = await client.propose(
+                _SYSTEM_PROMPT, prompt, PlanEditProposal,
+                schema=_proposal_schema(profile, catalog),
+            )
         except (ModelResponseError, ValidationError) as exc:
             # Refusal, truncation, or a value outside the client-side constraints (e.g. a
             # credit cap past le=24) — keep the best legal plan so far instead of failing.
             logger.warning("revise-plan: unusable proposal on iteration %d: %s", iteration, exc)
             break
+
+        # DETERMINISTIC BACKSTOP for the one field the model must set itself. If the student
+        # named a per-semester load and the model left the field null, take the number from the
+        # text — a regex is right every time here, and the alternative is silently ignoring an
+        # explicit request. The model's own value always wins when it set one.
+        if proposal.max_credits_per_semester is None:
+            asked = extract_credit_cap(feedback)
+            if asked is not None:
+                logger.info("revise-plan: model left the credit cap null; using %d from the "
+                            "student's own wording", asked)
+                proposal = proposal.model_copy(update={"max_credits_per_semester": asked})
 
         revised_plan = generate_plan(_apply_proposal(profile, proposal, catalog), catalog)
         best_plan, best_proposal, accepted_iteration = revised_plan, proposal, iteration

@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import re
 import shutil
+import struct
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -70,6 +71,106 @@ def gpu_memory_used_mb() -> list[int] | None:
         return [int(x) for x in out.split()]
     except (OSError, subprocess.SubprocessError, ValueError):
         return None
+
+
+# Enough of the GGUF header to answer one question: how many blocks (transformer layers) does
+# this model have? Needed because llama.cpp counts MoE offload from the BOTTOM of the stack
+# (see resolve_n_cpu_moe) and the harness wants to express it from the top. Hand-rolled rather
+# than importing llama.cpp/gguf-py: that package is a submodule with its own numpy dependency,
+# and this reads one integer out of the first few KB of the file.
+#
+# Layout: "GGUF" | u32 version | u64 tensor_count | u64 kv_count | kv_count x (key, type, value)
+# where a key is u64 length + utf-8 bytes, and a value is typed by the enum below.
+_GGUF_SCALAR_FMT = {
+    0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i",
+    6: "<f", 7: "<?", 10: "<Q", 11: "<q", 12: "<d",
+}
+_GGUF_STRING, _GGUF_ARRAY = 8, 9
+
+
+def gguf_block_count(path: str | Path) -> int | None:
+    """The model's layer count from its own gguf metadata, or None if unreadable.
+
+    The key is architecture-prefixed (``gemma4.block_count``, ``qwen3moe.block_count``, ...),
+    so it is matched by suffix. Returning None rather than raising keeps a malformed or
+    truncated header from taking down a run that did not ask for layer-relative offload;
+    the caller decides whether it actually needed the number.
+    """
+    try:
+        with open(path, "rb") as f:
+            if f.read(4) != b"GGUF":
+                return None
+            _version, _n_tensors, n_kv = struct.unpack("<IQQ", f.read(20))
+
+            def read(fmt: str) -> Any:
+                return struct.unpack(fmt, f.read(struct.calcsize(fmt)))[0]
+
+            def skip_value(vtype: int) -> None:
+                if vtype in _GGUF_SCALAR_FMT:
+                    f.seek(struct.calcsize(_GGUF_SCALAR_FMT[vtype]), 1)
+                elif vtype == _GGUF_STRING:
+                    f.seek(read("<Q"), 1)
+                elif vtype == _GGUF_ARRAY:
+                    elem_type, count = read("<I"), read("<Q")
+                    if elem_type == _GGUF_STRING:      # tokenizer vocab lives here — 150k+
+                        for _ in range(count):         # entries, each length-prefixed
+                            f.seek(read("<Q"), 1)
+                    elif elem_type in _GGUF_SCALAR_FMT:
+                        f.seek(struct.calcsize(_GGUF_SCALAR_FMT[elem_type]) * count, 1)
+                    else:
+                        raise ValueError(f"unsupported gguf array element type {elem_type}")
+                else:
+                    raise ValueError(f"unsupported gguf value type {vtype}")
+
+            for _ in range(n_kv):
+                key = f.read(read("<Q")).decode("utf-8", "replace")
+                vtype = read("<I")
+                if key.endswith(".block_count") and vtype in _GGUF_SCALAR_FMT:
+                    return int(read(_GGUF_SCALAR_FMT[vtype]))
+                skip_value(vtype)
+    except (OSError, struct.error, ValueError):
+        return None
+    return None
+
+
+def resolve_n_cpu_moe(
+    run: dict[str, Any], model_cfg: dict[str, Any], gguf_path: str | Path
+) -> int | None:
+    """Turn whichever MoE-offload knob was configured into the ``--n-cpu-moe N`` llama.cpp wants.
+
+    llama.cpp has exactly one MoE-offload count and it points the wrong way for comparing
+    models: ``--n-cpu-moe N`` keeps the experts of the FIRST N layers in system RAM, so N is
+    "how much is *not* on the card" and its meaning changes with the model's depth. 35 is a
+    saturating no-op on a 30-block model and leaves half the experts resident on a 64-block
+    one — the same config line describing two different machines.
+
+    ``n_gpu_moe`` states the other end: keep the experts of N layers on the GPU. That is the
+    quantity VRAM is actually spent on, so it is the one that transfers between models, and
+    the harness resolves it per model as ``block_count - n_gpu_moe``.
+
+    Per-model entries override the run-level default; the two knobs are mutually exclusive
+    within a level, since they would otherwise silently disagree about the same split.
+    """
+    for source, where in ((model_cfg, f"model {model_cfg.get('name', '?')}"), (run, "run")):
+        n_gpu_moe, n_cpu_moe = source.get("n_gpu_moe"), source.get("n_cpu_moe")
+        if n_gpu_moe is not None and n_cpu_moe is not None:
+            raise ValueError(
+                f"{where} sets both n_gpu_moe ({n_gpu_moe}) and n_cpu_moe ({n_cpu_moe}); "
+                "they describe the same split from opposite ends — set one."
+            )
+        if n_cpu_moe is not None:
+            return int(n_cpu_moe)
+        if n_gpu_moe is not None:
+            blocks = gguf_block_count(gguf_path)
+            if blocks is None:
+                raise ValueError(
+                    f"{where} sets n_gpu_moe={n_gpu_moe}, which needs the model's layer count, "
+                    f"but no block_count could be read from {gguf_path}. Use n_cpu_moe instead."
+                )
+            # Clamped, not an error: n_gpu_moe >= depth is the legitimate way to say "all
+            # experts on the card", and 0 is --cpu-moe.
+            return max(0, blocks - int(n_gpu_moe))
+    return None
 
 
 def is_windows_exe(server_exe: str | Path | None) -> bool:
@@ -248,6 +349,51 @@ class ServerHandle:
             pass
 
 
+def slot_context(run: dict[str, Any]) -> int:
+    """The context ONE request actually gets: ``num_ctx // parallel``.
+
+    The number that matters for "does my prompt plus my token budget fit", and the one that is
+    easy to get wrong, because config names `num_ctx` and llama.cpp reports the slot's share.
+    """
+    return int(run["num_ctx"]) // max(1, int(run.get("parallel", 1)))
+
+
+# Chars per token for THIS harness's prompts, measured rather than assumed. The usual "4" is an
+# English-prose figure and it badly underestimates the Mode B prompt, which is now a database
+# export: braces, quotes, colons and course codes all tokenise far worse than prose. MEASURED
+# 2026-07-30 against a live gemma4-e4b — a 33.7k-character Mode B prompt reported
+# prompt_eval_count 11,458, i.e. 2.94 chars/token, against the 8,400 that /4 predicted. A 36%
+# underestimate is not a rounding error here: it is the difference between `check` passing and a
+# run silently truncating every plan request against the context.
+CHARS_PER_TOKEN = 2.9
+
+
+def approx_tokens(text: str) -> int:
+    return int(len(text) / CHARS_PER_TOKEN)
+
+
+def check_slot_context(run: dict[str, Any], longest_prompt_tokens: int) -> str | None:
+    """Complain if a slot cannot hold the longest prompt plus the biggest token budget.
+
+    Returns a message, or None when it fits. This is the failure `--parallel` invites: at
+    num_ctx 16384 two slots is 8192 and still fits a ~2.9k prompt with a 4096 budget, but four
+    slots is 4096 — smaller than the budget alone — and every plan request would be truncated by
+    the context rather than by the budget, silently, on every model at once.
+    """
+    slot = slot_context(run)
+    budget = max(int(run.get("max_plan_tokens", 0)), int(run.get("max_output_tokens", 0)))
+    needed = longest_prompt_tokens + budget
+    if needed <= slot:
+        return None
+    return (
+        f"per-slot context is {slot} tokens (num_ctx {run['num_ctx']} / parallel "
+        f"{run.get('parallel', 1)}), but the longest prompt (~{longest_prompt_tokens}) plus the "
+        f"largest token budget ({budget}) needs ~{needed}. Requests would be cut off by the "
+        f"CONTEXT instead of the budget — which is not a model fault and is scored as if it "
+        f"were. Lower `parallel`, raise `num_ctx`, or lower the token budgets."
+    )
+
+
 def build_argv(cfg: dict[str, Any], model_cfg: dict[str, Any], host: str) -> list[str]:
     """The single place a llama-server command line is constructed.
 
@@ -258,7 +404,8 @@ def build_argv(cfg: dict[str, Any], model_cfg: dict[str, Any], host: str) -> lis
     llama = cfg["llamacpp"]
     run = cfg["run"]
     windows = is_windows_exe(llama["server_exe"])
-    gguf = to_server_path(Path(llama["models_root"]) / model_cfg["gguf"], windows=windows)
+    gguf_local = Path(llama["models_root"]) / model_cfg["gguf"]   # readable from this side
+    gguf = to_server_path(gguf_local, windows=windows)            # openable by the server
 
     # The bind address is not the connect address under interop: the server binds on the
     # Windows side, where this box's loopback means the wrong machine. 0.0.0.0 is what makes
@@ -277,7 +424,14 @@ def build_argv(cfg: dict[str, Any], model_cfg: dict[str, Any], host: str) -> lis
         "--cache-type-k", run["cache_type_k"],
         "--cache-type-v", run["cache_type_v"],
         "--jinja",                       # each gguf's own chat template, exactly like the app
-        "--parallel", "1",
+        # SLOTS. llama.cpp divides the context between them — the per-request window is
+        # `--ctx-size / --parallel`, not `--ctx-size` (MEASURED: -c 16384 --parallel 2 reports
+        # n_ctx 8192 per slot). So raising this silently shrinks what a single request may use,
+        # and `slot_context()` below is what stops that going unnoticed.
+        #
+        # The runner issues one request at a time, so anything above 1 sits idle while costing
+        # context. It is here so the eval can be run at the deployment's real slot count.
+        "--parallel", str(run.get("parallel", 1)),
         "--no-mmap",
         "--no-webui",
         # Debug verbosity is REQUIRED, not optional: it is the only level at which this build
@@ -286,9 +440,12 @@ def build_argv(cfg: dict[str, Any], model_cfg: dict[str, Any], host: str) -> lis
         "-lv", str(llama.get("log_verbosity", 5)),
     ]
     # MoE expert offload to CPU. A no-op on dense models, so it is applied uniformly rather
-    # than conditionally — one fewer axis on which models differ.
-    if run.get("n_cpu_moe") is not None:
-        argv += ["--n-cpu-moe", str(run["n_cpu_moe"])]
+    # than conditionally — one fewer axis on which models differ. Configured either as
+    # `n_cpu_moe` (llama.cpp's own bottom-up count) or `n_gpu_moe` (layers of experts kept on
+    # the card, resolved against this model's depth); see resolve_n_cpu_moe.
+    n_cpu_moe = resolve_n_cpu_moe(run, model_cfg, gguf_local)
+    if n_cpu_moe is not None:
+        argv += ["--n-cpu-moe", str(n_cpu_moe)]
     # Reasoning off at launch: the only switch that behaves the same across Qwen3, gpt-oss
     # and GLM templates. Per-request chat_template_kwargs is a backstop in the client.
     if model_cfg.get("think") is False:

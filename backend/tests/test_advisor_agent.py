@@ -21,11 +21,16 @@ class _StubClient:
         self.model = "stub-model"
         self._responses = list(responses)
         self.prompts: list[str] = []
+        self.schemas: list[dict | None] = []
 
     async def propose(
-        self, system_prompt: str, user_prompt: str, output_type: type[PlanEditProposal]
+        self, system_prompt: str, user_prompt: str, output_type: type[PlanEditProposal],
+        schema: dict | None = None,
     ) -> PlanEditProposal:
         self.prompts.append(user_prompt)
+        # Mirrors the real client: callers may narrow the schema per request (course-code and
+        # tag enums built from this student's own courses). Captured so a test can assert on it.
+        self.schemas.append(schema)
         return self._responses.pop(0)
 
 
@@ -84,7 +89,8 @@ def test_revise_plan_falls_back_to_baseline_on_refusal():
     class _RefusingClient:
         model = "stub"
 
-        async def propose(self, system_prompt: str, user_prompt: str, output_type) -> PlanEditProposal:
+        async def propose(self, system_prompt: str, user_prompt: str, output_type,
+                          schema: dict | None = None) -> PlanEditProposal:
             raise ModelResponseError("stop_reason=refusal")
 
     result = asyncio.run(revise_plan(_profile(), load_catalog(), "whatever", client=_RefusingClient()))
@@ -92,3 +98,48 @@ def test_revise_plan_falls_back_to_baseline_on_refusal():
     # No usable proposal -> the baseline plan is returned unchanged, flagged as 0 iterations.
     assert result.iterations == 0
     assert result.plan.semesters
+
+
+def test_proposal_schema_is_narrowed_to_this_student_and_catalog():
+    """Grammar-level grounding: the model must not be *able* to name a course or tag that
+    doesn't exist. 16% of parsed proposals in model_eval were ungrounded — whole semester
+    layouts written into `reorder`, tags like 'seminar' invented wholesale — and every one was
+    silently dropped by _apply_proposal, costing the student their request with no error."""
+    from app.services.advisor_agent import _proposal_schema
+
+    catalog = load_catalog()
+    profile = _profile()
+    schema = _proposal_schema(profile, catalog)
+
+    for field in ("reorder", "defer"):
+        assert schema["properties"][field]["items"]["enum"] == profile.remaining_courses, field
+    tags = schema["properties"]["avoid_tags"]["items"]["enum"]
+    assert tags == sorted(set(tags)) and "required" in tags
+    # ...and the narrowed schema is what actually reaches the client.
+    client = _StubClient([PlanEditProposal(rationale="ok")])
+    asyncio.run(revise_plan(profile, catalog, "make it lighter", client=client))
+    assert client.schemas[0] is not None
+    assert client.schemas[0]["properties"]["reorder"]["items"]["enum"]
+
+
+def test_credit_cap_is_recovered_from_the_students_own_wording():
+    """The one field the model must set itself, backstopped deterministically.
+
+    A student naming a number is a parsing problem, and a regex is right every time where the
+    best model measured in model_eval was right 0/3 — it left the field null and wrote the
+    number into the rationale, where nothing consumes it.
+    """
+    client = _StubClient([PlanEditProposal(rationale="sure", max_credits_per_semester=None)])
+    result = asyncio.run(revise_plan(
+        _profile(), load_catalog(), "please cap me at 12 credits a semester", client=client))
+
+    assert result.proposal.max_credits_per_semester == 12
+    assert all(s.total_credits <= 12 for s in result.plan.semesters)
+
+
+def test_credit_cap_backstop_never_overrides_the_model():
+    client = _StubClient([PlanEditProposal(rationale="sure", max_credits_per_semester=9)])
+    result = asyncio.run(revise_plan(
+        _profile(), load_catalog(), "please cap me at 12 credits a semester", client=client))
+
+    assert result.proposal.max_credits_per_semester == 9

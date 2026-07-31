@@ -63,9 +63,9 @@ bundled fixture when that DB is unavailable.
 | `models/schemas.py` | All Pydantic request/response models: `Course`, `StudentProfile`, `PlanResponse`/`SemesterPlan`/`PlannedCourse`, academic-DB models (`AcademicProgramDetail`, `RequirementBlockDetail`, ...), persistence models (`StudentRecord`, `SavedPlan`), admin models (`AdminTableInfo`, `AdminTablesResponse`, `AdminTableRowsResponse`), advisor models (`AdvisorAskRequest/Response`, `RevisePlanRequest/Response`, `PlanEditProposal`), plan-edit models (`PlanEditRequest` with the `move`/`add`/`remove` Literal and a validator requiring `target_semester` for placements), and typed envelopes (`ExplainPlanRequest/Response` — `plan` is a structured `PlanResponse`, not a `dict` — and `AcademicCourseSearchResponse`). |
 | `services/catalog.py` | Loads the bundled 8-course `data/courses.json` fixture. This is the **offline fallback** catalog used when the academic DB is unreachable or a course code isn't found there — not dead code, but not the primary data source either. |
 | `services/academic_db.py` | Read-only queries against the real `catalog_ingestion` Postgres DB (`catalog_years → programs → requirement_groups → requirement_options → courses`), mapped onto the API's response models. Powers `/academic/*`. |
-| `services/planner.py` | The deterministic planner core: given a profile + a catalog (list of `Course`), greedily schedules remaining courses across semesters respecting credit caps, warns on issues. `next_term()` advances fall→spring→summer→fall, crossing year boundaries correctly. Pure/no I/O — this is the "source of truth" the LLM proposals are always re-validated against. |
+| `services/planner.py` | The deterministic planner core: given a profile + a catalog (list of `Course`), greedily schedules remaining courses across semesters respecting BOTH load caps — credits per semester, and how many of the major's own courses (`is_major_course`) may share one term — and warns on issues. `next_term()` advances fall→spring→summer→fall, crossing year boundaries correctly. Pure/no I/O — this is the "source of truth" the LLM proposals are always re-validated against. |
 | `services/planner_catalog.py` | Bridges `planner.py` to the real database: builds a `Course` catalog from DB rows instead of the fixture, and when `StudentProfile.program_id` is set, derives `remaining_courses` from that program's actual requirement rows (with choose-N selection logic) instead of trusting client-supplied course codes. Falls back to the fixture catalog on DB errors for profiles without a `program_id`. |
-| `services/plan_editor.py` | Deterministic direct-edit engine behind `POST /v1/plan/edit` (TODO Priority 2). Applies one `move`/`add`/`remove` to a plan layout and re-validates it *placement-preservingly* — prereqs via `planner.prereqs_satisfied` (never re-implemented), term offerings, credit caps — surfacing violations as warnings instead of reflowing the student's manual placement. Course facts come from the DB (`fetch_courses_by_codes`) with the fixture as offline fallback; no LLM involved. |
+| `services/plan_editor.py` | Deterministic direct-edit engine behind `POST /v1/plan/edit` (TODO Priority 2). Applies one `move`/`add`/`remove` to a plan layout and re-validates it *placement-preservingly* — prereqs via `planner.prereqs_satisfied` (never re-implemented), term offerings, credit caps, major-course load — surfacing violations as warnings instead of reflowing the student's manual placement. Course facts come from the DB (`fetch_courses_by_codes`) with the fixture as offline fallback; no LLM involved. |
 | `services/advisor_agent.py` | The "AI proposes, planner disposes" revise-plan agent. Sends the profile + baseline plan + free-text feedback to the local llama.cpp model via `LlamaCppClient.propose()`, gets back a schema-enforced `PlanEditProposal` (reorder/defer/avoid-tags/credit-cap — never a raw schedule), applies it, and re-validates through `planner.py` with a retry loop if the result is worse than the baseline. |
 | `services/students_db.py` | Thin JSONB store/fetch for the `students` and `plans` Postgres tables (profiles and plans stored exactly as the API serializes them). Backs the `/students*` routes, which the web client now uses for onboarding + plan autosave. |
 | `services/admin_db.py` | Read-only browsing service behind `/v1/admin/*` (TODO Priority 6): explicit `BROWSABLE_TABLES` whitelist (anything else raises `UnknownTableError` → 404), rows serialized as JSONB via `to_jsonb` (Postgres handles UUID/timestamp conversion), `academic_rules`' pgvector `embedding` column stripped, `ctid`-ordered pagination clamped to 200 rows/page. No write paths exist. |
@@ -84,7 +84,7 @@ bundled fixture when that DB is unavailable.
 
 | File | Description |
 |------|-------------|
-| `test_planner.py` | Exercises `generate_plan()` against the bundled fixture catalog — semester generation, credit caps, warnings. |
+| `test_planner.py` | Exercises `generate_plan()` against the bundled fixture catalog — semester generation, credit caps, the soft/hard major-course cap, warnings. |
 | `test_planner_catalog.py` | Tests the planner↔DB bridge with DB calls monkeypatched: code normalization, row→`Course` mapping, choose-N selection, and the fixture fallback when the DB is down. |
 | `test_plan_editor.py` | Tests the direct-edit engine against the fixture catalog injected straight into `apply_plan_edit` (no DB, no HTTP): move/add/remove semantics, prereq/term/credit-cap warnings, code normalization, input-plan immutability, and the `PlanEditRequest` validator. |
 | `test_admin_db.py` | Tests the admin browsing service's pure parts (no DB): whitelist rejection (incl. injection-shaped names), hidden-column projection, page-size clamping via a faked connection. |
@@ -169,7 +169,12 @@ no FastAPI/pydantic/Postgres, so it runs on whichever box holds the GPU. It star
 flags — "every model saw identical settings" is only true if one place owns the command line.
 
 The headline task is **plan of study** (CS BS, Machine Intelligence), scored for viability:
-prerequisite ordering, term offerings, credit caps, hallucinated codes, requirement coverage.
+prerequisite ordering, term offerings, credit caps, major-course load, hallucinated codes, requirement coverage.
+It runs in three arms: **Mode A** (the shipped path — model proposes a `PlanEditProposal`, the
+deterministic planner disposes), **Mode B** (the model builds the whole schedule; no production
+call site does this), and **Mode C** (Mode B plus Purdue's published sample 4-year plan in the
+prompt, nothing else changed — an intervention test on whether a known-good ordering fixes
+Mode B's ordering failures, or just gets copied onto students it doesn't describe).
 Latency is reported per call site: TTFT for the streaming ones (QA, explain-plan), total for
 the grammar-constrained JSON ones (the plan modes), because half a JSON plan renders as
 nothing.
@@ -181,14 +186,15 @@ See [`model_eval/README.md`](model_eval/README.md).
 | `config.yaml` | Every knob that could pollute a comparison: `num_ctx`, KV type, GPU layers, sampling, per-model gguf paths under `D:\llm\models\`, decision thresholds. |
 | `run.py` | CLI: `doctor` (networking), `check` (fixture/prompt validity), `serve`, `run`, `report`, `parity`, `fixture-check`. |
 | `questions.yaml` | Grounded-QA items with their retrieved chunks **pinned in the file** — retrieval belongs to the embedding model, so pinning it keeps QA scores about the chat model. |
-| `plan_fixtures/cs_machine_intelligence.yaml` | **The scoring authority**: 34-course catalog with prereq edges and term offerings, 9 requirement groups, 8 student scenarios. `verified: false` — read its provenance header. |
+| `plan_fixtures/cs_machine_intelligence.yaml` | **The scoring authority**: 43-course catalog with prereq edges and term offerings, 9 requirement groups, 9 student scenarios. Includes five `equivalent_to` substitutes (MA 16500 for MA 16100, …) and four `suggested-elective` courses the published plan recommends. `verified: false` — read its provenance header. |
+| `plan_fixtures/cs_machine_intelligence.sample_plan.yaml` | Mode C's reference material: Purdue's published sample 4-year plan, hand-saved (catalog.purdue.edu is behind an AWS WAF JS challenge). **Prompt input, not scoring authority** — it decides no viability check, so it stays out of `fixture_hash` and rides in Mode C's static prompt hash. |
 | `setup/allow_wsl_llamacpp.ps1` | The one Windows Firewall rule that lets WSL reach llama-server on the host. |
 | `harness/server.py` | llama-server lifecycle over WSL interop: builds argv from config, waits for `/health`, counts per-layer GPU offload from stderr, stops between models. |
 | `harness/llamacpp_client.py` | Streaming stdlib client for `/v1/chat/completions` (the same endpoint the app uses). TTFT, token counts, llama.cpp's own timings. |
 | `harness/planner.py` | **Vendored copy** of `backend/app/services/planner.py` + `advisor_agent._apply_proposal`, so Mode A replays the app's real revise-plan path without importing it. `run.py parity` guards the drift. |
 | `harness/fixtures.py` | Loads the plan fixture; ports `planner_catalog.select_remaining_courses` so Mode A starts from production's baseline. |
 | `harness/plan_scorers.py` | Plan viability, requirement coverage, scenario assertions, proposal groundedness — all automatic and decidable. |
-| `harness/prompts.py` | Static-first prompts mirroring the app's four live LLM call sites; sha256 of each static block travels with every record. |
+| `harness/prompts.py` | Static-first prompts mirroring the app's four live LLM call sites, plus Mode C's appended reference block; sha256 of each static block travels with every record. |
 | `harness/scorers.py` | JSON extraction plus the *heuristic* faithfulness/recall/abstention checks. |
 | `harness/runner.py` | Orchestration: server lifecycle, warmup + discard, VRAM delta, N replicates. Plan tasks run first. |
 | `harness/report.py` | `results/report.md`: plan tables first, validity guards, manual review queue. No composite score. |

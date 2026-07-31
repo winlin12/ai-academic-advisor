@@ -9,6 +9,10 @@ class Course(BaseModel):
     title: str
     credits: int = Field(ge=0)
     prereqs: list[str] = Field(default_factory=list)
+    # Satisfied by taking the course earlier OR in the same semester. The planner is
+    # deliberately conservative and requires them earlier (always legal); only validation that
+    # judges a plan the student already built applies the looser same-semester rule.
+    coreqs: list[str] = Field(default_factory=list)
     offered_terms: list[str] = Field(default_factory=list)
     requirement_tags: list[str] = Field(default_factory=list)
     workload_score: int = Field(default=3, ge=1, le=5)
@@ -110,6 +114,20 @@ class StudentProfile(BaseModel):
     start_year: int = 2026
     semesters_to_plan: int = Field(default=4, ge=1, le=12)
     max_credits_per_semester: int = Field(default=9, ge=1, le=24)
+    # The load to AIM FOR, as opposed to the load never to exceed. None = derive it per term as
+    # the even split of the credits left over the semesters left, which spreads a plan across
+    # the student's whole horizon instead of filling early terms to the cap and leaving the
+    # tail empty. Set it equal to max_credits_per_semester for the old front-loading shape.
+    target_credits_per_semester: int | None = Field(default=None, ge=1, le=24)
+    # A second load cap, on how many of the MAJOR's own courses land in one term. Credits alone
+    # cannot express it: four 4-credit CS courses and one CS course plus three gen-eds are both
+    # 16 credits and nothing like the same semester. ``max_`` is never exceeded (the course
+    # moves to a later term instead); ``preferred_`` is only relaxed when nothing else fits the
+    # room left in the term. Students overwhelmingly report 3 as the ceiling and 2 as the
+    # comfortable load, which is what these defaults are.
+    major_subject: str = "CS"
+    max_major_courses_per_semester: int = Field(default=3, ge=1, le=8)
+    preferred_major_courses_per_semester: int = Field(default=2, ge=1, le=8)
     preferences: dict[str, str | int | bool | list[str]] = Field(default_factory=dict)
 
 
@@ -245,8 +263,21 @@ class PlanEditProposal(BaseModel):
     validates — there is no JSON-repair path.
     """
 
+    # max_length is LOAD-BEARING, not tidiness. llama.cpp turns this schema into a GBNF
+    # grammar, and a bare `"type": "string"` accepts any number of characters — so the
+    # grammar constrains the SHAPE of the proposal and nothing about its size. model_eval
+    # 2026-07-29 caught what that costs: with thinking disabled at the template level,
+    # qwen3.6-35b-a3b relocated its reasoning INTO this field, wrote a 14,690-character
+    # rationale on one scenario, and on three others fell into a verbatim repetition loop
+    # ("I will output empty lists. But wait, I..." x11) that ran to the token ceiling
+    # without ever closing the JSON — 9 of 28 proposals lost, ~390 s each. Nothing else in
+    # the stack can stop that: temperature 0.15 makes a loop absorbing, and llama.cpp
+    # disables repetition penalties by default (penalty_repeat 1.0, dry_multiplier 0.0).
+    # A maxLength makes it structurally impossible instead of merely discouraged, and it
+    # enforces the "one or two sentences" this description already asks for.
     rationale: str = Field(
         default="",
+        max_length=400,
         description="One or two sentences explaining the change, addressed to the student.",
     )
     reorder: list[str] = Field(

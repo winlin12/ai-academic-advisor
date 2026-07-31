@@ -1,0 +1,83 @@
+[
+  {
+    "id": "cs-core",
+    "program_id": "cs-bs-machine-intelligence",
+    "parent_group_id": null,
+    "name": "Computer Science Core",
+    "requirement_type": "all_of",
+    "credits_min": 24.0,
+    "raw_text": "Take all of the following."
+  },
+  {
+    "id": "mi-required",
+    "program_id": "cs-bs-machine-intelligence",
+    "parent_group_id": null,
+    "name": "Machine Intelligence — required",
+    "requirement_type": "all_of",
+    "credits_min": 3.0,
+    "raw_text": "Take all of the following."
+  },
+  {
+    "id": "mi-ai-choice",
+    "program_id": "cs-bs-machine-intelligence",
+    "parent_group_id": null,
+    "name": "Machine Intelligence — AI course (choose one)",
+    "requirement_type": "choose_credits",
+    "credits_min": 3.0,
+    "raw_text": "Choose 3 credits from the following."
+  },
+  {
+    "id": "mi-selective",
+    "program_id": "cs-bs-machine-intelligence",
+    "parent_group_id": null,
+    "name": "Machine Intelligence — selectives (choose two)",
+    "requirement_type": "choose_credits",
+    "credits_min": 6.0,
+    "raw_text": "Choose 6 credits from the following."
+  },
+  {
+    "id": "cs-elective",
+    "program_id": "cs-bs-machine-intelligence",
+    "parent_group_id": null,
+    "name": "Additional CS courses at the 400 level",
+    "requirement_type": "choose_credits",
+    "credits_min": 6.0,
+    "raw_text": "Choose 6 credits from the following."
+  },
+  {
+    "id": "mathematics",
+    "program_id": "cs-bs-machine-intelligence",
+    "parent_group_id": null,
+    "name": "Mathematics And Statistics",
+    "requirement_type": "all_of",
+    "credits_min": 20.0,
+    "raw_text": "Take all of the following."
+  },
+  {
+    "id": "science",
+    "program_id": "cs-bs-machine-intelligence",
+    "parent_group_id": null,
+    "name": "Laboratory Science Sequence",
+    "requirement_type": "all_of",
+    "credits_min": 7.0,
+    "raw_text": "Take all of the following."
+  },
+  {
+    "id": "gen-ed-core",
+    "program_id": "cs-bs-machine-intelligence",
+    "parent_group_id": null,
+    "name": "University Core — written, oral, humanities",
+    "requirement_type": "all_of",
+    "credits_min": 10.0,
+    "raw_text": "Take all of the following."
+  },
+  {
+    "id": "gen-ed-selective",
+    "program_id": "cs-bs-machine-intelligence",
+    "parent_group_id": null,
+    "name": "University Core — additional selectives",
+    "requirement_type": "choose_credits",
+    "credits_min": 6.0,
+    "raw_text": "Choose 6 credits from the following."
+  }
+]

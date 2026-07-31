@@ -1,0 +1,247 @@
+[
+  {
+    "requirement_group_id": "cs-core",
+    "course_code": "CS 18000",
+    "credits": 4.0
+  },
+  {
+    "requirement_group_id": "cs-core",
+    "course_code": "CS 18200",
+    "credits": 3.0
+  },
+  {
+    "requirement_group_id": "cs-core",
+    "course_code": "CS 24000",
+    "credits": 3.0
+  },
+  {
+    "requirement_group_id": "cs-core",
+    "course_code": "CS 25000",
+    "credits": 4.0
+  },
+  {
+    "requirement_group_id": "cs-core",
+    "course_code": "CS 25100",
+    "credits": 3.0
+  },
+  {
+    "requirement_group_id": "cs-core",
+    "course_code": "CS 25200",
+    "credits": 4.0
+  },
+  {
+    "requirement_group_id": "cs-core",
+    "course_code": "CS 38100",
+    "credits": 3.0
+  },
+  {
+    "requirement_group_id": "mi-required",
+    "course_code": "CS 37300",
+    "credits": 3.0
+  },
+  {
+    "requirement_group_id": "mi-ai-choice",
+    "course_code": "CS 47100",
+    "credits": 3.0
+  },
+  {
+    "requirement_group_id": "mi-ai-choice",
+    "course_code": "CS 47300",
+    "credits": 3.0
+  },
+  {
+    "requirement_group_id": "mi-selective",
+    "course_code": "CS 43900",
+    "credits": 3.0
+  },
+  {
+    "requirement_group_id": "mi-selective",
+    "course_code": "CS 44800",
+    "credits": 3.0
+  },
+  {
+    "requirement_group_id": "mi-selective",
+    "course_code": "CS 45600",
+    "credits": 3.0
+  },
+  {
+    "requirement_group_id": "mi-selective",
+    "course_code": "CS 45800",
+    "credits": 3.0
+  },
+  {
+    "requirement_group_id": "mi-selective",
+    "course_code": "CS 48300",
+    "credits": 3.0
+  },
+  {
+    "requirement_group_id": "mi-selective",
+    "course_code": "CS 47100",
+    "credits": 3.0
+  },
+  {
+    "requirement_group_id": "mi-selective",
+    "course_code": "CS 47300",
+    "credits": 3.0
+  },
+  {
+    "requirement_group_id": "mi-selective",
+    "course_code": "CS 34800",
+    "credits": 3.0
+  },
+  {
+    "requirement_group_id": "mi-selective",
+    "course_code": "CS 47500",
+    "credits": 3.0
+  },
+  {
+    "requirement_group_id": "mi-selective",
+    "course_code": "STAT 41600",
+    "credits": 3.0
+  },
+  {
+    "requirement_group_id": "cs-elective",
+    "course_code": "CS 35400",
+    "credits": 3.0
+  },
+  {
+    "requirement_group_id": "cs-elective",
+    "course_code": "CS 49000",
+    "credits": 3.0
+  },
+  {
+    "requirement_group_id": "cs-elective",
+    "course_code": "CS 42200",
+    "credits": 3.0
+  },
+  {
+    "requirement_group_id": "cs-elective",
+    "course_code": "CS 42600",
+    "credits": 3.0
+  },
+  {
+    "requirement_group_id": "cs-elective",
+    "course_code": "CS 44000",
+    "credits": 3.0
+  },
+  {
+    "requirement_group_id": "cs-elective",
+    "course_code": "CS 35200",
+    "credits": 3.0
+  },
+  {
+    "requirement_group_id": "cs-elective",
+    "course_code": "CS 31400",
+    "credits": 3.0
+  },
+  {
+    "requirement_group_id": "cs-elective",
+    "course_code": "CS 33400",
+    "credits": 3.0
+  },
+  {
+    "requirement_group_id": "cs-elective",
+    "course_code": "CS 30700",
+    "credits": 3.0
+  },
+  {
+    "requirement_group_id": "cs-elective",
+    "course_code": "CS 40800",
+    "credits": 3.0
+  },
+  {
+    "requirement_group_id": "mathematics",
+    "course_code": "MA 16100",
+    "credits": 5.0
+  },
+  {
+    "requirement_group_id": "mathematics",
+    "course_code": "MA 16200",
+    "credits": 5.0
+  },
+  {
+    "requirement_group_id": "mathematics",
+    "course_code": "MA 26100",
+    "credits": 4.0
+  },
+  {
+    "requirement_group_id": "mathematics",
+    "course_code": "MA 26500",
+    "credits": 3.0
+  },
+  {
+    "requirement_group_id": "mathematics",
+    "course_code": "STAT 35000",
+    "credits": 3.0
+  },
+  {
+    "requirement_group_id": "science",
+    "course_code": "PHYS 17200",
+    "credits": 4.0
+  },
+  {
+    "requirement_group_id": "science",
+    "course_code": "PHYS 24100",
+    "credits": 3.0
+  },
+  {
+    "requirement_group_id": "gen-ed-core",
+    "course_code": "ENGL 10600",
+    "credits": 4.0
+  },
+  {
+    "requirement_group_id": "gen-ed-core",
+    "course_code": "COM 11400",
+    "credits": 3.0
+  },
+  {
+    "requirement_group_id": "gen-ed-core",
+    "course_code": "SCLA 10100",
+    "credits": 3.0
+  },
+  {
+    "requirement_group_id": "gen-ed-selective",
+    "course_code": "PHIL 15000",
+    "credits": 3.0
+  },
+  {
+    "requirement_group_id": "gen-ed-selective",
+    "course_code": "ECON 25100",
+    "credits": 3.0
+  },
+  {
+    "requirement_group_id": "gen-ed-selective",
+    "course_code": "PSY 12000",
+    "credits": 3.0
+  },
+  {
+    "requirement_group_id": "gen-ed-selective",
+    "course_code": "HIST 10300",
+    "credits": 3.0
+  },
+  {
+    "requirement_group_id": "gen-ed-selective",
+    "course_code": "PHIL 11000",
+    "credits": 3.0
+  },
+  {
+    "requirement_group_id": "gen-ed-selective",
+    "course_code": "POL 10100",
+    "credits": 3.0
+  },
+  {
+    "requirement_group_id": "gen-ed-selective",
+    "course_code": "SOC 10000",
+    "credits": 3.0
+  },
+  {
+    "requirement_group_id": "gen-ed-selective",
+    "course_code": "ANTH 10000",
+    "credits": 3.0
+  },
+  {
+    "requirement_group_id": "gen-ed-selective",
+    "course_code": "ECON 25200",
+    "credits": 3.0
+  }
+]

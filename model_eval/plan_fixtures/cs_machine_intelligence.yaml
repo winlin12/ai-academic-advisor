@@ -62,11 +62,54 @@ program:
   total_credits_min: 120
   verified: false
 
-# --- catalog -----------------------------------------------------------------
-# The complete palette a model is allowed to schedule. Any code a model emits
-# that is NOT in this list is scored as a hallucination — so this list must be
-# generous enough that a *correct* plan is expressible, and no more.
-#
+  # MAJOR-COURSE LOAD CAP — added 2026-07-29, and unlike everything else in this file it is a
+  # STUDENT-EXPERIENCE rule, not a registration rule. Nothing at Purdue stops you enrolling in
+  # five CS courses at once; the reason it belongs in the scoring authority is that the models
+  # kept doing it (4- and 5-CS semesters all over the transcripts) and so did this repo's own
+  # deterministic planner, and a plan nobody would follow is not a plan.
+  #
+  #   max_       = 3   the ceiling. Reported by a 4+1 BS/MS student fitting BS and MS courses
+  #                    into the same terms, i.e. from about the heaviest real load there is —
+  #                    which is what makes 4 a plan defect rather than an ambitious semester.
+  #                    HARD: a fourth CS course in one term is `major_overload_violation` and
+  #                    the plan is not viable.
+  #
+  #   preferred_ = 3   EQUAL TO THE HARD CAP, i.e. the soft preference is OFF as of 2026-07-31.
+  #                    It was 2 — the load students describe as sustainable — and it stayed a
+  #                    genuine finding, but as a PROMPT it was a second limit on the same
+  #                    quantity that the model was also told to break when nothing else fit.
+  #                    That is a judgement call small models make badly, and it was competing
+  #                    for attention with the credit target and the prerequisite chain, both of
+  #                    which were going wrong more often and cost more when they did. The
+  #                    machinery is untouched: `soft_major_overloads` still scores, the
+  #                    planner's two-pass selection still runs (both passes just use the same
+  #                    limit now), and `major_load_line` prints one number instead of two.
+  #                    Put it back to 2 to re-enable, and expect the static prompt hash to move.
+  #
+  # Scenario profiles inherit these and may override either one (a student who asks for a
+  # lighter major load gets it via their own `profile:` block).
+  major_subject: "CS"
+  preferred_major_courses_per_semester: 3
+  max_major_courses_per_semester: 3
+
+  # CREDIT TARGET vs CREDIT CAP — added 2026-07-29, the companion knob to the pair above.
+  # `max_credits_per_semester` (on each scenario's profile) says what a semester may never
+  # exceed. It says nothing about what a semester should AIM for, and filling every term to the
+  # cap is what produced the front-loaded shape the planner had until now: mi-fresh-start put
+  # 85 credits into 6 of the student's 8 semesters as [16, 15, 14, 16, 15, 9] and left the last
+  # two empty. Legal, and a worse four years than ~11 credits a term.
+  #
+  # null = DERIVE PER TERM as ceil(credits still to place / semesters still available), clamped
+  # by the cap. Deriving beats a fixed number because it self-corrects — a term that cannot
+  # reach the target (prereqs unmet, nothing offered) raises the target for the terms after it,
+  # so the work lands inside the horizon instead of a 3-credit stub at the end.
+  #
+  # Measured effect on the deterministic planner, all 9 scenarios: every one now uses its FULL
+  # horizon (was 1-3 terms short), credit spread fell from 7-13 to 2-4, coverage and viability
+  # unchanged, 0 courses unplanned. Set this to the same value as the cap to get the old
+  # front-loading back; set it per scenario to model a student who wants a specific load.
+  target_credits_per_semester: null
+
 # `requirement_tags` are the vocabulary the revise-plan agent's `avoid_tags`
 # knob operates over (see backend/app/services/advisor_agent.py), so they are
 # deliberately shaped like the app's tags, not like catalog metadata.
@@ -127,7 +170,13 @@ courses:
   - code: "CS 37300"
     title: "Data Mining And Machine Learning"
     credits: 3
-    prereqs: ["CS 25100", "STAT 35000"]
+    # STAT 35000 MOVED prereqs -> coreqs, 2026-07-30. It may be taken alongside CS 37300, and
+    # modelling it as a hard prerequisite charged a violation for a schedule a student can
+    # actually register for. It was the single most common prereq violation in the whole
+    # corpus: 78 of 534 (15%). Sourced from the student, not from Acalog, which publishes no
+    # prereq edges at all — same provenance caveat as every other edge in this file.
+    prereqs: ["CS 25100"]
+    coreqs: ["STAT 35000"]
     offered_terms: [fall, spring]   # observed in 6 PurdueIO terms
     requirement_tags: [required, machine-intelligence, ai, project-heavy]
     workload_score: 4
@@ -183,6 +232,58 @@ courses:
     requirement_tags: [machine-intelligence, theory-heavy]
     workload_score: 5
 
+  # ---- MI selectives added 2026-07-31: WIDENING A STARVED CHOICE ---------------
+  # THIS CHANGED `fixture_hash`. Every run recorded before 2026-07-31 is no longer
+  # comparable to one recorded after.
+  #
+  # The problem these fix is not accuracy, it is CHOICE. `mi-selective` asked for 6
+  # credits from 7 options, `cs-elective` for 6 from 6, and `gen-ed-selective` for 6
+  # from 3 — a group where two of the three options are effectively mandatory is not
+  # a selective, it is a required block with extra steps. Worse for the thing this
+  # eval measures: nearly every cs-elective option sat behind CS 25200, so the only
+  # legal placements were late, and a model with a scheduling gap in an early term
+  # had nothing it was allowed to put there. Models were being scored on sequencing
+  # while being handed a menu that only permitted one sequence.
+  #
+  # APPENDED, NEVER INSERTED. `select_remaining_courses` (both here and in the app)
+  # is a greedy walk down each group's `courses:` list until the credit target is
+  # met, so options added at the END are invisible to it: the deterministic planner
+  # picks exactly what it picked before, the Mode A baseline is byte-identical, and
+  # `run.py parity` still holds. Mode B, where the model picks freely, sees the whole
+  # widened menu — which is the arm the change is for.
+  #
+  # Each new course appears in exactly ONE requirement group. Coverage is computed
+  # per group with no cross-group deduction, so listing a course twice would let it
+  # satisfy two groups at once; the existing CS 47100/CS 47300 overlap between
+  # `mi-ai-choice` and `mi-selective` is the department's own rule and is deliberate,
+  # and nothing here adds a second case of it.
+  #
+  # PROVENANCE: same status as the rest of this file — codes, titles and credits are
+  # from the Purdue catalog as I know it, prereqs are hand-written (Acalog publishes
+  # none), and offered_terms have NOT been through `refresh-offerings` yet. Run it
+  # before quoting any term-violation number that involves these rows.
+  - code: "CS 34800"
+    title: "Information Systems"
+    credits: 3
+    prereqs: ["CS 25100"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, re-run refresh-offerings
+    requirement_tags: [machine-intelligence, systems, project-heavy]
+    workload_score: 4
+  - code: "CS 47500"
+    title: "Human-Computer Interaction"
+    credits: 3
+    prereqs: ["CS 25100"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, re-run refresh-offerings
+    requirement_tags: [machine-intelligence, project-heavy]
+    workload_score: 3
+  - code: "STAT 41600"
+    title: "Probability"
+    credits: 3
+    prereqs: ["MA 26100"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, re-run refresh-offerings
+    requirement_tags: [machine-intelligence, mathematics, statistics, theory-heavy]
+    workload_score: 4
+
   # ---- additional 400-level CS electives ----
   - code: "CS 35200"
     title: "Compilers: Principles And Practice"
@@ -226,6 +327,160 @@ courses:
     offered_terms: [fall, spring, summer]   # observed in 8 PurdueIO terms
     requirement_tags: [cs-elective]
     workload_score: 3
+
+  # Added 2026-07-31 with the MI selectives above — see that block for the reasoning
+  # and the append-don't-insert rule. These four exist specifically to break the
+  # "every CS elective is gated behind CS 25200" shape: CS 31400 needs only CS 18000
+  # and linear algebra, CS 33400 only CS 25100, so a plan with room in an early term
+  # now has something legal to put there. CS 40800 goes the other way on purpose —
+  # it is the fixture's only two-deep elective chain (CS 25200 -> CS 30700 -> CS
+  # 40800), so a model that schedules it has to carry an ordering constraint through
+  # three courses rather than one.
+  - code: "CS 31400"
+    title: "Numerical Methods"
+    credits: 3
+    prereqs: ["CS 18000", "MA 26500"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, re-run refresh-offerings
+    requirement_tags: [cs-elective, theory-heavy]
+    workload_score: 4
+  - code: "CS 33400"
+    title: "Fundamentals Of Computer Graphics"
+    credits: 3
+    prereqs: ["CS 25100", "MA 26500"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, re-run refresh-offerings
+    requirement_tags: [cs-elective, project-heavy]
+    workload_score: 4
+  - code: "CS 30700"
+    title: "Software Engineering I"
+    credits: 3
+    prereqs: ["CS 25200"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, re-run refresh-offerings
+    requirement_tags: [cs-elective, project-heavy]
+    workload_score: 4
+  - code: "CS 40800"
+    title: "Software Testing"
+    credits: 3
+    prereqs: ["CS 30700"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, re-run refresh-offerings
+    requirement_tags: [cs-elective, project-heavy]
+    workload_score: 4
+
+  # ---- course-for-course equivalents ----------------------------------------
+  # ADDED 2026-07-27. Purdue's published sample plan offers each of these as an
+  # explicit alternative ("MA 16100 ... or MA 16500"), so a student who takes one
+  # has satisfied the requirement the other appears under. Before this, the
+  # fixture had none of them and scored such a plan as `hallucinated_course` —
+  # charging a model for a schedule a real student could register for. Same class
+  # of bug as the hand-written offered_terms that `refresh-offerings` fixed.
+  #
+  # `equivalent_to` names the PRIMARY course this one stands in for. It is a
+  # SCORING concept only, handled in plan_scorers.py:
+  #   - requirement coverage counts either course for the primary's groups
+  #   - a prereq naming the primary is satisfied by the equivalent
+  #   - scheduling BOTH is a duplicate; you cannot take both for credit
+  # The deterministic planner never sees it. These courses are deliberately in no
+  # requirement group, so `select_remaining_courses` never picks one, so
+  # `generate_plan` output is byte-identical to before and `run.py parity` still
+  # holds against the app's planner (which has no such field).
+  - code: "MA 16500"
+    title: "Analytic Geometry And Calculus I"
+    credits: 4
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, re-run refresh-offerings
+    equivalent_to: "MA 16100"
+    requirement_tags: [required, mathematics]
+    workload_score: 4
+  - code: "MA 16600"
+    title: "Analytic Geometry And Calculus II"
+    credits: 4
+    prereqs: ["MA 16100"]                   # satisfied by MA 16500 via equivalence
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, re-run refresh-offerings
+    equivalent_to: "MA 16200"
+    requirement_tags: [required, mathematics]
+    workload_score: 4
+  - code: "MA 27101"
+    title: "Honors Multivariate Calculus"
+    credits: 5
+    prereqs: ["MA 16200"]
+    offered_terms: [fall]                   # NOT observed — hand-written, re-run refresh-offerings
+    equivalent_to: "MA 26100"
+    requirement_tags: [required, mathematics]
+    workload_score: 5
+  - code: "MA 35100"
+    title: "Elementary Linear Algebra"
+    credits: 3
+    prereqs: ["MA 16200"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, re-run refresh-offerings
+    equivalent_to: "MA 26500"
+    requirement_tags: [required, mathematics]
+    workload_score: 3
+  - code: "STAT 51100"
+    title: "Statistical Methods"
+    credits: 3
+    prereqs: ["MA 16200"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, re-run refresh-offerings
+    equivalent_to: "STAT 35000"
+    requirement_tags: [required, mathematics, statistics]
+    workload_score: 3
+
+  # ---- courses the sample plan suggests for its elective slots ---------------
+  # ADDED 2026-07-27, same reason: the published plan names them ("Elective —
+  # 1.00 cr (CS 19300 suggested)"), so a model that schedules one was being
+  # charged a hallucination for following the document it was handed.
+  #
+  # THEY SATISFY NO REQUIREMENT GROUP, on purpose — they are electives, and in
+  # the real degree they fill free-elective credit that this fixture does not
+  # model. Two consequences to keep in view:
+  #   - Scheduling them can never raise `requirement_coverage`. A model that
+  #     fills a semester with seminars is doing legal, useless work.
+  #   - `idle_credits` therefore becomes partially gameable: 1-credit seminars
+  #     soak up capacity without progress. Read idle_credits next to coverage,
+  #     which is what it was always meant to be read against.
+  #
+  # Every one carries the `suggested-elective` tag, which does three jobs: it
+  # renders in the catalog block the model sees (so "suggested" is stated, not
+  # implied by absence from the requirement list), it gives Mode A's `avoid_tags`
+  # a real handle to express "skip these", and it is what the `mi-no-filler`
+  # scenario's assertion is written against.
+  #
+  # JUDGMENT CALL, flagged for easy reversal: COM 21700 fills the sample plan's
+  # "Technical Writing & Presentation" Science Core slot. It is NOT added to
+  # `gen-ed-selective`, because doing so would change which options the greedy
+  # selective picker takes and shift the deterministic baseline for every
+  # scenario. If you want it to count toward the university core, add it to that
+  # group's `courses:` and re-run `run.py check` to confirm every scenario is
+  # still reachable.
+  #
+  # Titles/credits here are from the Purdue catalog as I know it and are NOT
+  # spot-checked — same status as the rest of this file's `verified: false` rows.
+  - code: "CS 19300"
+    title: "Tools"
+    credits: 1
+    prereqs: []
+    offered_terms: [fall, spring]           # NOT observed — hand-written, re-run refresh-offerings
+    requirement_tags: [cs-elective, suggested-elective, programming]
+    workload_score: 1
+  - code: "CS 29100"
+    title: "Sophomore Seminar"
+    credits: 1
+    prereqs: []
+    offered_terms: [fall, spring]           # NOT observed — hand-written, re-run refresh-offerings
+    requirement_tags: [cs-elective, suggested-elective]
+    workload_score: 1
+  - code: "CS 39100"
+    title: "Junior Resources Seminar"
+    credits: 1
+    prereqs: []
+    offered_terms: [fall, spring]           # NOT observed — hand-written, re-run refresh-offerings
+    requirement_tags: [cs-elective, suggested-elective]
+    workload_score: 1
+  - code: "COM 21700"
+    title: "Science Writing And Presentation"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, re-run refresh-offerings
+    requirement_tags: [gen-ed, suggested-elective, writing]
+    workload_score: 2
 
   # ---- mathematics ----
   - code: "MA 16100"
@@ -324,6 +579,56 @@ courses:
     requirement_tags: [gen-ed, social-science]
     workload_score: 2
 
+  # Added 2026-07-31. `gen-ed-selective` asked for 6 credits from THREE options — two
+  # of the three were effectively mandatory, which is a required block wearing a
+  # selective's clothes. It is also the group models dropped most often (78 of 162
+  # Mode B plans in results_old9), and a group with no slack is the worst possible
+  # one to be short on: every option is prereq-free and offered every term, so these
+  # are exactly the courses that can fill a light semester anywhere in the horizon.
+  # Six more options, all unlocked, all 3 credits.
+  - code: "HIST 10300"
+    title: "Introduction To The Modern World"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, re-run refresh-offerings
+    requirement_tags: [gen-ed, humanities]
+    workload_score: 2
+  - code: "PHIL 11000"
+    title: "Introduction To Philosophy"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, re-run refresh-offerings
+    requirement_tags: [gen-ed, humanities]
+    workload_score: 2
+  - code: "POL 10100"
+    title: "American Government And Politics"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, re-run refresh-offerings
+    requirement_tags: [gen-ed, social-science]
+    workload_score: 2
+  - code: "SOC 10000"
+    title: "Introductory Sociology"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, re-run refresh-offerings
+    requirement_tags: [gen-ed, social-science]
+    workload_score: 2
+  - code: "ANTH 10000"
+    title: "Being Human: Introduction To Anthropology"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, re-run refresh-offerings
+    requirement_tags: [gen-ed, social-science]
+    workload_score: 2
+  - code: "ECON 25200"
+    title: "Macroeconomics"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, re-run refresh-offerings
+    requirement_tags: [gen-ed, social-science]
+    workload_score: 2
+
 # --- degree requirements -----------------------------------------------------
 # `kind: all`    -> every listed course must appear in the plan (or be completed)
 # `kind: choose` -> enough listed courses to reach `choose_credits`
@@ -354,7 +659,12 @@ requirement_groups:
     name: "Machine Intelligence — selectives (choose two)"
     kind: choose
     choose_credits: 6
-    courses: ["CS 43900", "CS 44800", "CS 45600", "CS 45800", "CS 48300", "CS 47100", "CS 47300"]
+    # The last three were APPENDED 2026-07-31 and must stay last: the greedy picker
+    # stops as soon as the 6-credit target is met, so anything added at the end is
+    # invisible to the deterministic baseline and visible only to Mode B, where the
+    # model chooses. Insert one in the middle and every Mode A baseline shifts.
+    courses: ["CS 43900", "CS 44800", "CS 45600", "CS 45800", "CS 48300", "CS 47100", "CS 47300",
+              "CS 34800", "CS 47500", "STAT 41600"]
 
   - id: cs-elective
     name: "Additional CS courses at the 400 level"
@@ -368,7 +678,13 @@ requirement_groups:
     # unsatisfiable in five of eight scenarios — `run.py check` caught it. The flexible
     # fall/spring options lead here so the baseline is reachable; the greedy-picker
     # weakness is real and worth fixing in the app, but it is not what this eval measures.
-    courses: ["CS 35400", "CS 49000", "CS 42200", "CS 42600", "CS 44000", "CS 35200"]
+    #
+    # APPENDED 2026-07-31, same rule as mi-selective — the four new options stay last
+    # so the greedy picker still takes CS 35400 + CS 49000 and the baseline does not
+    # move. Two of them (CS 31400, CS 33400) are the only electives in this group that
+    # do NOT require CS 25200, which is the whole reason they are here.
+    courses: ["CS 35400", "CS 49000", "CS 42200", "CS 42600", "CS 44000", "CS 35200",
+              "CS 31400", "CS 33400", "CS 30700", "CS 40800"]
 
   - id: mathematics
     name: "Mathematics And Statistics"
@@ -389,7 +705,12 @@ requirement_groups:
     name: "University Core — additional selectives"
     kind: choose
     choose_credits: 6
-    courses: ["PHIL 15000", "ECON 25100", "PSY 12000"]
+    # Was three options for a 6-credit target — the tightest group in the fixture and
+    # the one most often left short. Six APPENDED 2026-07-31 (last, per the rule
+    # above): the picker still takes PHIL 15000 + ECON 25100 for the baseline, and
+    # Mode B now has nine prereq-free, every-term courses to fill a light term with.
+    courses: ["PHIL 15000", "ECON 25100", "PSY 12000",
+              "HIST 10300", "PHIL 11000", "POL 10100", "SOC 10000", "ANTH 10000", "ECON 25200"]
 
 # --- scenarios ---------------------------------------------------------------
 # Each scenario is one (profile, ask) pair run against every model, N times.
@@ -593,3 +914,45 @@ scenarios:
     assertions:
       - kind: max_credits_at_most
         value: 15
+
+  - id: mi-no-filler
+    label: "Student who explicitly refuses the suggested electives"
+    profile:
+      name: "Kai"
+      degree_program: "Computer Science, BS — Machine Intelligence"
+      completed_courses: ["CS 18000", "CS 18200", "CS 24000", "MA 16100", "MA 16200"]
+      start_term: fall
+      start_year: 2026
+      semesters_to_plan: 6
+      max_credits_per_semester: 16
+    feedback: >-
+      Please don't put any of the optional seminar or suggested-elective courses in my
+      plan — no CS 19300, CS 29100, CS 39100 or COM 21700. I'm paying per credit hour
+      and I only want courses that actually count toward my degree requirements.
+    notes: >-
+      ADDED 2026-07-27 with the suggested electives themselves. Every other scenario
+      asks the model to DO something; this one asks it to refrain, which nothing else
+      in the fixture tested. The catalog block states these courses are
+      `suggested-elective` and no requirement group lists them, so the information
+      needed to honour the ask is fully present — a model that schedules one has
+      either ignored the student or padded the schedule to look busy.
+
+      READ THIS ROW IN MODE B AND MODE C, NOT MODE A. In Mode A the suggested
+      electives are never in `remaining_courses` (they satisfy no requirement group),
+      so the deterministic planner cannot schedule them and `none_scheduled` passes
+      for every model regardless of what it proposed. It is not evidence there. What
+      Mode A can still show is whether the model reached for the
+      `avoid_tags: [suggested-elective]` handle, which is visible in the proposal.
+
+      IT IS ALSO THE SHARPEST MODE C PROBE IN THE FIXTURE. The published sample plan
+      suggests CS 19300, CS 29100 and CS 39100 by name, in specific semester slots, and
+      this student has explicitly refused them. A model that reproduces the template
+      schedules exactly the courses the student just said no to — so a Mode C
+      `none_scheduled` failure that Mode B did not have is anchoring, caught red-handed
+      rather than inferred from the slot-match aggregate.
+    assertions:
+      - kind: none_scheduled
+        courses: ["CS 19300", "CS 29100", "CS 39100", "COM 21700"]
+        why: "The student named these four and refused them; scheduling one ignores the ask."
+      - kind: max_credits_at_most
+        value: 16

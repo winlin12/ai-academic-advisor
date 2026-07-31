@@ -205,15 +205,26 @@ class LlamaCppClient:
             raise ModelResponseError("Model returned an empty response.")
         return text
 
-    async def propose(self, system_prompt: str, user_prompt: str, output_type: type[T]) -> T:
+    async def propose(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        output_type: type[T],
+        schema: dict | None = None,
+    ) -> T:
         """Schema-constrained generation, validated against ``output_type``.
 
         llama.cpp's ``response_format={"type": "json_schema", ...}`` converts the schema to a
         GBNF grammar and constrains decoding to it — stricter than Ollama's old format=<schema>
         (syntax-only), but still no hard guarantee on every schema keyword. One retry with the
         validation error appended (same mitigation validated in model_eval/) before raising.
+
+        ``schema`` overrides the one derived from ``output_type``, for callers that can narrow
+        it against the request — e.g. restricting course-code fields to an enum of the courses
+        this particular student actually has left. The result is still validated against
+        ``output_type``, so a narrowed schema can only ever be stricter than the model.
         """
-        schema = output_type.model_json_schema()
+        schema = schema or output_type.model_json_schema()
         response_format = {
             "type": "json_schema",
             "json_schema": {"name": output_type.__name__, "schema": schema},

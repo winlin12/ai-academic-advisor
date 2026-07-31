@@ -4,8 +4,11 @@
   python run.py doctor                      diagnose local llama-server reachability
   python run.py check                       validate fixture, prompts, GPU, model files
   python run.py serve <model>               launch llama-server for one model and hold it
-  python run.py run [--models a,b] [--brackets 8gb,coder] [--tasks plan_b,qa]
+  python run.py run [--models a,b] [--brackets 8gb,coder] [--tasks plan_a,plan_b,qa]
   python run.py run --mitigate --models X   mitigation pass (multi-iteration revise loop)
+  python run.py converge --preflight        MODE C: validate locked slots, spend no GPU time
+  python run.py converge [--variants blind,feedback] [--models a,b] [--scenarios id]
+  python run.py converge-report             results/convergence_report.md
   python run.py report                      plan tables + validity guards + review queue
   python run.py parity                      check the vendored planner against the app's
   python run.py fixture-check               diff the plan fixture against the catalog DB
@@ -39,9 +42,22 @@ def main() -> None:
     sub.add_parser("fixture-check", help="diff the plan fixture against the catalog DB")
     sub.add_parser("refresh-offerings",
                    help="rewrite the fixture's offered_terms from observed PurdueIO offerings")
+    sub.add_parser("build-mock-db",
+                   help="regenerate mock_db/ from the plan fixture (run after editing it)")
 
     servep = sub.add_parser("serve", help="launch llama-server for one model and hold it")
     servep.add_argument("model", help="model name from config.yaml")
+
+    convp = sub.add_parser(
+        "converge", help="MODE C: retry-to-convergence (attempts + wall clock, censored)")
+    convp.add_argument("--models", help="comma-separated model names (default: all)")
+    convp.add_argument("--brackets", help="comma-separated brackets: 8gb,coder,server,reference")
+    convp.add_argument("--variants", help="comma-separated: blind,feedback (default: both)")
+    convp.add_argument("--scenarios", help="comma-separated scenario ids (default: all)")
+    convp.add_argument("--preflight", action="store_true",
+                       help="validate locked slots and print the prereq-risk note, then stop")
+
+    sub.add_parser("converge-report", help="results/convergence_report.md")
 
     runp = sub.add_parser("run", help="execute the evaluation")
     runp.add_argument("--models", help="comma-separated model names (default: all)")
@@ -67,6 +83,11 @@ def main() -> None:
             # A guard, not a crash — print the reason and the fix, not a traceback.
             print(f"refusing to start: {exc}")
             sys.exit(1)
+    elif args.cmd == "converge":
+        converge(args)
+    elif args.cmd == "converge-report":
+        from harness.convergence_report import generate_report as convergence_report
+        print(f"wrote {convergence_report(ROOT)}")
     elif args.cmd == "report":
         from harness.report import generate_report
         generate_report(ROOT)
@@ -76,6 +97,8 @@ def main() -> None:
         fixture_check()
     elif args.cmd == "refresh-offerings":
         refresh_offerings()
+    elif args.cmd == "build-mock-db":
+        build_mock_db()
 
 
 def _run(args, run_eval) -> None:
@@ -91,6 +114,90 @@ def _run(args, run_eval) -> None:
 def _cfg() -> dict:
     import yaml
     return yaml.safe_load((ROOT / "config.yaml").read_text())
+
+
+# --- converge (MODE C) --------------------------------------------------------------------------
+
+
+def converge(args) -> None:
+    """Mode C. ``--preflight`` spends no GPU time; it is what you run after editing locks."""
+    from harness.convergence import (
+        load_locked_slots, preflight, prereq_risk_note, run_convergence,
+    )
+    from harness.runner import ConcurrentRunError
+
+    split = lambda v: v.split(",") if v else None
+
+    if args.preflight:
+        from harness.runner import load_context
+        ctx = load_context(ROOT)
+        conv_cfg = ctx.cfg.get("convergence") or {}
+        if not conv_cfg:
+            print("config.yaml has no `convergence:` block.")
+            sys.exit(1)
+        locked = load_locked_slots(ROOT / conv_cfg["locked_slots"])
+        print(prereq_risk_note(ctx.fixture, conv_cfg))
+        print(f"\nlocked slots: {locked.path.name} (hash {locked.slots_hash})")
+        for scenario in ctx.fixture.scenarios:
+            slots = locked.for_scenario(scenario.id)
+            pins = ", ".join(f"{s.course}@{s.semester_index + 1}" for s in slots) or "none"
+            print(f"  {scenario.id:24s} {pins}")
+        problems = preflight(ctx, locked, conv_cfg)
+        if problems:
+            print(f"\n❌ {len(problems)} problem(s):")
+            for problem in problems:
+                print(f"  - {problem}")
+            sys.exit(1)
+        print("\n✅ preflight passed: every locked slot is legal where it is pinned.")
+        return
+
+    try:
+        run_convergence(
+            ROOT,
+            models=split(args.models),
+            brackets=split(args.brackets),
+            variants=split(args.variants),
+            scenarios=split(args.scenarios),
+        )
+    except ConcurrentRunError as exc:
+        print(f"refusing to start: {exc}")
+        sys.exit(1)
+
+
+# --- build-mock-db -----------------------------------------------------------------------------
+
+
+def build_mock_db() -> None:
+    """Regenerate mock_db/ from the plan fixture.
+
+    The mock database is what the model is shown; the fixture is what the model is scored
+    against. Generating one from the other is what keeps those two the same set of facts —
+    hand-maintaining both is how a model ends up penalised for a prerequisite it was never
+    given. `run.py check` fails if this has not been run since the fixture last changed.
+    """
+    from harness.fixtures import load_fixture
+    from harness.mock_db import load_mock_db, integrity_problems, render_context
+    from harness.mock_db_build import write_mock_db
+    from harness.server import approx_tokens
+
+    cfg = _cfg()
+    fixture = load_fixture(ROOT / cfg["paths"]["plan_fixture"])
+    out_dir = ROOT / cfg["paths"]["mock_db"]
+    written = write_mock_db(fixture, out_dir)
+    print(f"wrote {len(written)} table(s) to {out_dir}")
+
+    db = load_mock_db(out_dir)
+    for table in db.tables:
+        print(f"  {table:28s} {len(db.rows(table)):4d} rows   (sha {db.files[table]})")
+    problems = integrity_problems(db)
+    if problems:
+        print(f"\n❌ {len(problems)} integrity problem(s) in the generated database:")
+        for problem in problems:
+            print(f"  - {problem}")
+        sys.exit(1)
+    export = render_context(db)
+    print(f"\ndb_hash {db.db_hash} | export {len(export)} chars "
+          f"(~{approx_tokens(export)} tokens)")
 
 
 # --- doctor ------------------------------------------------------------------------------------
@@ -149,7 +256,9 @@ def _port_open(host: str, port: int, timeout: float = 2.0) -> bool:
 
 def check() -> None:
     """Everything verifiable without spending a single generation."""
-    from harness.fixtures import load_fixture
+    from harness.fixtures import load_fixture, load_sample_plan
+    from harness.mock_db import integrity_problems, load_mock_db
+    from harness.mock_db_build import stale_tables
     from harness.planner import generate_plan
     from harness.plan_scorers import score_plan, plan_to_semesters
     from harness.prompts import PromptBuilder
@@ -157,7 +266,11 @@ def check() -> None:
 
     cfg = _cfg()
     fixture = load_fixture(ROOT / cfg["paths"]["plan_fixture"])
-    prompts = PromptBuilder(fixture)
+    sample_rel = cfg["paths"].get("sample_plan")
+    sample_plan = load_sample_plan(ROOT / sample_rel) if sample_rel else None
+    mock_dir = ROOT / cfg["paths"]["mock_db"]
+    database = load_mock_db(mock_dir)
+    prompts = PromptBuilder(fixture, sample_plan, database)
 
     print(f"fixture: {fixture.name}")
     print(f"  hash {fixture.fixture_hash} | {len(fixture.catalog)} courses | "
@@ -176,16 +289,91 @@ def check() -> None:
         for prereq in course.prereqs:
             if prereq not in known:
                 problems.append(f"{course.code} lists unknown prereq {prereq}")
+        for coreq in course.coreqs:
+            if coreq not in known:
+                problems.append(f"{course.code} lists unknown coreq {coreq}")
+            if coreq in course.prereqs:
+                problems.append(
+                    f"{course.code} lists {coreq} as BOTH a prereq and a coreq — the prereq "
+                    f"reading wins in the scorer, so the coreq is silently a no-op."
+                )
         if not course.offered_terms:
             problems.append(f"{course.code} has no offered_terms")
     for group in fixture.requirement_groups:
         for code in group.get("courses", []):
             if code not in known:
                 problems.append(f"requirement group {group['id']} lists unknown course {code}")
+
+    # `equivalent_to` is load-bearing for three separate checks (duplicates, prereqs,
+    # coverage), and every way it can be wrong is silent at runtime.
+    grouped = {c for g in fixture.requirement_groups for c in g.get("courses", [])}
+    for course in fixture.catalog:
+        if not course.equivalent_to:
+            continue
+        if course.equivalent_to not in known:
+            problems.append(
+                f"{course.code} is equivalent_to {course.equivalent_to}, which is not in the "
+                f"catalog — the substitution would silently never apply."
+            )
+        if course.code in grouped:
+            problems.append(
+                f"{course.code} is a substitute for {course.equivalent_to} but is ALSO listed "
+                f"in a requirement group. It would be counted twice toward a `choose` target "
+                f"and the deterministic planner would schedule both. List only the primary."
+            )
+        if fixture.canonical.get(course.code) == course.code:
+            problems.append(
+                f"{course.code}'s equivalence resolves back to itself — a cycle in "
+                f"`equivalent_to`. Substitution is silently a no-op for it."
+            )
     for scenario in fixture.scenarios:
         for code in scenario.profile.completed_courses:
             if code not in known:
                 problems.append(f"scenario {scenario.id} completed unknown course {code}")
+
+    # The Mode C reference plan. It scores nothing, so a mistake in it cannot make a plan
+    # wrongly viable — but a `code:` that the catalog does not have would silently drop out of
+    # the anchoring slot map, quietly shrinking the denominator of the one number this arm
+    # turns on. That is worth a hard failure; an `also_cites` code NOT in the catalog is the
+    # normal case and is exactly what makes the copied-hallucination diagnostic work.
+    if sample_plan is not None:
+        print(f"\nSample plan (anchoring diagnostic only, no longer a prompt input): "
+              f"{sample_plan.path.name} (hash {sample_plan.plan_hash})")
+        rows = sum(len(s.entries) for s in sample_plan.semesters)
+        named = sample_plan.slot_of
+        print(f"  {len(sample_plan.semesters)} semesters | {rows} rows | "
+              f"{len(named)} name a catalog course | {rows - len(named)} placeholders")
+        print(f"  off-catalog codes it cites (alternatives/suggestions, kept on purpose): "
+              f"{', '.join(sorted(sample_plan.off_catalog_codes)) or 'none'}")
+        for semester in sample_plan.semesters:
+            for entry in semester.entries:
+                if entry.code and entry.code not in known:
+                    problems.append(
+                        f"sample plan row {entry.code!r} ({semester.label}) sets `code:` to a "
+                        f"course the scoring fixture does not have — move it to `also_cites` "
+                        f"or add the course, or it silently drops out of the anchoring metric."
+                    )
+                for cited in entry.also_cites:
+                    if cited in known:
+                        problems.append(
+                            f"sample plan row cites {cited} under `also_cites` but the fixture "
+                            f"DOES have it — a model scheduling it would be scored legal while "
+                            f"the diagnostic calls it an off-catalog copy."
+                        )
+        # Not fatal: the published plan genuinely omits courses the fixture requires (CS 38100),
+        # and that gap is part of what Mode C tests. Printing it stops it being read as a bug.
+        required = {c for g in fixture.requirement_groups if g.get("kind") == "all"
+                    for c in g.get("courses", [])}
+        uncovered = sorted(required - set(named))
+        if uncovered:
+            print(f"  NOTE: required courses the sample plan never names: "
+                  f"{', '.join(uncovered)} — following it literally does not complete the "
+                  f"degree, which the model is expected to notice.")
+    elif sample_rel:
+        problems.append(f"paths.sample_plan points at {sample_rel} but it could not be loaded.")
+    else:
+        print("\nSample plan: not configured (paths.sample_plan unset) — the template-anchoring "
+              "diagnostic will be absent. Mode C does not need it.")
 
     # THE check that matters: is a viable plan even reachable? If the deterministic planner —
     # which cannot make a mistake — can't produce a viable plan for a scenario, then every
@@ -213,6 +401,23 @@ def check() -> None:
                 f"reporting of what doesn't fit."
             )
 
+    # THE MOCK DATABASE — what Mode B is actually shown. Two failures are checked, and both are
+    # silent otherwise: rows that reference something that does not exist (a model scored
+    # against a requirement whose course it never saw), and a database that no longer matches
+    # the fixture it was generated from (a model shown one catalog and scored against another).
+    print(f"\nmock database: {mock_dir.name} (hash {database.db_hash})")
+    print("  " + " | ".join(f"{t} {len(database.rows(t))}" for t in database.tables))
+    problems += [f"mock db: {p}" for p in integrity_problems(database)]
+    stale = stale_tables(fixture, mock_dir)
+    if stale:
+        problems.append(
+            f"mock database is STALE — {', '.join(stale)} would be regenerated differently from "
+            f"the current fixture. The model would be shown one catalog and scored against "
+            f"another. Run `python run.py build-mock-db`."
+        )
+    else:
+        print("  in sync with the fixture ✓")
+
     questions = _load_questions(cfg)
     behaviors = {}
     for q in questions:
@@ -228,17 +433,32 @@ def check() -> None:
     print(f"  qa          {prompts.grounded_qa('x', [])[2]}")
     print(f"  explain     {prompts.explain_plan('x', '{}')[2]}")
 
-    # A prompt that doesn't fit in num_ctx isn't a model failure; catch it here.
-    system, user, _ = prompts.plan_freeform(scenario)
-    approx = (len(system) + len(user)) // 4
+    # DOES THE PROMPT FIT? Not a model failure, so it is caught here rather than scored. Mode B
+    # is the long one — it carries the whole database export — and it is what decides whether
+    # num_ctx is big enough. This guard is the reason a `num_ctx: 8192` edit fails `check`
+    # instead of producing 135 HTTP 400s halfway through a sweep.
+    from harness.server import (  # noqa: PLC0415
+        approx_tokens, check_slot_context, slot_context,
+    )
     budget = cfg["run"]["num_ctx"] - cfg["run"]["max_plan_tokens"]
-    print(f"\nlongest prompt (mode B): ~{approx} tokens vs. num_ctx {cfg['run']['num_ctx']} "
-          f"minus max_plan_tokens {cfg['run']['max_plan_tokens']} = {budget} available")
+    slot = slot_context(cfg["run"])
+    print(f"\nper-slot context: {slot} tokens "
+          f"(num_ctx {cfg['run']['num_ctx']} / parallel {cfg['run'].get('parallel', 1)}), "
+          f"minus max_plan_tokens {cfg['run']['max_plan_tokens']} = "
+          f"{slot - cfg['run']['max_plan_tokens']} left for the prompt")
+    system, user, _ = prompts.plan_freeform(scenario)
+    approx = approx_tokens(system + user)
+    print(f"  mode B: ~{approx} tokens")
     if approx > budget:
         problems.append(
-            f"the Mode B prompt (~{approx} tok) does not leave room to generate within "
-            f"num_ctx={cfg['run']['num_ctx']}. Raise num_ctx or trim the fixture catalog."
+            f"the mode B prompt (~{approx} tok) does not leave room to generate within "
+            f"num_ctx={cfg['run']['num_ctx']}. Raise num_ctx, or shrink the database export."
         )
+    # Does ONE request still fit? `--parallel` divides the context, so this catches
+    # "parallel 4 quietly made every plan request truncate against the context".
+    slot_problem = check_slot_context(cfg["run"], approx)
+    if slot_problem:
+        problems.append(slot_problem)
 
     # Two entries pointing at the same gguf benchmark ONE model under two names and report a
     # fake head-to-head. The report's duplicate-NAME guard cannot see this: the names differ.
@@ -338,9 +558,13 @@ def parity() -> None:
 
     cfg = _cfg()
     fixture = load_fixture(ROOT / cfg["paths"]["plan_fixture"])
+    # EVERY field the planner reads has to cross this bridge. Anything omitted silently gives
+    # the app's planner different inputs, and the divergence then reads as "the port drifted"
+    # when it is really the harness lying to itself — `coreqs` did exactly that on 2026-07-30.
     app_catalog = [
         AppCourse(
             code=c.code, title=c.title, credits=c.credits, prereqs=list(c.prereqs),
+            coreqs=list(c.coreqs),
             offered_terms=list(c.offered_terms), requirement_tags=list(c.requirement_tags),
             workload_score=c.workload_score,
         )
@@ -359,6 +583,10 @@ def parity() -> None:
                 start_term=p.start_term, start_year=p.start_year,
                 semesters_to_plan=p.semesters_to_plan,
                 max_credits_per_semester=p.max_credits_per_semester,
+                target_credits_per_semester=p.target_credits_per_semester,
+                major_subject=p.major_subject,
+                max_major_courses_per_semester=p.max_major_courses_per_semester,
+                preferred_major_courses_per_semester=p.preferred_major_courses_per_semester,
             ),
             app_catalog,
         )

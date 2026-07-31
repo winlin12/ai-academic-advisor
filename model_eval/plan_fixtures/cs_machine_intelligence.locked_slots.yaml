@@ -1,0 +1,84 @@
+# =============================================================================
+# LOCKED SLOTS — Mode C (retry-to-convergence) only.
+#
+# A locked slot is a (semester_index, course) pair the STUDENT fixed: "I am
+# taking CS 25100 in my third semester, plan around it." It is an input to every
+# attempt and the model may never move it. Only the slots the model fills itself
+# are eligible for revision between retries.
+#
+# WHY THIS IS A SEPARATE FILE AND NOT PART OF THE FIXTURE.
+# `plan_fixtures/cs_machine_intelligence.yaml` is hashed into every Mode A/B
+# record as `fixture_hash`, and the report refuses to pool records whose hashes
+# disagree. Locked slots change nothing about how a Mode A or Mode B plan is
+# scored — those modes never see them — so folding them into the fixture would
+# invalidate every existing Mode A/B record for a change they did not observe.
+# Same argument, and the same resolution, as the published sample plan: prompt
+# input is recorded separately, scoring authority travels in `fixture_hash`.
+# This file's sha256 lands in `meta_convergence.json`, and each record carries the
+# pins it actually used in its own `locked_slots` field — so a Mode C row is
+# self-describing without reaching for the file that produced it.
+#
+# PROVENANCE: every slot below is lifted from the DETERMINISTIC planner's own
+# output for that scenario, at the semester index the planner chose. That is not
+# a convenience — it is what makes the locked set demonstrably satisfiable. A
+# hand-invented lock ("CS 38100 in semester 1") can be unreachable, and an
+# unreachable lock makes convergence impossible for reasons that have nothing to
+# do with the model, which is the same class of bug `run.py check`'s reachability
+# pass exists to catch. `run.py converge --preflight` re-verifies this: it plans
+# each scenario deterministically and confirms every locked slot is legal where
+# it is pinned.
+#
+# CHOICE OF SLOTS. Each scenario gets one shallow anchor (an early course that
+# constrains little) and one DEEP anchor — a course with prerequisites behind it,
+# pinned to a specific term. The deep one is the point: it forces the model to
+# sequence backwards from a fixed position rather than greedily forwards, which
+# is the sequencing failure Mode B keeps surfacing. Editing these changes Mode
+# C's static hash and invalidates prior Mode C runs, by design.
+# =============================================================================
+
+source:
+  derived_from: "harness/planner.generate_plan, 2026-07-31"
+  fixture: "cs_machine_intelligence.yaml"
+  note: >-
+    Slots are positions in the planning horizon, 0-based: semester_index 0 is the
+    student's start term. They are NOT catalog facts and are not scored against
+    the catalog; they are the student's stated intent.
+
+scenarios:
+  mi-fresh-start:
+    - {semester_index: 0, course: "CS 18000"}
+    - {semester_index: 2, course: "CS 25100"}
+
+  mi-sophomore-catchup:
+    - {semester_index: 0, course: "CS 25100"}
+    - {semester_index: 3, course: "CS 37300"}
+
+  mi-light-load:
+    - {semester_index: 0, course: "CS 18200"}
+    - {semester_index: 1, course: "CS 25100"}
+
+  mi-ai-early:
+    - {semester_index: 0, course: "CS 37300"}
+    - {semester_index: 2, course: "CS 47100"}
+
+  mi-summer-accelerate:
+    - {semester_index: 0, course: "CS 18200"}
+    - {semester_index: 2, course: "CS 25200"}
+
+  mi-spring-start:
+    - {semester_index: 0, course: "CS 18000"}
+    - {semester_index: 2, course: "CS 25100"}
+
+  mi-theory-averse:
+    - {semester_index: 0, course: "CS 25100"}
+    - {semester_index: 3, course: "CS 37300"}
+
+  # One semester, and it is already unsatisfiable for COVERAGE by design. The lock
+  # is deliberately light: the scenario's value is the honesty probe, and pinning
+  # more of a 1-semester horizon would turn it into a transcription exercise.
+  mi-tight-horizon:
+    - {semester_index: 0, course: "CS 37300"}
+
+  mi-no-filler:
+    - {semester_index: 0, course: "CS 25100"}
+    - {semester_index: 3, course: "CS 37300"}

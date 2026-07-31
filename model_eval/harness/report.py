@@ -140,28 +140,52 @@ def _plan_section(records: list[dict], mode: str, title: str, note: str) -> list
     if note:
         lines += [note, ""]
     lines += [
-        "| Model | PLAN_VIABLE | Structure OK | Req. coverage | Violations/plan | Idle cr | Consistency | Median s |",
-        "|---|---|---|---|---|---|---|---|",
+        "| Model | PLAN_VIABLE | Structure OK | Req. coverage | Ask honoured | Violations/plan | Idle cr | Heavy CS terms | Sem used | Cr spread | Consistency | Median s |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     rows: list[tuple[float, str]] = []
     for model, all_recs in groups.items():
         recs = _satisfiable(all_recs) or all_recs
         viable = _by_run(recs, "plan_viable")
+        # A plan can be perfectly legal and still ignore what the student asked for — the
+        # `mi-no-filler` scenario is exactly that case, and PLAN_VIABLE cannot see it.
+        asserts: list[bool] = []
+        for rec in recs:
+            asserts.extend((rec.get("assertions_passed") or {}).values())
         coverage = [r["requirement_coverage"] for r in recs
                     if r.get("requirement_coverage") is not None]
         violations = [len(r.get("violations") or []) for r in recs]
         # Read Idle cr NEXT TO Violations/plan, never on its own. A model that schedules almost
         # nothing wins the violations column by default; this is the column that shows the bill.
         idle = [r["idle_credits"] for r in recs if r.get("idle_credits") is not None]
+        # SOFT breaches only — the hard ones are already in Violations/plan and in the
+        # breakdown below. This column is the term a student would call a bad semester but
+        # would still be allowed to register for: exactly at the hard cap, over the preferred
+        # one. Per plan, so it is readable next to Violations/plan.
+        soft = [r["soft_major_overloads"] for r in recs
+                if r.get("soft_major_overloads") is not None]
+        # Distribution, the pair the credit TARGET was added to move. "Sem used" is
+        # semesters-with-courses over semesters-available; "Cr spread" is max-min across
+        # non-empty terms. Both diagnostic — a plan that finishes early is not illegal — but
+        # together they are what shows whether a target produced a balanced plan or just a
+        # front-loaded one with the same violation count.
+        used = [r["semesters_used"] for r in recs if r.get("semesters_used")]
+        avail = [r["semesters_available"] for r in recs if r.get("semesters_available")]
+        spread = [r["credit_spread"] for r in recs if r.get("credit_spread") is not None]
         flat = [v for vs in viable.values() for v in vs]
         cov_cell = f"{(sum(coverage) / len(coverage)):.0%}" if coverage else "—"
         vio_cell = f"{(sum(violations) / len(violations)):.1f}" if violations else "—"
         idle_cell = f"{(sum(idle) / len(idle)):.0f}" if idle else "—"
+        soft_cell = f"{(sum(soft) / len(soft)):.1f}" if soft else "—"
+        used_cell = (f"{sum(used) / len(used):.1f}/{sum(avail) / len(avail):.1f}"
+                     if used and avail else "—")
+        spread_cell = f"{(sum(spread) / len(spread)):.1f}" if spread else "—"
         rows.append((
             (sum(1 for v in flat if v) / len(flat)) if flat else -1.0,
             f"| `{model}` | {_rate_with_range(viable)} | "
-            f"{_rate([bool(r.get('structure_ok')) for r in recs])} | {cov_cell} | {vio_cell} | "
-            f"{idle_cell} | "
+            f"{_rate([bool(r.get('structure_ok')) for r in recs])} | {cov_cell} | "
+            f"{_rate(asserts)} | {vio_cell} | "
+            f"{idle_cell} | {soft_cell} | {used_cell} | {spread_cell} | "
             f"{_consistency(recs, 'scenario', 'plan_viable')} | "
             f"{_median([r.get('total_s') for r in recs])} |",
         ))
@@ -170,17 +194,22 @@ def _plan_section(records: list[dict], mode: str, title: str, note: str) -> list
     # WHY plans fail is more actionable than how often.
     lines += ["", "**Where plans break** (violation counts across ALL runs, including the "
               "unsatisfiable scenario — a violation is a violation regardless of whether full "
-              "coverage was reachable):", "",
-              "| Model | prereq | term offering | credit cap | hallucinated | duplicate |",
-              "|---|---|---|---|---|---|"]
+              "coverage was reachable). `CS overload` is the only column here the registrar "
+              "would let a student through: it counts terms holding MORE than the hard "
+              "major-course limit, which is a plan the student abandons rather than one they "
+              "cannot enrol in:", "",
+              "| Model | prereq | coreq | term offering | credit cap | CS overload | hallucinated | duplicate |",
+              "|---|---|---|---|---|---|---|---|"]
     for model, recs in groups.items():
         counts: Counter = Counter()
         for rec in recs:
             counts.update(rec.get("violation_counts") or {})
         lines.append(
             f"| `{model}` | {counts.get('prereq_violation', 0)} "
+            f"| {counts.get('coreq_violation', 0)} "
             f"| {counts.get('term_offering_violation', 0)} "
             f"| {counts.get('credit_cap_violation', 0)} "
+            f"| {counts.get('major_overload_violation', 0)} "
             f"| {counts.get('hallucinated_course', 0)} "
             f"| {counts.get('duplicate_course', 0)} |"
         )
@@ -240,6 +269,18 @@ def _mode_label(stage: str) -> str:
     return "Mode " + stage.removeprefix("plan_mode_").upper()
 
 
+def _pp(new: float | None, old: float | None) -> str:
+    """Signed percentage-point delta, or an em dash when either side is missing."""
+    if new is None or old is None:
+        return "—"
+    return f"{(new - old) * 100:+.0f}pp"
+
+
+def _mean(values: list[Any]) -> float | None:
+    clean = _numbers(values)
+    return sum(clean) / len(clean) if clean else None
+
+
 def _latency_section(records: list[dict]) -> list[str]:
     """What a student actually waits for.
 
@@ -254,7 +295,8 @@ def _latency_section(records: list[dict]) -> list[str]:
     are discarded. A student hitting a cold server waits for the weights on top of this.
     """
     stages = [s for s in ("qa", "explain") if _group(records, s)]
-    plan_stages = [s for s in ("plan_mode_a", "plan_mode_b") if _group(records, s)]
+    plan_stages = [s for s in ("plan_mode_a", "plan_mode_b")
+                   if _group(records, s)]
     if not stages and not plan_stages:
         return []
 
@@ -320,29 +362,38 @@ def _unsatisfiable_section(records: list[dict]) -> list[str]:
     fabricate room for it. Inventing an extra semester or blowing through the credit cap to
     make the numbers work is the single most damaging behaviour on a real advising site,
     because it looks like a complete plan.
+
+    Split by mode, because Mode C has a specific way to fail it: the sample plan describes
+    eight semesters and this student has one, so a model that anchors on the template has a
+    ready-made reason to overrun the horizon.
     """
-    recs = [r for r in records
-            if r.get("stage") == "plan_mode_b" and r.get("expect_unsatisfiable")
-            and not r.get("error")]
-    if not recs:
+    stages = [
+        s for s in ("plan_mode_b",)
+        if any(r.get("stage") == s and r.get("expect_unsatisfiable") and not r.get("error")
+               for r in records)
+    ]
+    if not stages:
         return []
-    models = sorted({r["model"] for r in recs})
     lines = ["### When nothing fits — the honesty check", "",
              "One scenario in the fixture is unsatisfiable by design (one semester left, more "
              "requirements than can fit). Nobody scores PLAN_VIABLE here. The question is "
              "whether the model says so.", "",
-             "| Model | Stayed in horizon | Respected credit cap | Declared what didn't fit | Violations/plan |",
-             "|---|---|---|---|---|"]
-    for model in models:
-        mine = [r for r in recs if r["model"] == model]
-        caps = [not (r.get("violation_counts") or {}).get("credit_cap_violation") for r in mine]
-        horizon = [not r.get("over_horizon") for r in mine]
-        declared = [bool(r.get("declared_unplanned")) for r in mine]
-        vio = [len(r.get("violations") or []) for r in mine]
-        lines.append(
-            f"| `{model}` | {_rate(horizon)} | {_rate(caps)} | {_rate(declared)} "
-            f"| {(sum(vio) / len(vio)):.1f} |"
-        )
+             "| Model | Mode | Stayed in horizon | Respected credit cap | Declared what didn't fit | Violations/plan |",
+             "|---|---|---|---|---|---|"]
+    for stage in stages:
+        recs = [r for r in records if r.get("stage") == stage
+                and r.get("expect_unsatisfiable") and not r.get("error")]
+        for model in sorted({r["model"] for r in recs}):
+            mine = [r for r in recs if r["model"] == model]
+            caps = [not (r.get("violation_counts") or {}).get("credit_cap_violation")
+                    for r in mine]
+            horizon = [not r.get("over_horizon") for r in mine]
+            declared = [bool(r.get("declared_unplanned")) for r in mine]
+            vio = [len(r.get("violations") or []) for r in mine]
+            lines.append(
+                f"| `{model}` | {_mode_label(stage)} | {_rate(horizon)} | {_rate(caps)} "
+                f"| {_rate(declared)} | {(sum(vio) / len(vio)):.1f} |"
+            )
     return lines + [""]
 
 
@@ -445,6 +496,13 @@ def _guards(records: list[dict], cfg: dict, fixture_meta: dict) -> list[str]:
                          "these records came from different prompts and MUST NOT be compared. "
                          "Re-run, or split the file by hash.")
 
+    sample_hashes = {r.get("sample_plan_hash") for r in records if r.get("sample_plan_hash")}
+    if len(sample_hashes) > 1:
+        ok = False
+        lines.append(f"- ⚠️ **mixed sample-plan hashes** ({sorted(sample_hashes)}) — the "
+                     "reference plan Mode C was given changed partway through, so the Mode C − "
+                     "Mode B delta is measuring two different reference plans.")
+
     fixture_hashes = {r.get("fixture_hash") for r in records if r.get("fixture_hash")}
     if len(fixture_hashes) > 1:
         ok = False
@@ -514,7 +572,8 @@ def _review_queue(records: list[dict], out_path: Path) -> int:
                 "output": rec.get("output"),
                 "grade": None, "notes": None,
             })
-        elif rec.get("stage") in ("plan_mode_a", "plan_mode_b") and rec.get("plan_viable") is False:
+        elif (rec.get("stage") in ("plan_mode_a", "plan_mode_b")
+              and rec.get("plan_viable") is False):
             violations = rec.get("violations") or []
             # A plan for the deliberately-unsatisfiable scenario is non-viable BY DESIGN. With
             # no violations to confirm there is nothing for a human to decide, and queueing it
@@ -554,10 +613,15 @@ def generate_report(root: Path) -> Path:
         f"Fixture `{fixture_meta.get('path', '?')}` (hash `{fixture_meta.get('hash', '?')}`, "
         f"{fixture_meta.get('courses', '?')} courses, "
         f"{fixture_meta.get('requirement_groups', '?')} requirement groups)  ",
+        *([f"Sample plan `{meta['sample_plan'].get('path')}` (anchoring diagnostic only) "
+           f"(hash `{meta['sample_plan'].get('hash')}`, "
+           f"{meta['sample_plan'].get('named_courses')} named courses) — prompt input only, "
+           f"it decides no score  "] if meta.get("sample_plan") else []),
         f"Run {meta.get('timestamp', '?')} · tasks {meta.get('tasks', '?')} · "
         f"num_ctx {run_meta.get('num_ctx', '?')} · temp {run_meta.get('temperature', '?')} · "
         f"seed {run_meta.get('seed', '?')} · "
-        f"{run_meta.get('runs_per_pair', '?')} replicates",
+        f"{run_meta.get('runs_per_pair', '?')} replicates · "
+        f"{run_meta.get('parallel', 1)} server slot(s)",
         "",
         "## 1. Plan of study — the feature this is really about",
         "",

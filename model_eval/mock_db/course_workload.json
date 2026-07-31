@@ -1,0 +1,226 @@
+[
+  {
+    "course_code": "ANTH 10000",
+    "workload_score": 2
+  },
+  {
+    "course_code": "COM 11400",
+    "workload_score": 2
+  },
+  {
+    "course_code": "COM 21700",
+    "workload_score": 2
+  },
+  {
+    "course_code": "CS 18000",
+    "workload_score": 4
+  },
+  {
+    "course_code": "CS 19300",
+    "workload_score": 1
+  },
+  {
+    "course_code": "CS 29100",
+    "workload_score": 1
+  },
+  {
+    "course_code": "CS 39100",
+    "workload_score": 1
+  },
+  {
+    "course_code": "ECON 25100",
+    "workload_score": 2
+  },
+  {
+    "course_code": "ECON 25200",
+    "workload_score": 2
+  },
+  {
+    "course_code": "ENGL 10600",
+    "workload_score": 2
+  },
+  {
+    "course_code": "HIST 10300",
+    "workload_score": 2
+  },
+  {
+    "course_code": "MA 16100",
+    "workload_score": 4
+  },
+  {
+    "course_code": "MA 16500",
+    "workload_score": 4
+  },
+  {
+    "course_code": "PHIL 11000",
+    "workload_score": 2
+  },
+  {
+    "course_code": "PHIL 15000",
+    "workload_score": 2
+  },
+  {
+    "course_code": "POL 10100",
+    "workload_score": 2
+  },
+  {
+    "course_code": "PSY 12000",
+    "workload_score": 2
+  },
+  {
+    "course_code": "SCLA 10100",
+    "workload_score": 2
+  },
+  {
+    "course_code": "SOC 10000",
+    "workload_score": 2
+  },
+  {
+    "course_code": "CS 18200",
+    "workload_score": 4
+  },
+  {
+    "course_code": "CS 24000",
+    "workload_score": 3
+  },
+  {
+    "course_code": "MA 16200",
+    "workload_score": 4
+  },
+  {
+    "course_code": "MA 16600",
+    "workload_score": 4
+  },
+  {
+    "course_code": "PHYS 17200",
+    "workload_score": 4
+  },
+  {
+    "course_code": "CS 25000",
+    "workload_score": 4
+  },
+  {
+    "course_code": "CS 25100",
+    "workload_score": 4
+  },
+  {
+    "course_code": "MA 26100",
+    "workload_score": 4
+  },
+  {
+    "course_code": "MA 26500",
+    "workload_score": 3
+  },
+  {
+    "course_code": "MA 27101",
+    "workload_score": 5
+  },
+  {
+    "course_code": "MA 35100",
+    "workload_score": 3
+  },
+  {
+    "course_code": "PHYS 24100",
+    "workload_score": 4
+  },
+  {
+    "course_code": "STAT 35000",
+    "workload_score": 3
+  },
+  {
+    "course_code": "STAT 51100",
+    "workload_score": 3
+  },
+  {
+    "course_code": "CS 25200",
+    "workload_score": 5
+  },
+  {
+    "course_code": "CS 31400",
+    "workload_score": 4
+  },
+  {
+    "course_code": "CS 33400",
+    "workload_score": 4
+  },
+  {
+    "course_code": "CS 34800",
+    "workload_score": 4
+  },
+  {
+    "course_code": "CS 37300",
+    "workload_score": 4
+  },
+  {
+    "course_code": "CS 38100",
+    "workload_score": 5
+  },
+  {
+    "course_code": "CS 43900",
+    "workload_score": 3
+  },
+  {
+    "course_code": "CS 44800",
+    "workload_score": 4
+  },
+  {
+    "course_code": "CS 45800",
+    "workload_score": 4
+  },
+  {
+    "course_code": "CS 47100",
+    "workload_score": 4
+  },
+  {
+    "course_code": "CS 47300",
+    "workload_score": 4
+  },
+  {
+    "course_code": "CS 47500",
+    "workload_score": 3
+  },
+  {
+    "course_code": "STAT 41600",
+    "workload_score": 4
+  },
+  {
+    "course_code": "CS 30700",
+    "workload_score": 4
+  },
+  {
+    "course_code": "CS 35200",
+    "workload_score": 5
+  },
+  {
+    "course_code": "CS 35400",
+    "workload_score": 5
+  },
+  {
+    "course_code": "CS 42200",
+    "workload_score": 4
+  },
+  {
+    "course_code": "CS 42600",
+    "workload_score": 4
+  },
+  {
+    "course_code": "CS 44000",
+    "workload_score": 4
+  },
+  {
+    "course_code": "CS 45600",
+    "workload_score": 4
+  },
+  {
+    "course_code": "CS 48300",
+    "workload_score": 5
+  },
+  {
+    "course_code": "CS 49000",
+    "workload_score": 3
+  },
+  {
+    "course_code": "CS 40800",
+    "workload_score": 4
+  }
+]

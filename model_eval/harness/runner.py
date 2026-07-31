@@ -17,6 +17,12 @@ TASK ORDER PER MODEL. Plan-of-study runs FIRST, before QA and explain. It is the
 app will lean on hardest, so if a run has to be cut short (OOM, a model that will not load, a
 box that has to go back to being a workstation), the data that survives is the data that
 matters. This is deliberate, not incidental.
+
+ONE REQUEST AT A TIME. Every latency here is a single-user latency, which is what makes it
+comparable across models and across runs. A concurrent request pool lived here briefly on
+2026-07-30 and was removed the next day — it belongs with the deployment question ("what does a
+student wait when ten of them are on the site"), not with the model-selection question this
+harness answers, and mixing the two in one results file produces medians that describe neither.
 """
 
 from __future__ import annotations
@@ -32,13 +38,20 @@ from typing import Any
 import yaml
 
 from . import plan_scorers, scorers
-from .fixtures import Fixture, Scenario, load_fixture
+from .fixtures import Fixture, SamplePlan, Scenario, load_fixture, load_sample_plan
 from .llamacpp_client import GenerationResult, LlamaCppClient, LlamaCppError
+from .mock_db import MockDatabase, load_mock_db
 from .planner import (
-    Plan, Profile, Proposal, apply_proposal, generate_plan, set_planning_terms, severity,
+    Plan, Profile, Proposal, apply_proposal, extract_credit_cap, generate_plan,
+    set_planning_terms, severity,
 )
-from .prompts import PROPOSAL_SCHEMA, PromptBuilder, json_response_format, plan_schema
-from .server import ServerHandle, gpu_memory_used_mb, resolve_host, start_server
+from .prompts import (
+    PROPOSAL_SCHEMA, PromptBuilder, catalog_tags, json_response_format, plan_schema,
+    proposal_schema,
+)
+from .server import (
+    ServerHandle, gpu_memory_used_mb, resolve_host, slot_context, start_server,
+)
 
 WARMUP_SYSTEM = "You reply with exactly one word."
 WARMUP_USER = "Reply with the single word: ready"
@@ -52,6 +65,14 @@ class EvalContext:
     prompts: PromptBuilder
     questions: list[dict[str, Any]]
     host: str
+    # The mock of the advisor's real databases — Mode B's entire context. Carried on the
+    # context so its hash can travel into meta_*.json alongside the fixture's.
+    database: MockDatabase
+    # The published sample plan. NO LONGER A PROMPT INPUT — the reference arm was replaced by
+    # the feedback arm on 2026-07-30. It is still loaded because `template_anchoring` scores
+    # every free-form plan against it as a base rate: how much of the published template a
+    # model reproduces from parametric memory alone. None simply omits that diagnostic.
+    sample_plan: SamplePlan | None = None
 
     @property
     def results_dir(self) -> Path:
@@ -73,7 +94,7 @@ class EvalContext:
 
     def write_transcript(
         self, model: str, stage: str, item: str, run_idx: int,
-        system: str, user: str, output: str, verdict: str = "",
+        system: str, user: str, output: str, verdict: str = "", detail: str = "",
     ) -> None:
         """Save one full exchange as readable markdown.
 
@@ -92,11 +113,77 @@ class EvalContext:
         (d / f"{safe(item)}__run{run_idx}.md").write_text(
             f"# {model} · {stage} · {item} · run {run_idx}\n\n"
             + (f"**Verdict:** {verdict}\n\n" if verdict else "")
+            + (detail + "\n" if detail else "")
             + f"## System prompt\n\n```\n{system}\n```\n\n"
             f"## User prompt\n\n```\n{user}\n```\n\n"
             f"## Model output\n\n```\n{output}\n```\n",
             encoding="utf-8",
         )
+
+
+def _score_detail(
+    score: plan_scorers.PlanScore, semesters: list[list[str]], profile: Profile,
+) -> str:
+    """Everything the scorer decided, spelled out, above the prompts in the transcript.
+
+    The verdict line carries counts ("violations={'prereq_violation': 3}"), which tells you a
+    plan failed but not why — and "why" is where the useful findings have come from. Reading a
+    transcript is how STAT 35000 turned out to be a corequisite of CS 37300 rather than a
+    prerequisite, which was 15% of every prereq violation in the corpus and was suppressing half
+    of one model's Mode B viability. That is only findable if the individual violations, the
+    requirements still short, and the per-semester shape are all on the page next to the plan.
+    """
+    lines: list[str] = ["## Scoring", ""]
+    lines.append(
+        f"**PLAN_VIABLE: {str(score.viable).upper()}** — {len(score.violations)} violation(s), "
+        f"requirement coverage {score.requirement_coverage:.0%}, "
+        f"{score.semesters_used}/{score.semesters_available} semesters used, "
+        f"credit spread {score.credit_spread}"
+    )
+    lines.append("")
+
+    if score.violations:
+        counts = ", ".join(f"{k} x{v}" for k, v in sorted(score.violation_counts.items()))
+        lines += [f"### Violations ({len(score.violations)}) — {counts}", ""]
+        lines += [f"- `{v}`" for v in score.violations]
+        lines.append("")
+    else:
+        lines += ["### Violations", "", "None — every hard rule held.", ""]
+
+    if score.missing_requirements:
+        lines += ["### Requirements still short", ""]
+        lines += [f"- {m}" for m in score.missing_requirements]
+        lines.append("")
+
+    if score.semester_credits:
+        terms = plan_scorers._terms(profile, len(score.semester_credits))
+        cap = profile.max_credits_per_semester
+        soft = min(profile.preferred_major_courses_per_semester,
+                   profile.max_major_courses_per_semester)
+        hard = profile.max_major_courses_per_semester
+        lines += [
+            f"### Semesters (credit cap {cap}, {profile.major_subject} cap {hard}, "
+            f"{soft} preferred)", "",
+            f"| # | term | credits | {profile.major_subject} | courses |",
+            "|---|---|---|---|---|",
+        ]
+        for i, credits in enumerate(score.semester_credits):
+            major = (score.major_courses_per_semester[i]
+                     if i < len(score.major_courses_per_semester) else 0)
+            term, year = terms[i] if i < len(terms) else ("?", "?")
+            codes = ", ".join(semesters[i]) if i < len(semesters) else ""
+            over_cr = " **OVER**" if credits > cap else ""
+            over_mj = " **OVER**" if major > hard else (" *heavy*" if major > soft else "")
+            lines.append(
+                f"| {i + 1} | {term} {year} | {credits}{over_cr} | {major}{over_mj} | {codes} |")
+        lines.append("")
+
+    if score.assertions_passed:
+        lines += ["### Did it do what the student asked?", ""]
+        lines += [f"- {'PASS' if ok else 'FAIL'} — `{k}`"
+                  for k, ok in sorted(score.assertions_passed.items())]
+        lines.append("")
+    return "\n".join(lines)
 
 
 def load_context(root: Path) -> EvalContext:
@@ -107,14 +194,28 @@ def load_context(root: Path) -> EvalContext:
     fixture = load_fixture(root / cfg["paths"]["plan_fixture"])
     questions_path = root / cfg["paths"]["questions"]
     questions = yaml.safe_load(questions_path.read_text()) if questions_path.exists() else []
+
+    # THE MODEL'S CONTEXT. Loaded before the prompts are built, because Mode B's static block is
+    # the rendered database — its bytes are in the static hash, so a stale mock db is a silently
+    # different experiment, which is what `run.py check`'s staleness guard exists to prevent.
+    database = load_mock_db(root / cfg["paths"]["mock_db"])
+
+    sample_rel = cfg["paths"].get("sample_plan")
+    sample_plan = load_sample_plan(root / sample_rel) if sample_rel else None
+    if sample_rel and sample_plan is None:  # pragma: no cover — defensive
+        print(f"[WARN] paths.sample_plan is set to {sample_rel} but nothing loaded; "
+              "Mode C will be skipped.")
+
     return EvalContext(
         cfg=cfg,
         root=root,
         fixture=fixture,
-        prompts=PromptBuilder(fixture),
+        prompts=PromptBuilder(fixture, sample_plan, database),
         questions=questions or [],
         host=resolve_host(cfg["llamacpp"].get("host", "auto"),
                           cfg["llamacpp"].get("server_exe")),
+        sample_plan=sample_plan,
+        database=database,
     )
 
 
@@ -165,7 +266,13 @@ def _env_record(
         "offload": handle.offload(),
         "server_n_ctx": server_ctx,
         "configured_num_ctx": ctx.cfg["run"]["num_ctx"],
-        "ctx_matches_config": server_ctx == ctx.cfg["run"]["num_ctx"] if server_ctx else None,
+        # Compared against the SLOT context, not num_ctx: llama.cpp reports what one request
+        # gets, which is num_ctx/parallel. Comparing to num_ctx would flag every model as
+        # incomparable the moment `parallel` went above 1.
+        "configured_parallel": ctx.cfg["run"].get("parallel", 1),
+        "expected_slot_ctx": slot_context(ctx.cfg["run"]),
+        "ctx_matches_config": (
+            server_ctx == slot_context(ctx.cfg["run"]) if server_ctx else None),
         "loaded_model_id": client.loaded_model(),
         "build_info": props.get("build_info"),
     }
@@ -214,6 +321,24 @@ def run_mode_a(
     # but the student's wait begins once, and averaging a retry's TTFT into it would report a
     # latency nobody experiences.
     first_ttft: float | None = None
+    # GENERATION TELEMETRY. This stage used to build its record by hand and drop all of it,
+    # which made a whole failure mode invisible: qwen3.6-35b-a3b spent ~390 s per record
+    # looping inside `rationale` until it hit the token ceiling, and `runs_baseline.jsonl`
+    # showed only a large total_s next to proposal_parse_failed — no finish_reason, no
+    # truncated flag, no token count, and not even the text the model produced. The raw output
+    # existed solely in the transcript, so the JSONL could not answer "did it ramble or did it
+    # refuse?" without opening a markdown file per record.
+    #
+    # MIXED SEMANTICS, on purpose, and it is why these are set here rather than via
+    # _base_record: counts SUM across iterations (matching total_s, which already does),
+    # `truncated` is ANY iteration hitting the ceiling (that is what explains a parse
+    # failure), and finish_reason/output describe the LAST exchange (the one the transcript
+    # and `proposal` correspond to).
+    eval_count = prompt_eval_count = 0
+    truncated = False
+    finish_reason: str | None = None
+    cap_source = "none"
+    applied_cap: int | None = None
 
     last_exchange: tuple[str, str, str] = ("", "", "")
     for iteration in range(1, max_iterations + 1):
@@ -223,7 +348,10 @@ def run_mode_a(
                 system, user,
                 options=sampling_options(ctx.cfg, max_tokens=ctx.cfg["run"]["max_output_tokens"]),
                 think=model_cfg.get("think"),
-                response_format=json_response_format("PlanEditProposal", PROPOSAL_SCHEMA),
+                response_format=json_response_format(
+                    "PlanEditProposal",
+                    proposal_schema(scenario.profile.remaining_courses,
+                                    catalog_tags(ctx.fixture.catalog))),
             )
         except LlamaCppError as exc:
             out.write(json.dumps({
@@ -233,6 +361,10 @@ def run_mode_a(
         total_s += res.total_s
         if first_ttft is None:
             first_ttft = res.ttft_s
+        eval_count += res.eval_count or 0
+        prompt_eval_count += res.prompt_eval_count or 0
+        truncated = truncated or bool(res.truncated)
+        finish_reason = res.finish_reason
         last_exchange = (system, user, res.text)
 
         parsed = scorers.extract_json(res.text)
@@ -250,8 +382,20 @@ def run_mode_a(
             avoid_tags=[str(t) for t in parsed.get("avoid_tags") or []],
             max_credits_per_semester=parsed.get("max_credits_per_semester"),
         )
+        # Port of the app's deterministic backstop. Recorded separately from the model's own
+        # answer on purpose: `proposal_sets_credit_cap` must keep measuring whether the MODEL
+        # understood the request, while the student still gets the load they asked for. Reading
+        # those two columns together is what says "the fallback is carrying this model".
+        if proposal.max_credits_per_semester is None:
+            asked = extract_credit_cap(scenario.feedback)
+            if asked is not None:
+                proposal.max_credits_per_semester = asked
+                cap_source = "text"
+        else:
+            cap_source = "model"
         revised = generate_plan(apply_proposal(profile, proposal, catalog), catalog)
         best_plan, best_proposal, accepted = revised, parsed, iteration
+        applied_cap = proposal.max_credits_per_semester
         if severity(revised) <= baseline_severity:
             break
         prior_warnings = list(revised.warnings) + [
@@ -259,16 +403,17 @@ def run_mode_a(
         ]
 
     semesters = plan_scorers.plan_to_semesters(best_plan)
-    # The applied cap is what the student actually experiences, so score against it, not
-    # against the profile's original.
+    # The APPLIED cap is what the student actually experiences, so score against it, not
+    # against the profile's original and not against what the model said. Those differ whenever
+    # the deterministic backstop filled a cap the model left null: the plan really was built at
+    # the tighter number, so scoring it against the looser one would grade a plan nobody got.
     effective = profile
-    if best_proposal and best_proposal.get("max_credits_per_semester"):
-        effective = profile.replace(
-            max_credits_per_semester=int(best_proposal["max_credits_per_semester"])
-        )
+    if applied_cap:
+        effective = profile.replace(max_credits_per_semester=int(applied_cap))
     score = plan_scorers.score_plan(ctx.fixture, effective, semesters)
     score.assertions_passed = plan_scorers.check_assertions(
-        scenario.assertions, semesters, score, proposal=best_proposal or {}
+        scenario.assertions, semesters, score, proposal=best_proposal or {},
+        canonical=ctx.fixture.canonical,
     )
 
     planned_codes = {plan_scorers.normalize_code(c) for s in semesters for c in s}
@@ -283,7 +428,14 @@ def run_mode_a(
         "fixture_hash": ctx.fixture.fixture_hash,
         "ttft_s": first_ttft,
         "total_s": total_s,
+        "eval_count": eval_count,
+        "prompt_eval_count": prompt_eval_count,
+        "finish_reason": finish_reason,
+        "truncated": truncated,
+        "output": last_exchange[2],
         "iterations": accepted,
+        "credit_cap_source": cap_source,
+        "credit_cap_from_text": extract_credit_cap(scenario.feedback),
         "proposal_parse_failed": best_proposal is None,
         "parse_failures": parse_failures,
         "proposal": best_proposal,
@@ -302,12 +454,17 @@ def run_mode_a(
     ctx.write_transcript(
         model_cfg["name"], "plan_mode_a", scenario.id, run_idx, *last_exchange,
         verdict=f"grounded={rec.get('proposal_grounded')} "
-                f"viable={rec.get('plan_viable')} "
-                f"assertions={rec.get('assertions_passed')}",
+                f"viable={rec.get('plan_viable')} cap_source={cap_source}",
+        detail=_score_detail(score, semesters, effective),
     )
 
 
-# --- MODE B: free-form plan of study --------------------------------------------------------
+# --- MODES B and C: free-form plan of study --------------------------------------------------
+#
+# ONE function, two prompts. Mode C exists to measure what the published sample plan buys, and
+# that subtraction is only valid if everything downstream of the prompt — sampling options, the
+# response grammar, the parse, the scorer, the record shape — is identical. Two near-copies of
+# this function would drift, and the drift would land in the delta.
 
 
 def run_mode_b(
@@ -321,25 +478,40 @@ def run_mode_b(
     semesters fails the whole plan, which is the correct standard: a student following it
     would be turned away at registration.
     """
-    system, user, static_hash = ctx.prompts.plan_freeform(scenario)
+    _run_freeform_plan(
+        ctx, client, model_cfg, scenario, run_idx, out,
+        mitigate=mitigate, stage="plan_mode_b",
+        prompt=ctx.prompts.plan_freeform(scenario),
+    )
+
+
+def _run_freeform_plan(
+    ctx: EvalContext, client: LlamaCppClient, model_cfg: dict,
+    scenario: Scenario, run_idx: int, out, *, mitigate: bool,
+    stage: str, prompt: tuple[str, str, str],
+) -> None:
+    system, user, static_hash = prompt
     try:
         res = client.chat(
             system, user,
             options=sampling_options(ctx.cfg, max_tokens=ctx.cfg["run"]["max_plan_tokens"]),
             think=model_cfg.get("think"),
             response_format=json_response_format(
-                "PlanOfStudy", plan_schema(ctx.cfg["run"]["planning_terms"])),
+                "PlanOfStudy", plan_schema(
+                    ctx.cfg["run"]["planning_terms"],
+                    [c.code for c in ctx.fixture.catalog],
+                    [g["id"] for g in ctx.fixture.requirement_groups])),
         )
     except LlamaCppError as exc:
         out.write(json.dumps({
-            "model": model_cfg["name"], "stage": "plan_mode_b", "scenario": scenario.id,
+            "model": model_cfg["name"], "stage": stage, "scenario": scenario.id,
             "run_idx": run_idx, "mitigated": mitigate, "error": str(exc)}) + "\n")
         return
 
     parsed = scorers.extract_json(res.text)
     rec = _base_record(
         model_cfg["name"], res, static_hash,
-        stage="plan_mode_b", scenario=scenario.id, run_idx=run_idx, mitigated=mitigate,
+        stage=stage, scenario=scenario.id, run_idx=run_idx, mitigated=mitigate,
         expect_unsatisfiable=scenario.expect_unsatisfiable,
         fixture_hash=ctx.fixture.fixture_hash,
     )
@@ -350,7 +522,7 @@ def run_mode_b(
         rec["structure_ok"] = False
         rec["parse_failure_reason"] = "no JSON object" if not parsed else "no semesters array"
         out.write(json.dumps(rec, default=str) + "\n")
-        ctx.write_transcript(model_cfg["name"], "plan_mode_b", scenario.id, run_idx,
+        ctx.write_transcript(model_cfg["name"], stage, scenario.id, run_idx,
                              system, user, res.text,
                              verdict=f"UNPARSEABLE ({rec['parse_failure_reason']})")
         return
@@ -369,17 +541,34 @@ def run_mode_b(
         "semester_count": len(semesters),
         "over_horizon": len(semesters) > scenario.profile.semesters_to_plan,
         "declared_unplanned": parsed.get("unplanned") or [],
+        # The model's own requirement accounting, stored raw. The derived flags below say
+        # whether it agreed with the scorer; only the object itself says what it actually
+        # claimed, and that is what you read when a flag looks wrong.
+        "requirements_covered": parsed.get("requirements_covered"),
         "rationale": parsed.get("rationale"),
         "rationale_flags": plan_scorers.rationale_flags(
             str(parsed.get("rationale") or ""), planned_codes, ctx.fixture
         ),
         "term_labels_ok": _term_labels_ok(parsed["semesters"], scenario.profile),
+        **plan_scorers.self_report_check(parsed["semesters"], score),
+        **plan_scorers.requirement_report_check(
+            parsed.get("requirements_covered"), ctx.fixture, scenario.profile,
+            semesters, score),
     })
+    # Anchoring is computed for BOTH modes whenever a sample plan is configured. Mode B never
+    # sees it, so Mode B's slot_match is the base rate a model reproduces from memory alone —
+    # without that baseline, Mode C's number is unreadable.
+    if ctx.sample_plan is not None:
+        rec.update(plan_scorers.template_anchoring(
+            ctx.sample_plan, semesters, score.hallucinated,
+            canonical=ctx.fixture.canonical))
     out.write(json.dumps(rec, default=str) + "\n")
     ctx.write_transcript(
-        model_cfg["name"], "plan_mode_b", scenario.id, run_idx, system, user, res.text,
+        model_cfg["name"], stage, scenario.id, run_idx, system, user, res.text,
         verdict=f"viable={score.viable} coverage={score.requirement_coverage:.0%} "
-                f"violations={score.violation_counts or 'none'}",
+                f"violations={score.violation_counts or 'none'} "
+                f"slot_match={rec.get('template_slot_match')}",
+        detail=_score_detail(score, semesters, scenario.profile),
     )
 
 
@@ -523,8 +712,9 @@ def run_model(ctx: EvalContext, model_cfg: dict, out, *, tasks: set[str], mitiga
         print(f"[env] {name}: vram_delta={env['vram_delta_mb']} offload={env['offload']} "
               f"n_ctx={env['server_n_ctx']}")
         if env["ctx_matches_config"] is False:
-            print(f"[WARN] {name}: server reports n_ctx={env['server_n_ctx']}, config asked for "
-                  f"{env['configured_num_ctx']} — this model is NOT comparable to the others.")
+            print(f"[WARN] {name}: server reports n_ctx={env['server_n_ctx']} per slot, config "
+                  f"implies {env['expected_slot_ctx']} (num_ctx {env['configured_num_ctx']} / "
+                  f"parallel {env['configured_parallel']}) — NOT comparable to the others.")
 
         runs = ctx.cfg["run"]["runs_per_pair"]
         for run_idx in range(runs):
@@ -599,6 +789,8 @@ def run_eval(
         raise SystemExit("No models matched the filter.")
 
     task_set = set(tasks or ctx.cfg["run"]["default_tasks"])
+    if not task_set:
+        raise SystemExit("No tasks left to run.")
     out_path = ctx.results_dir / f"runs_{tag}.jsonl"
 
     # The lock is taken BEFORE anything is written. Taking it later was a real bug: a run that
@@ -635,6 +827,15 @@ def write_meta(ctx: EvalContext, tag: str, selected: list[dict], tasks: set[str]
             "courses": len(ctx.fixture.catalog),
             "requirement_groups": len(ctx.fixture.requirement_groups),
         },
+        # Mode B's whole context. Recorded per table, not just as one hash: when the export
+        # changes, "which table moved" is the first question, and a single digest cannot answer
+        # it. Its bytes are already inside plan_mode_b's static hash — this is the readable copy.
+        "mock_db": {
+            "path": ctx.database.path.name,
+            "hash": ctx.database.db_hash,
+            "tables": {t: {"rows": len(ctx.database.rows(t)), "hash": ctx.database.files[t]}
+                       for t in ctx.database.tables},
+        },
         "static_hashes": {
             "plan_mode_a": ctx.prompts.plan_proposal(scenario, generate_plan(
                 scenario.profile, ctx.fixture.catalog))[2],
@@ -643,6 +844,18 @@ def write_meta(ctx: EvalContext, tag: str, selected: list[dict], tasks: set[str]
             "explain": ctx.prompts.explain_plan("x", "{}")[2],
         },
     }
+    if ctx.sample_plan is not None:
+        # Recorded separately from fixture_hash on purpose: the sample plan is prompt input,
+        # not scoring authority. It cannot change a Mode A/B score, and folding it into
+        # fixture_hash would invalidate those records for a change they never saw.
+        meta["sample_plan"] = {
+            "path": ctx.sample_plan.path.name,
+            "hash": ctx.sample_plan.plan_hash,
+            "url": ctx.sample_plan.source.get("url"),
+            "semesters": len(ctx.sample_plan.semesters),
+            "named_courses": len(ctx.sample_plan.slot_of),
+            "off_catalog_codes": sorted(ctx.sample_plan.off_catalog_codes),
+        }
     (ctx.results_dir / f"meta_{tag}.json").write_text(json.dumps(meta, indent=2))
     if not ctx.fixture.verified:
         print("[meta] NOTE: plan fixture is marked verified: false — rankings are usable, "

@@ -50,10 +50,84 @@ def first_planning_term(term: str, year: int) -> tuple[str, int]:
 
 
 def prereqs_satisfied(course: Course, completed: set[str]) -> bool:
-    return all(prereq in completed for prereq in course.prereqs)
+    """Conservative on purpose: corequisites are required UP FRONT here.
+
+    A coreq may legally be taken alongside its course, but making the greedy planner exploit
+    that needs it to reason about pairs it has not selected yet. Requiring it earlier is always
+    legal — never a registration wall — at the cost of occasionally scheduling a term later than
+    strictly necessary. Validation of a plan the student built themselves applies the true
+    same-semester rule, so a hand-edited plan is not flagged for something legal.
+    """
+    required = set(course.prereqs) | set(course.coreqs)
+    return all(code in completed for code in required)
 
 
-def generate_plan(profile: StudentProfile, catalog: list[Course]) -> PlanResponse:
+def is_major_course(code: str, subject: str) -> bool:
+    """Does this course code belong to the major's subject ("CS 25100" -> CS)?
+
+    Subject prefix rather than requirement tags: ``required`` is carried by MA 26100 and
+    PHYS 17200 as much as by CS 25100, and it is specifically the department's own courses
+    that stack into an unmanageable term. Matched on the leading alphabetic run, so "CS25100",
+    "CS 25100" and "cs 25100" all count.
+    """
+    if not subject:
+        return False
+    letters = "".join(ch for ch in str(code) if not ch.isdigit()).strip().upper()
+    return letters.replace("-", "").replace(" ", "") == subject.strip().upper()
+
+
+def semester_credit_target(
+    profile: StudentProfile,
+    remaining: list[str],
+    catalog_by_code: dict[str, Course],
+    semester_index: int,
+) -> int:
+    """Credits to aim for in THIS semester. Never above ``max_credits_per_semester``.
+
+    An explicit ``target_credits_per_semester`` is honoured as-is (clamped). Otherwise the
+    target is the even split of what is left over the terms that are left, which is what makes
+    a plan spread across the student's horizon instead of front-loading to the cap and leaving
+    the tail empty. Recomputing it every term is what lets it self-correct: a term that cannot
+    reach the target raises the bar for the terms after it, so the work still lands inside the
+    horizon rather than piling into a stub semester at the end.
+
+    Both degenerate cases fall back to the cap, i.e. the pre-2026-07-29 behaviour: no semesters
+    left to divide by, and nothing left to place.
+    """
+    explicit = profile.target_credits_per_semester
+    if explicit:
+        return min(int(explicit), profile.max_credits_per_semester)
+    semesters_left = profile.semesters_to_plan - semester_index
+    if semesters_left <= 0:
+        return profile.max_credits_per_semester
+    credits_left = sum(
+        catalog_by_code[code].credits for code in remaining if code in catalog_by_code
+    )
+    if credits_left <= 0:
+        return profile.max_credits_per_semester
+    even_split = -(-credits_left // semesters_left)  # integer ceiling
+    return min(even_split, profile.max_credits_per_semester)
+
+
+def generate_plan(
+    profile: StudentProfile, catalog: list[Course], *, _spread: bool = True
+) -> PlanResponse:
+    """Build a legal plan, spreading the load across the horizon where that is free.
+
+    SPREAD FIRST, PACK IF IT DOES NOT FIT. Aiming at ``target_credits_per_semester`` instead of
+    the cap leaves capacity unused in early terms, and that capacity does not come back: when a
+    prerequisite chain opens up late, the courses it was holding have nowhere to go and end up
+    unplanned. MEASURED in model_eval — a sophomore profile with the CS track reordered to the
+    front placed 55 credits as [11, 9, 10, 9, 9, 7] under a 15-credit cap and stranded two
+    required electives; the same profile filling to the cap placed 61 as [14, 13, 15, 13, 6]
+    and stranded nothing.
+
+    It bites specifically when ``remaining_courses`` has been REORDERED, which is what the
+    revise-plan agent does — so without this fallback a student's stated preference could
+    silently drop a required course from their plan. Coverage is never the price of a nicer
+    distribution: a spread plan that strands more than the packed one is discarded.
+    ``_spread`` is the internal re-entry for that second attempt, not part of the API.
+    """
     catalog_by_code = {course.code: course for course in catalog}
     completed = set(profile.completed_courses)
     remaining = list(profile.remaining_courses)
@@ -73,10 +147,18 @@ def generate_plan(profile: StudentProfile, catalog: list[Course]) -> PlanRespons
 
     term, year = first_planning_term(profile.start_term.lower(), profile.start_year)
 
-    for _ in range(profile.semesters_to_plan):
+    for semester_index in range(profile.semesters_to_plan):
         selected: list[Course] = []
         selected_credits = 0
         semester_warnings: list[str] = []
+        # Recomputed EVERY term, not once: `remaining` shrinks as courses are placed and the
+        # horizon shrinks with it, so a term that came up short automatically raises the bar
+        # for the terms after it. Clamped by the cap, which is still the only hard bound.
+        credit_target = (
+            semester_credit_target(profile, remaining, catalog_by_code, semester_index)
+            if _spread
+            else profile.max_credits_per_semester
+        )
 
         candidates = []
         for code in remaining:
@@ -96,10 +178,42 @@ def generate_plan(profile: StudentProfile, catalog: list[Course]) -> PlanRespons
             )
         )
 
-        for course in candidates:
-            if selected_credits + course.credits <= profile.max_credits_per_semester:
-                selected.append(course)
+        # TWO PASSES over the same candidate list, differing only in the major-course ceiling
+        # they allow. Pass one holds the soft limit (``preferred_major_courses_per_semester``),
+        # so everything else the student could be taking gets first claim on the room; pass two
+        # raises it to the hard limit and admits a further major course only into room nothing
+        # else filled. The result is "at most `preferred` CS courses unless the semester would
+        # otherwise go short, and never more than `max`" — with no second sort, so the priority
+        # order the revise-plan agent controls still decides which courses those are.
+        #
+        # A credit cap alone cannot express this: four 4-credit CS courses and one CS course
+        # plus three gen-eds are both 16 credits and nothing like the same term. Before this
+        # existed the planner produced 4- and 5-CS semesters, which is not a plan a student
+        # would follow.
+        chosen: set[str] = set()
+        selected_majors = 0
+        soft_major_limit = min(
+            profile.preferred_major_courses_per_semester,
+            profile.max_major_courses_per_semester,
+        )
+        for major_limit in (soft_major_limit, profile.max_major_courses_per_semester):
+            for course in candidates:
+                if course.code in chosen:
+                    continue
+                # `credit_target`, not `max_credits_per_semester`: this is the line that
+                # turns a front-loaded plan into a spread one. The cap still exists — the
+                # target is clamped to it — but it is no longer what the greedy fill aims at.
+                if selected_credits + course.credits > credit_target:
+                    continue
+                if is_major_course(course.code, profile.major_subject):
+                    if selected_majors >= major_limit:
+                        continue
+                    selected_majors += 1
+                chosen.add(course.code)
                 selected_credits += course.credits
+        # Emitted in candidate (priority) order rather than the order the passes admitted them,
+        # so a semester reads the same way it always has.
+        selected = [course for course in candidates if course.code in chosen]
 
         if not selected and remaining:
             blocked_reasons = []
@@ -158,10 +272,17 @@ def generate_plan(profile: StudentProfile, catalog: list[Course]) -> PlanRespons
             + ", ".join(remaining)
         )
 
-    return PlanResponse(
+    plan = PlanResponse(
         student_name=profile.name,
         degree_program=profile.degree_program,
         semesters=semesters,
         unplanned_courses=remaining,
         warnings=warnings,
     )
+    # The fallback. Only ever taken when spreading actually cost coverage, so a plan can never
+    # come out worse than it would have before the credit target existed.
+    if _spread and plan.unplanned_courses:
+        packed = generate_plan(profile, catalog, _spread=False)
+        if len(packed.unplanned_courses) < len(plan.unplanned_courses):
+            return packed
+    return plan

@@ -31,11 +31,27 @@ class Settings(BaseSettings):
     # Generous ceiling so truncation is a model fault, not a config one; mirrors
     # model_eval/config.yaml's max_output_tokens. Unlike Ollama's num_ctx, llama-server's
     # context size is fixed at process launch (`--ctx-size`; omitted entirely on the 2060
-    # Super box, which defaults to the model's native 32768 and still fits under 8GB VRAM
-    # at Q4_K_M) and can't be overridden per-request — keep this budget comfortably under
-    # whatever that launch context is so a long system+user prompt still leaves room to
-    # generate.
-    llamacpp_max_tokens: int = 1024
+    # Super box, where the default `0` means "the context the model was trained with" —
+    # 32768 for Qwen2.5-Coder-7B, which still fits under 8GB VRAM at Q4_K_M) and can't be
+    # overridden per-request — keep this budget comfortably under whatever that launch
+    # context is so a long system+user prompt still leaves room to generate. 8192 is a
+    # quarter of 32768, so it is.
+    #
+    # RAISED FROM 1024, 2026-07-29, because 1024 was silently breaking revise-plan. The
+    # eval measured what the verbose models actually write into PlanEditProposal.rationale:
+    # up to 10,659 characters (~2.7k tokens) for qwen3.5-9b, ~7.2k chars for
+    # qwen3.6-35b-a3b. At 1024 they never reach the closing keys, the response fails to
+    # validate, and revise_plan logs "unusable proposal" and degrades to a no-op — the
+    # student's feedback silently does nothing. The eval did not catch it because
+    # model_eval ran Mode A at 16384 while production ran at 1024, so the harness's claim
+    # to measure the shipped path was false on exactly this axis.
+    #
+    # Settled at 4096 once PlanEditProposal.rationale grew its max_length=400: the reason
+    # this needed to be large was the rambling, and the grammar now forbids that. A capped
+    # proposal is a few hundred tokens; the largest thing this budget still has to cover is
+    # explain_plan, which is free text with no schema and has never exceeded ~1400 tokens.
+    # Mirrors model_eval/config.yaml's run.max_output_tokens — change one, change the other.
+    llamacpp_max_tokens: int = 4096
 
     # Anthropic API — kept as an optional swappable backend (services/anthropic_client.py),
     # not the active path. Requires ANTHROPIC_API_KEY (read by the SDK from the process

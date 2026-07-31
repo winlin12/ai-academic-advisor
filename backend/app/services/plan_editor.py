@@ -35,7 +35,7 @@ from app.models.schemas import (
     StudentProfile,
 )
 from app.services.catalog import load_catalog
-from app.services.planner import prereqs_satisfied
+from app.services.planner import is_major_course, prereqs_satisfied
 from app.services.planner_catalog import fetch_courses_by_codes, normalize_course_code
 
 logger = logging.getLogger(__name__)
@@ -210,6 +210,26 @@ def _revalidate_layout(
             warnings.append(
                 f"{total_credits} credits exceeds the {credit_cap}-credit cap for this semester"
             )
+
+        # The second load cap, warned about on the same terms as the credit cap. A student who
+        # drags a fourth CS course into a term is inside their credit cap and has still built a
+        # semester the planner would never produce; without this the edit looks clean.
+        if profile is not None:
+            major_courses = sum(
+                1 for planned in courses
+                if is_major_course(planned.code, profile.major_subject)
+            )
+            if major_courses > profile.max_major_courses_per_semester:
+                warnings.append(
+                    f"{major_courses} {profile.major_subject} courses exceeds the "
+                    f"{profile.max_major_courses_per_semester}-course limit for this semester"
+                )
+            elif major_courses > profile.preferred_major_courses_per_semester:
+                warnings.append(
+                    f"{major_courses} {profile.major_subject} courses in one semester — over "
+                    f"the {profile.preferred_major_courses_per_semester} most students find "
+                    f"manageable, though within the limit"
+                )
 
         completed.update(normalize_course_code(course.code) for course in courses)
         rebuilt.append(
