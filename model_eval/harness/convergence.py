@@ -1038,7 +1038,6 @@ def run_case(
                     plan_schema(
                         ctx.cfg["run"]["planning_terms"],
                         [c.code for c in fixture.catalog],
-                        [g["id"] for g in fixture.requirement_groups],
                     ),
                 ),
             )

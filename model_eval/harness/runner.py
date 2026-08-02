@@ -499,8 +499,7 @@ def _run_freeform_plan(
             response_format=json_response_format(
                 "PlanOfStudy", plan_schema(
                     ctx.cfg["run"]["planning_terms"],
-                    [c.code for c in ctx.fixture.catalog],
-                    [g["id"] for g in ctx.fixture.requirement_groups])),
+                    [c.code for c in ctx.fixture.catalog])),
         )
     except LlamaCppError as exc:
         out.write(json.dumps({
@@ -541,19 +540,11 @@ def _run_freeform_plan(
         "semester_count": len(semesters),
         "over_horizon": len(semesters) > scenario.profile.semesters_to_plan,
         "declared_unplanned": parsed.get("unplanned") or [],
-        # The model's own requirement accounting, stored raw. The derived flags below say
-        # whether it agreed with the scorer; only the object itself says what it actually
-        # claimed, and that is what you read when a flag looks wrong.
-        "requirements_covered": parsed.get("requirements_covered"),
         "rationale": parsed.get("rationale"),
         "rationale_flags": plan_scorers.rationale_flags(
             str(parsed.get("rationale") or ""), planned_codes, ctx.fixture
         ),
         "term_labels_ok": _term_labels_ok(parsed["semesters"], scenario.profile),
-        **plan_scorers.self_report_check(parsed["semesters"], score),
-        **plan_scorers.requirement_report_check(
-            parsed.get("requirements_covered"), ctx.fixture, scenario.profile,
-            semesters, score),
     })
     # Anchoring is computed for BOTH modes whenever a sample plan is configured. Mode B never
     # sees it, so Mode B's slot_match is the base rate a model reproduces from memory alone —

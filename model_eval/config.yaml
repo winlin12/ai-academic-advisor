@@ -14,15 +14,15 @@ run:
   # grows with it — ~9.8k tokens before, and the headroom over max_plan_tokens was the thing
   # that would have gone first. KV cache is f16, so this doubles KV VRAM — which is what
   # n_gpu_moe: 6 below is paying for.
-  num_ctx: 32768
+  num_ctx: 16384
   parallel: 1
   n_gpu_layers: 999
-  # n_cpu_moe: 35
+  n_cpu_moe: 24
   # 6 as of 2026-07-31, down from 7: doubling num_ctx doubled the f16 KV cache, and on this
   # box's 8 GB card the MoE expert layers are what has to give way. One fewer expert layer on
   # the GPU costs throughput on the two `server`-bracket models and nothing on the dense 8gb
   # ones. Read the [env] offload row per model rather than assuming this was enough.
-  n_gpu_moe: 6
+  # n_gpu_moe: 6
   cache_type_k: "f16"        
   cache_type_v: "f16"       
   temperature: 0.15
@@ -41,15 +41,26 @@ run:
   default_tasks: [plan_a, plan_b, qa, explain]
 
 models:
+  - name: "gemma4-12b"
+    gguf: "gemma4-12b/gemma-4-12b-it-IQ4_XS.gguf"
+    bracket: server         
+    think: false
+    n_cpu_moe: 0
   - name: "gemma4-26b"
     gguf: "gemma4-26b/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"
     bracket: server         
+    think: false 
+    n_cpu_moe: 22
+  - name: "gemma4-26b-s"
+    gguf: "gemma4-26b-s/gemma-4-26B-A4B-it-UD-IQ4_NL.gguf"
+    bracket: server         
     think: false
+    n_cpu_moe: 20
   - name: "qwen3.6-35b-a3b"
     gguf: "qwen3.6-35b-a3b/Qwen_Qwen3.6-35B-A3B-Q4_K_M.gguf"
     bracket: server
     think: false
-  
+    n_cpu_moe: 32
   - name: "gemma4-e4b"
     gguf: "gemma4-e4b/gemma-4-E4B-it-Q4_K_M.gguf"
     bracket: 8gb
@@ -57,14 +68,6 @@ models:
   
   - name: "qwen3.5-9b"
     gguf: "qwen3.5-9b/Qwen3.5-9B-Q4_K_M.gguf"
-    bracket: 8gb
-    think: false
-  - name: "qwen2.5-coder-7b-instruct"     # the app's current default (backend LLAMACPP_MODEL)
-    gguf: "Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf"
-    bracket: 8gb
-    think: false
-  - name: "qwen3-8b"
-    gguf: "qwen3-8b/Qwen_Qwen3-8B-Q4_K_M.gguf"
     bracket: 8gb
     think: false
  

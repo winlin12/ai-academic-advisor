@@ -133,12 +133,17 @@ PROPOSAL_SCHEMA: dict[str, Any] = {
 # arm's identity. The RESOLVED enum values are per student (they come from that student's
 # remaining courses), which belongs to the variable tail — so the policy name is hashed, not the
 # values, and the static hash stays identical across scenarios the way the invariant requires.
-# `requirements_covered` is appended 2026-07-31. It is applied by `plan_schema()`, NOT present
-# in the PLAN_SCHEMA template that `_static_hash` actually hashes — so without naming it here
-# the Mode B hash would not move for a change that adds nine required keys to the grammar, and
-# the report would happily pool records from two different response formats. That is precisely
-# the failure this string exists to prevent.
-SCHEMA_ENUM_POLICY = "enums:reorder,defer,avoid_tags,courses<-context;requirements_covered<-groups"
+# `;requirements_covered<-groups` was appended 2026-07-31 and removed again 2026-08-02 with the
+# key itself (see plan_schema). It had to be named here while it existed because it was injected
+# by `plan_schema()` at call time and so was invisible to the PLAN_SCHEMA template that
+# `_static_hash` actually hashes. Nothing replaces it: `total_credits` and `major_course_count`
+# went in the same commit and those ARE in the template, so Mode B's hash moves on their removal
+# without help. Anything added back to the grammar at call time must be named here again.
+#
+# NOTE this string is shared with Mode A, whose grammar did not change — its static hash moves
+# once here anyway (c45d38252a6a236b -> 223926a625f420ec) because the Mode B clause was living in
+# the shared string. Mode A records do not pool across this commit; the format is the same.
+SCHEMA_ENUM_POLICY = "enums:reorder,defer,avoid_tags,courses<-context"
 
 
 def proposal_schema(remaining_courses: list[str], known_tags: list[str]) -> dict[str, Any]:
@@ -291,8 +296,7 @@ already decided to take in a specific semester.
 
 
 def plan_schema(planning_terms: list[str],
-                catalog_codes: list[str] | None = None,
-                requirement_group_ids: list[str] | None = None) -> dict[str, Any]:
+                catalog_codes: list[str] | None = None) -> dict[str, Any]:
     """Mode B/C's response schema, with the term and course enums restricted to what exists.
 
     Encoding the restriction in the GRAMMAR rather than only in the prose matters: with summer
@@ -306,41 +310,30 @@ def plan_schema(planning_terms: list[str],
     class outright. It cannot touch the other 97% (prereq order, duplicates, credit sums, the
     major cap) — no grammar can express those — which is what Mode C's feedback loop is for.
 
-    REQUIREMENT ACCOUNTING, added 2026-07-31, and the reason it is in the grammar rather than in
-    the prompt: coverage failures are POSITIONAL. Over 162 Mode B plans, the groups at the end of
-    `requirement_groups` were dropped an order of magnitude more often than the ones at the top —
-    mi-required 9 and mi-ai-choice 3, against gen-ed-core 84 and gen-ed-selective 78 — and the
-    plans that dropped them had scheduled only 66 of 100 available credits. The models were not
-    short of courses or of room; they worked down the list, did the major properly, and trailed
-    off. Prose cannot fix an attention problem, because more prose is more to attend to.
-    A required key per group can: the JSON physically cannot close until the model has written
-    something for `gen-ed-selective`, so the last group gets the same forced consideration as the
-    first. Values are enum-constrained to real course codes, so the accounting cannot be
-    satisfied with prose either.
+    REQUIREMENT ACCOUNTING (`requirements_covered`, a required key per group) lived here from
+    2026-07-31 to 2026-08-02. The finding that motivated it stands and is worth keeping: coverage
+    failures are POSITIONAL. Over 162 Mode B plans, the groups at the end of `requirement_groups`
+    were dropped an order of magnitude more often than the ones at the top — mi-required 9 and
+    mi-ai-choice 3, against gen-ed-core 84 and gen-ed-selective 78 — and the plans that dropped
+    them had scheduled only 66 of 100 available credits. The models were not short of courses or
+    of room; they worked down the list, did the major properly, and trailed off.
 
-    It is scored as a DIAGNOSTIC against the computed coverage, never as the coverage itself —
-    a model that claims CS 18000 covers `science` must not be able to talk its way to a pass.
+    WHY IT WENT ANYWAY: it cost roughly 440 output tokens per plan — Mode B's median output went
+    600 -> 1040 and its median latency 32 s -> 65 s on gemma4-26b, which is ~40% of the sweep's
+    wall clock — and it never produced a number the harness could not compute itself. Coverage is
+    recomputed from the semesters against the fixture regardless, and Mode C's repair variant
+    already feeds that COMPUTED gap back to the model (see convergence.py's `missing_requirements`
+    -> prompts.revise_user). Making the model narrate an accounting we derive anyway is paying
+    generation time for a diagnostic.
+
+    If positional drop-off regresses in the next sweep, the fix to try first is prompt ORDER (put
+    the groups the models trail off on where they will be attended to), not another required key.
     """
     schema = json.loads(json.dumps(PLAN_SCHEMA))
     semester = schema["properties"]["semesters"]["items"]["properties"]
     semester["term"]["enum"] = list(planning_terms)
     if catalog_codes:
         semester["courses"]["items"] = {"type": "string", "enum": sorted(catalog_codes)}
-    if requirement_group_ids:
-        codes = ({"type": "string", "enum": sorted(catalog_codes)} if catalog_codes
-                 else {"type": "string"})
-        schema["properties"]["requirements_covered"] = {
-            "type": "object",
-            "description": (
-                "For EVERY requirement group, list the courses in your plan that satisfy it. "
-                "A group you cannot cover gets an empty list — but check the plan first."
-            ),
-            "properties": {gid: {"type": "array", "items": dict(codes)}
-                           for gid in requirement_group_ids},
-            "required": list(requirement_group_ids),
-            "additionalProperties": False,
-        }
-        schema["required"] = [*schema["required"], "requirements_covered"]
     return schema
 
 
@@ -360,31 +353,20 @@ PLAN_SCHEMA: dict[str, Any] = {
                         "items": {"type": "string"},
                         "description": "Course codes exactly as written in the catalog, e.g. 'CS 25100'.",
                     },
-                    # FORCED SELF-CHECK. These two are not read back into the plan — the scorer
-                    # recomputes both from `courses` — they exist to make the model state the
-                    # numbers it keeps getting wrong. Credit-cap and major-overload violations
-                    # are 33% of all Mode B failures, and both are constraints a grammar cannot
-                    # express, so the next best thing is to make the arithmetic explicit and
-                    # unskippable. Costs ~40 tokens per plan.
+                    # `total_credits` and `major_course_count` were required here as a FORCED
+                    # SELF-CHECK (make the model state the arithmetic it keeps getting wrong)
+                    # and REMOVED 2026-08-02 with `requirements_covered`, for the same reason:
+                    # neither was ever read back into the plan — the scorer recomputes both from
+                    # `courses` — so the model was spending generation time restating a number
+                    # the harness already has. ~40 tokens per plan, ~8 per semester.
                     #
-                    # Scored as a DIAGNOSTIC (`credits_self_reported_ok`): when the stated total
-                    # disagrees with the real one, the model lost track of its own semester,
-                    # which is a different bug from knowing the total and busting the cap
-                    # anyway. Those want different fixes and no other column separates them.
-                    "total_credits": {
-                        "type": "integer",
-                        "description": "Sum of the credits of the courses in THIS semester. Add them up.",
-                    },
-                    "major_course_count": {
-                        "type": "integer",
-                        "description": (
-                            "How many courses in THIS semester are from the student's major "
-                            "subject (the subject named in their per-semester course limit, "
-                            "e.g. CS). Count them."
-                        ),
-                    },
+                    # WHAT IS LOST is the `credits_self_reported_ok` diagnostic, which separated
+                    # "lost track of its own semester" from "knew the total and busted the cap
+                    # anyway". Both now land in the credit-cap violation count undifferentiated.
+                    # If that distinction is needed again, it is cheaper to recover from the
+                    # rationale text than to reinstate a required key.
                 },
-                "required": ["term", "year", "courses", "total_credits", "major_course_count"],
+                "required": ["term", "year", "courses"],
             },
         },
         "unplanned": {
