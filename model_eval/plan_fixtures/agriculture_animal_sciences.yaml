@@ -1,0 +1,563 @@
+# =============================================================================
+# PLAN-OF-STUDY GROUND TRUTH — Animal Sciences: Pre-Veterinary Medicine
+# Concentration, BS (College of Agriculture)
+#
+#   verified: false     <-- READ THIS BEFORE QUOTING ANY NUMBER FROM A RUN
+#
+# PROVENANCE — REAL, from the crawled catalog Postgres this time (rewritten
+# 2026-08-08; the first version of this file was hand-guessed and got the
+# department's own course prefix wrong — ANIMAL SCIENCES COURSES ARE "ANSC",
+# NOT "ASL"). Codes/titles/credits below were queried from program
+# a21780e8-4232-4308-a66f-5dfc57c89da8 ("Animal Sciences: Pre-Veterinary
+# Medicine Concentration", catalog year 6f29fb29-07a2-426c-8b94-543c353843bf)
+# in the same `catalog-ingestion-postgres` database `mechanical_engineering.
+# yaml` reads from — see that file's header for the query pattern
+# (`requirement_groups` -> `requirement_options` -> `courses`). Same caveats
+# apply: prereqs are Acalog-unpublished (hand-written, flagged below),
+# offered_terms are hand-written guesses (not run through `refresh-offerings`,
+# which only covers the CS MI course list), and two real requirement groups
+# were crawled with NO option rows at all (prose-only in Acalog) — left
+# unmodeled rather than invented; see the comments where they'd go.
+#
+# WHAT MAKES THIS PROGRAM'S REQUIREMENT SHAPE DIFFERENT FROM CS/ME:
+#   - A LIGHTER, DIFFERENT MATH TRACK: MA 16010 "Applied Calculus I", not the
+#     MA 16100/16200 engineering sequence CS/ME both require.
+#   - A college-wide half-credit orientation pair (AGR 10100 + AGR 11400) —
+#     the loader casts `credits` to `int`, so the real 0.5-credit value is
+#     rounded up to 1 here; flagged inline.
+#   - A required ECONOMICS SELECTIVE (pick one of six AGEC/ECON courses) —
+#     structurally the same shape as `mechanical_engineering.yaml`'s own
+#     `me-economics-selective`, real for this program too.
+#   - A SPECIES-MANAGEMENT SELECTIVE (pick one of seven ANSC 44xxx courses)
+#     folded into the otherwise-required major core to reach its real 30-
+#     credit total — the crawl lists all seven as flat options with no
+#     sub-group, so which one is "the elective" is an editorial read, not a
+#     crawled fact.
+#   - College preferred a specific WRITTEN COMPOSITION course (ENGL 10800,
+#     not CS/ME's ENGL 10600) — real, from this program's own crawled text.
+# =============================================================================
+
+program:
+  name: "Animal Sciences: Pre-Veterinary Medicine Concentration, BS"
+  slug: "ag"
+  # Real, crawled Postgres program this fixture's scenarios were written against —
+  # Mode B/C read this program's live catalog via `harness/real_db.py`, same source
+  # `mechanical_engineering.yaml`'s own header describes. Selected by `run.py`'s
+  # `--major`/multi-school loop, not a live DB text search — see `run.py resolve_major`.
+  real_db_program_id: "a21780e8-4232-4308-a66f-5dfc57c89da8"
+  # SCOPE, added 2026-08-09 — Mode B/C now measure ONLY this program's own major-scope
+  # requirement groups (real_db._scope_for == "program"); college/university-scoped groups
+  # (gen-ed, First-Year Engineering, ...) are dropped from what the model is shown and
+  # scored against, tested standalone instead by their own pseudo-major fixture — see
+  # engineering_core.yaml / agriculture_core.yaml / gen_ed_world_language.yaml and
+  # real_db.fetch_real_db_base's `scope_filter` docstring. "" (absent) = unfiltered, the
+  # old/default behaviour every fixture had before this field existed.
+  requirement_scope: "major"
+  catalog_year: "2026-2027"
+  campus: "West Lafayette"
+  total_credits_min: 120
+  verified: false
+  major_subject: "ANSC"
+  preferred_major_courses_per_semester: 3
+  max_major_courses_per_semester: 3
+  target_credits_per_semester: 15
+  hard_credit_cap: 18
+
+courses:
+  # ---- College of Agriculture orientation pair (REAL, 0.5cr each in Acalog — rounded to 1) ----
+  - code: "AGR 10100"
+    title: "Introduction To The College Of Agriculture And Purdue University"
+    credits: 1
+    prereqs: []
+    offered_terms: [fall]                   # NOT observed — hand-written, unverified
+    requirement_tags: [required, ag-college-core]
+  - code: "AGR 11400"
+    title: "Introduction To Animal Sciences Academic Programs"
+    credits: 1
+    prereqs: []
+    offered_terms: [fall]                   # NOT observed — hand-written, unverified
+    requirement_tags: [required, ag-college-core]
+
+  # ---- Animal Sciences major core (REAL — "Required Major Courses", 30 credits) ----
+  - code: "ANSC 10200"
+    title: "Introduction To Animal Agriculture"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, animal-sciences]
+  - code: "ANSC 12100"
+    title: "Ethics Of Animal Use"
+    credits: 2
+    prereqs: []
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, animal-sciences]
+  - code: "ANSC 22100"
+    title: "Principles Of Animal Nutrition"
+    credits: 3
+    prereqs: ["ANSC 10200"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, animal-sciences]
+  - code: "ANSC 23000"
+    title: "Physiology Of Domestic Animals"
+    credits: 4
+    prereqs: ["BIOL 11000"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, animal-sciences]
+  - code: "ANSC 24000"
+    title: "Principles Of Animal Production"
+    credits: 3
+    prereqs: ["ANSC 10200"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, animal-sciences]
+  - code: "ANSC 25500"
+    title: "Principles Of Animal Products"
+    credits: 3
+    prereqs: ["ANSC 10200"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, animal-sciences]
+  - code: "ANSC 28100"
+    title: "Career Planning In Animal Sciences"
+    credits: 1
+    prereqs: []
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, animal-sciences]
+  - code: "ANSC 31100"
+    title: "Animal Breeding And Genetics"
+    credits: 4
+    prereqs: ["ANSC 22100", "STAT 30100"]
+    offered_terms: [fall]                   # NOT observed — hand-written, unverified
+    requirement_tags: [required, animal-sciences]
+  - code: "ANSC 33300"
+    title: "Physiology Of Reproduction"
+    credits: 3
+    prereqs: ["ANSC 23000"]
+    offered_terms: [spring]                 # NOT observed — hand-written, unverified
+    requirement_tags: [required, animal-sciences]
+  - code: "ANSC 48100"
+    title: "Contemporary Issues In Animal Sciences"
+    credits: 1
+    # CAPSTONE — senior standing, per Acalog's own "(Capstone)" annotation on this row.
+    prereqs: ["ANSC 31100", "ANSC 33300"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, animal-sciences, project-heavy]
+
+  # ---- Species-management selective (REAL — same flat list, pick one, 3 credits) ----
+  - code: "ANSC 44000"
+    title: "Horse Management"
+    credits: 3
+    prereqs: ["ANSC 24000"]
+    offered_terms: [fall]                   # NOT observed — hand-written, unverified
+    requirement_tags: [animal-sciences-elective]
+  - code: "ANSC 44100"
+    title: "Beef Management"
+    credits: 3
+    prereqs: ["ANSC 24000"]
+    offered_terms: [spring]                 # NOT observed — hand-written, unverified
+    requirement_tags: [animal-sciences-elective]
+  - code: "ANSC 44200"
+    title: "Sheep Management"
+    credits: 3
+    prereqs: ["ANSC 24000"]
+    offered_terms: [fall]                   # NOT observed — hand-written, unverified
+    requirement_tags: [animal-sciences-elective]
+  - code: "ANSC 44300"
+    title: "Swine Management"
+    credits: 3
+    prereqs: ["ANSC 24000"]
+    offered_terms: [spring]                 # NOT observed — hand-written, unverified
+    requirement_tags: [animal-sciences-elective]
+  - code: "ANSC 44400"
+    title: "Dairy Management"
+    credits: 3
+    prereqs: ["ANSC 24000"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [animal-sciences-elective]
+  - code: "ANSC 44500"
+    title: "Commercial Poultry Management"
+    credits: 3
+    prereqs: ["ANSC 24000"]
+    offered_terms: [spring]                 # NOT observed — hand-written, unverified
+    requirement_tags: [animal-sciences-elective]
+  - code: "ANSC 44600"
+    title: "Companion Animal Management"
+    credits: 3
+    prereqs: ["ANSC 24000"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [animal-sciences-elective]
+
+  # ---- Pre-Veterinary Medicine concentration required courses (REAL, 39 credits exactly) ----
+  - code: "BCHM 30700"
+    title: "Biochemistry"
+    credits: 3
+    prereqs: ["CHM 25600"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, pre-vet, chemistry]
+  - code: "BCHM 30900"
+    title: "Biochemistry Laboratory"
+    credits: 1
+    prereqs: []
+    coreqs: ["BCHM 30700"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, pre-vet, chemistry, lab]
+  - code: "BIOL 22100"
+    title: "Introduction To Microbiology"
+    credits: 4
+    prereqs: ["BIOL 11100"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, pre-vet, science]
+  - code: "BIOL 23100"
+    title: "Biology III: Cell Structure And Function"
+    credits: 3
+    prereqs: ["BIOL 11100"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, pre-vet, science]
+  - code: "CHM 11510"
+    title: "General Chemistry I"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [required, pre-vet, chemistry]
+  - code: "CHM 11520"
+    title: "General Chemistry I - Laboratory"
+    credits: 1
+    prereqs: []
+    coreqs: ["CHM 11510"]
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [required, pre-vet, chemistry, lab]
+  - code: "CHM 11610"
+    title: "General Chemistry II"
+    credits: 3
+    prereqs: ["CHM 11510"]
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [required, pre-vet, chemistry]
+  - code: "CHM 11620"
+    title: "General Chemistry II - Laboratory"
+    credits: 1
+    prereqs: []
+    coreqs: ["CHM 11610"]
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [required, pre-vet, chemistry, lab]
+  - code: "CHM 25500"
+    title: "Organic Chemistry For The Life Sciences I"
+    credits: 3
+    prereqs: ["CHM 11610"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, pre-vet, chemistry]
+  - code: "CHM 25501"
+    title: "Organic Chemistry For The Life Sciences Laboratory I"
+    credits: 1
+    prereqs: []
+    coreqs: ["CHM 25500"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, pre-vet, chemistry, lab]
+  - code: "CHM 25600"
+    title: "Organic Chemistry For The Life Sciences II"
+    credits: 3
+    prereqs: ["CHM 25500"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, pre-vet, chemistry]
+  - code: "CHM 25601"
+    title: "Organic Chemistry For The Life Sciences Laboratory II"
+    credits: 1
+    prereqs: []
+    coreqs: ["CHM 25600"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, pre-vet, chemistry, lab]
+  - code: "PHYS 22000"
+    title: "General Physics"
+    credits: 4
+    prereqs: ["MA 16010"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, pre-vet, science]
+  - code: "PHYS 22100"
+    title: "General Physics"
+    credits: 4
+    prereqs: ["PHYS 22000"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, pre-vet, science]
+  - code: "VM 10200"
+    title: "Careers In Veterinary Medicine"
+    credits: 1
+    prereqs: []
+    offered_terms: [fall]                   # NOT observed — hand-written, unverified
+    requirement_tags: [required, pre-vet]
+
+  # Real crawled group "Animal Sciences Restricted Selectives (10 credits)" (id
+  # 81f36a2d-ff8b-40ca-acde-c27e15566765) has ZERO option rows — prose-only in
+  # Acalog, same class of gap `mechanical_engineering.yaml`'s header documents for
+  # its own program's sub-rules. NOT modeled here rather than invented; a real
+  # student's plan carries 10 more credits of restricted electives this fixture
+  # is blind to, on top of the already-unmodeled portion of `total_credits_min`.
+
+  # ---- economics selective (REAL — pick one, 3 credits) ----
+  - code: "AGEC 20300"
+    title: "Introductory Microeconomics For Food And Agribusiness"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [economics-selective]
+  - code: "AGEC 20400"
+    title: "Introduction To Resource Economics And Environmental Policy"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [economics-selective]
+  - code: "AGEC 21700"
+    title: "Economics"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [economics-selective]
+  - code: "ECON 21000"
+    title: "Principles Of Economics"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [economics-selective]
+  - code: "ECON 25100"
+    title: "Microeconomics"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [economics-selective]
+  - code: "ECON 25200"
+    title: "Macroeconomics"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [economics-selective]
+
+  # ---- other required science/stats (REAL, from "Other Departmental" group) ----
+  - code: "BIOL 11000"
+    title: "Fundamentals Of Biology I"
+    credits: 4
+    prereqs: []
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, science]
+  - code: "BIOL 11100"
+    title: "Fundamentals Of Biology II"
+    credits: 4
+    prereqs: ["BIOL 11000"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, science]
+  - code: "STAT 30100"
+    title: "Elementary Statistical Methods"
+    credits: 3
+    prereqs: ["MA 16010"]
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [required, statistics]
+
+  # ---- math (LIGHTER TRACK THAN CS/ME, real, see header) ----
+  - code: "MA 16010"
+    title: "Applied Calculus I"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [required, mathematics]
+
+  # ---- gen-ed core (REAL — this program's crawled text prefers ENGL 10800, not 10600) ----
+  - code: "ENGL 10800"
+    title: "First Year Composition"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [required, gen-ed, writing]
+  - code: "COM 11400"
+    title: "Fundamentals Of Speech Communication"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [required, gen-ed, oral-communication]
+
+  # ---- gen-ed / international-understanding selective pool ----
+  # The real "International Understanding", "Interpersonal Development", and "Human Cultures:
+  # Humanities" selectives (bde10300's children) crawled as PROSE ONLY — no option rows, same
+  # gap as the restricted-selectives group above. Reusing `cs_machine_intelligence.yaml`'s own
+  # verified UCC pool as a stand-in, same simplification `mechanical_engineering.yaml` makes for
+  # its own prose-only "Engineering Gen Ed" sub-rules — these ARE real, valid Purdue UCC courses,
+  # just not the crawled option list for THIS program's selective.
+  - code: "PHIL 15000"
+    title: "Principles Of Logic"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [gen-ed, humanities]
+  - code: "PSY 12000"
+    title: "Elementary Psychology"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [gen-ed, social-science]
+  - code: "HIST 10300"
+    title: "Introduction To The Modern World"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [gen-ed, humanities]
+  - code: "ANTH 10000"
+    title: "Being Human: Introduction To Anthropology"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [gen-ed, social-science]
+
+# --- degree requirements -----------------------------------------------------
+requirement_groups:
+  - id: ag-college-core
+    name: "College Of Agriculture — First-Year Orientation"
+    kind: all
+    courses: ["AGR 10100", "AGR 11400"]
+
+  - id: animal-sciences-core
+    name: "Animal Sciences Major Core"
+    kind: all
+    courses: ["ANSC 10200", "ANSC 12100", "ANSC 22100", "ANSC 23000", "ANSC 24000",
+              "ANSC 25500", "ANSC 28100", "ANSC 31100", "ANSC 33300", "ANSC 48100"]
+
+  - id: animal-sciences-elective
+    name: "Animal Sciences — Species-Management Selective (choose one)"
+    kind: choose
+    choose_credits: 3
+    courses: ["ANSC 44000", "ANSC 44100", "ANSC 44200", "ANSC 44300", "ANSC 44400",
+              "ANSC 44500", "ANSC 44600"]
+
+  - id: pre-vet-required
+    name: "Pre-Veterinary Medicine Concentration Requirements"
+    kind: all
+    courses: ["BCHM 30700", "BCHM 30900", "BIOL 22100", "BIOL 23100", "CHM 11510",
+              "CHM 11520", "CHM 11610", "CHM 11620", "CHM 25500", "CHM 25501",
+              "CHM 25600", "CHM 25601", "PHYS 22000", "PHYS 22100", "VM 10200"]
+
+  - id: economics-selective
+    name: "Economics Selective (choose one)"
+    kind: choose
+    choose_credits: 3
+    courses: ["AGEC 20300", "AGEC 20400", "AGEC 21700", "ECON 21000", "ECON 25100", "ECON 25200"]
+
+  - id: science-and-statistics
+    name: "Required Biology And Statistics"
+    kind: all
+    courses: ["BIOL 11000", "BIOL 11100", "STAT 30100"]
+
+  - id: mathematics
+    name: "Mathematics"
+    kind: all
+    courses: ["MA 16010"]
+
+  - id: gen-ed-core
+    name: "University Core — written and oral communication"
+    kind: all
+    courses: ["ENGL 10800", "COM 11400"]
+
+  - id: gen-ed-selective
+    name: "College Of Agriculture — International/Interpersonal/Humanities selectives (stand-in pool)"
+    kind: choose
+    choose_credits: 6
+    courses: ["PHIL 15000", "PSY 12000", "HIST 10300", "ANTH 10000"]
+
+# --- scenarios ---------------------------------------------------------------
+scenarios:
+  - id: prevet-fresh-start
+    label: "Incoming Pre-Vet Animal Sciences major, nothing completed"
+    profile:
+      name: "Avery"
+      degree_program: "Animal Sciences: Pre-Veterinary Medicine Concentration, BS"
+      completed_courses: []
+      start_term: fall
+      start_year: 2026
+      semesters_to_plan: 8
+      max_credits_per_semester: 17
+    feedback: >-
+      I'm starting from scratch in animal sciences, pre-vet track, and I want
+      to get into the animal physiology and nutrition courses as early as the
+      prerequisites allow — I'll be applying to vet school and don't want
+      those pushed late.
+    assertions:
+      - kind: scheduled_before
+        course: "ANSC 23000"
+        semester_index: 4
+        why: "ANSC 23000 gates ANSC 33300 and the reproduction/breeding sequence; deferring it past the midpoint stalls the pre-vet track."
+      - kind: max_credits_at_most
+        value: 17
+    world_language:
+      subject: SPAN
+      level: 1
+
+  - id: prevet-sophomore-catchup
+    label: "Second-year student who just declared Pre-Vet Animal Sciences"
+    profile:
+      name: "Jordan"
+      degree_program: "Animal Sciences: Pre-Veterinary Medicine Concentration, BS"
+      completed_courses: ["AGR 10100", "AGR 11400", "BIOL 11000", "MA 16010",
+                          "ENGL 10800", "COM 11400", "ANSC 10200"]
+      start_term: fall
+      start_year: 2026
+      semesters_to_plan: 6
+      max_credits_per_semester: 16
+    feedback: >-
+      I just declared the pre-vet concentration after a year of exploratory
+      studies and I have three years left. I want the organic chemistry
+      sequence on track since I know it gates everything else, and please
+      don't stack two chemistry labs in the same semester.
+    assertions:
+      - kind: scheduled_before
+        course: "CHM 11610"
+        semester_index: 3
+        why: "CHM 11610 gates the organic chemistry sequence and biochemistry; a late start cascades into an unfinishable plan."
+      - kind: max_credits_at_most
+        value: 16
+    world_language:
+      subject: GER
+      level: 2
+
+  - id: prevet-light-load
+    label: "Pre-Vet student who needs a reduced credit load"
+    profile:
+      name: "Sam"
+      degree_program: "Animal Sciences: Pre-Veterinary Medicine Concentration, BS"
+      completed_courses: ["AGR 10100", "AGR 11400", "MA 16010", "ENGL 10800"]
+      start_term: fall
+      start_year: 2026
+      semesters_to_plan: 8
+      max_credits_per_semester: 15
+    feedback: >-
+      I work at a veterinary clinic most afternoons, so please cap me at 12
+      credits a semester.
+    assertions:
+      - kind: max_credits_at_most
+        value: 12
+        why: "The student named an explicit cap; honouring it is the whole ask."
+      - kind: proposal_sets_credit_cap
+        value: 12
+    world_language:
+      subject: FR
+      level: 1
+
+  - id: prevet-spring-start
+    label: "Spring-start transfer student"
+    profile:
+      name: "Devin"
+      degree_program: "Animal Sciences: Pre-Veterinary Medicine Concentration, BS"
+      completed_courses: ["MA 16010", "ENGL 10800", "COM 11400", "PSY 12000",
+                          "PHIL 15000", "HIST 10300", "ANTH 10000"]
+      start_term: spring
+      start_year: 2027
+      semesters_to_plan: 8
+      max_credits_per_semester: 16
+    feedback: >-
+      I transferred in with my math and gen-ed credits done and I'm starting
+      in the spring. Get me through the animal sciences core and into the
+      pre-vet chemistry sequence.
+    notes: >-
+      A spring start shifts every fall-only course (ANSC 31100 among them) by
+      one position. Models that assume a canonical fall-start sequence collect
+      term violations here.
+    assertions:
+      - kind: scheduled_before
+        course: "ANSC 10200"
+        semester_index: 2
+      - kind: max_credits_at_most
+        value: 16
+    world_language:
+      subject: JPNS
+      level: 3

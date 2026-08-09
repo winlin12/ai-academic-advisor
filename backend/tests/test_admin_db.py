@@ -13,11 +13,11 @@ def test_fetch_rows_rejects_unknown_table():
 
 def test_fetch_rows_rejects_sql_injection_shaped_names():
     with pytest.raises(UnknownTableError):
-        fetch_rows("students; DROP TABLE students--")
+        fetch_rows("programs; DROP TABLE programs--")
 
 
 def test_row_select_expression_plain_table():
-    assert row_select_expression("students") == "to_jsonb(t)"
+    assert row_select_expression("programs") == "to_jsonb(t)"
 
 
 def test_row_select_expression_strips_hidden_columns():
@@ -61,7 +61,7 @@ def test_fetch_rows_clamps_page_size(monkeypatch):
             return False
 
     monkeypatch.setattr(admin_db, "_connect", lambda: FakeConnection())
-    result = fetch_rows("students", limit=9999, offset=-5)
+    result = fetch_rows("programs", limit=9999, offset=-5)
     assert result.limit == admin_db.MAX_PAGE_SIZE
     assert result.offset == 0
     assert captured["params"] == (admin_db.MAX_PAGE_SIZE, 0)

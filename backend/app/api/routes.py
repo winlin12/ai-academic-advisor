@@ -11,13 +11,13 @@ under ``routers/`` and is composed here into two mount points:
 
 from fastapi import APIRouter
 
-from app.api.routers import academic, admin, advisor, planning, students, system
+from app.api.routers import academic, admin, advisor, models, planning, system
 
 api_v1_router = APIRouter(prefix="/v1")
 api_v1_router.include_router(academic.router)
 api_v1_router.include_router(planning.router)
 api_v1_router.include_router(advisor.router)
-api_v1_router.include_router(students.router)
+api_v1_router.include_router(models.router)
 api_v1_router.include_router(admin.router)
 
 system_router = system.router

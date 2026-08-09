@@ -22,15 +22,20 @@ class _StubClient:
         self._responses = list(responses)
         self.prompts: list[str] = []
         self.schemas: list[dict | None] = []
+        self.seeds: list[int | None] = []
 
     async def propose(
         self, system_prompt: str, user_prompt: str, output_type: type[PlanEditProposal],
-        schema: dict | None = None,
+        schema: dict | None = None, *, seed: int | None = None, max_tokens: int | None = None,
     ) -> PlanEditProposal:
         self.prompts.append(user_prompt)
         # Mirrors the real client: callers may narrow the schema per request (course-code and
         # tag enums built from this student's own courses). Captured so a test can assert on it.
         self.schemas.append(schema)
+        # `seed` and `max_tokens` are accepted and ignored — the stub is deterministic by
+        # construction, but the signature has to track LlamaCppClient.propose or a test suite
+        # goes green against a client the app cannot actually call.
+        self.seeds.append(seed)
         return self._responses.pop(0)
 
 
@@ -90,7 +95,8 @@ def test_revise_plan_falls_back_to_baseline_on_refusal():
         model = "stub"
 
         async def propose(self, system_prompt: str, user_prompt: str, output_type,
-                          schema: dict | None = None) -> PlanEditProposal:
+                          schema: dict | None = None, *, seed: int | None = None,
+                          max_tokens: int | None = None) -> PlanEditProposal:
             raise ModelResponseError("stop_reason=refusal")
 
     result = asyncio.run(revise_plan(_profile(), load_catalog(), "whatever", client=_RefusingClient()))

@@ -18,9 +18,13 @@ const DEBOUNCE_MS = 300;
 const MIN_QUERY_LENGTH = 2;
 
 function formatProgramLabel(program: AcademicProgramSummary): string {
-  const parts = [program.program_title];
-  if (program.degree_code) parts.push(`(${program.degree_code})`);
-  return parts.join(" ");
+  // The degree code is appended only when the title does not already carry it. Purdue titles
+  // its concentrations "Computer Science, BS — Machine Intelligence concentration", and
+  // appending blindly produced "... concentration (BS)" with the BS said twice.
+  const title = program.program_title;
+  if (!program.degree_code) return title;
+  const already = new RegExp(`\\b${program.degree_code}\\b`, "i").test(title);
+  return already ? title : `${title} (${program.degree_code})`;
 }
 
 // Search-and-select for a real degree program (sets `program_id`, which is what actually

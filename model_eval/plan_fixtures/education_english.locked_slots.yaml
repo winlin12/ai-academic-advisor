@@ -1,0 +1,41 @@
+# =============================================================================
+# LOCKED SLOTS — Mode C (retry-to-convergence) only.
+#
+# See `cs_machine_intelligence.locked_slots.yaml`'s header for the full rationale (why this is
+# a separate file, not folded into `fixture_hash`, and why every slot below is lifted from the
+# deterministic planner's own output rather than hand-invented). Nothing here differs in kind —
+# only in program.
+#
+# CHOICE OF SLOTS: one shallow anchor (a zero-prereq course, semester 0) and one DEEP anchor —
+# `EDCI 49800` (Supervised Teaching) — the capstone, gated behind EDCI 42200 and the
+# ENGL 39100/49200 pair, this fixture's longest prerequisite chain by construction.
+# Every scenario opens with a zero-prereq EDCI course at semester 0.
+#
+# `run.py run --tasks converge --preflight` re-verifies every lock below is legal where pinned
+# before spending any GPU time on this fixture.
+# =============================================================================
+
+source:
+  derived_from: "harness/planner.generate_plan, 2026-08-09"
+  fixture: "education_english.yaml"
+  note: >-
+    Slots are positions in the planning horizon, 0-based: semester_index 0 is
+    the student's start term. They are NOT catalog facts and are not scored
+    against the catalog; they are the student's stated intent.
+
+scenarios:
+  englished-fresh-start:
+    - {semester_index: 0, course: "EDCI 20500"}
+    - {semester_index: 4, course: "EDCI 49800"}
+
+  englished-sophomore-catchup:
+    - {semester_index: 0, course: "EDCI 27000"}
+    - {semester_index: 4, course: "EDCI 49800"}
+
+  englished-light-load:
+    - {semester_index: 0, course: "EDCI 27000"}
+    - {semester_index: 4, course: "EDCI 49800"}
+
+  englished-spring-start:
+    - {semester_index: 0, course: "EDCI 20500"}
+    - {semester_index: 4, course: "EDCI 49800"}

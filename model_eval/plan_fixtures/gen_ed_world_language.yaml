@@ -1,0 +1,240 @@
+# =============================================================================
+# PLAN-OF-STUDY GROUND TRUTH — University Core (gen-ed) + world language
+#
+#   verified: false     <-- READ THIS BEFORE QUOTING ANY NUMBER FROM A RUN
+#
+# WHY THIS FIXTURE EXISTS — see `engineering_core.yaml`'s header for the full rationale.
+#
+# PROVENANCE — NOT a single live program, unlike `engineering_core.yaml`. Purdue's own crawl
+# has almost no schedulable gen-ed content at the university level: queried live 2026-08-09,
+# `requirement_type = 'university'` rows have real course options on 0 of 886, and
+# `'world_language'`-typed rows on only 6 of 307 — university core is stated in PROSE in this
+# crawl (see `real_db.py`'s `unresolved_groups`/`_clean_ucc_row`), not as a course list Mode B
+# could plan against directly. The gen-ed-core/gen-ed-selective content that DOES exist in this
+# directory today is the same hand-curated workaround every one of the 16 major fixtures already
+# used before this file existed — this fixture is that workaround, isolated into its own test
+# case instead of repeated once per major, plus a real per-major variation it papers over:
+#   - COM 11400 is common to every one of the 15 non-ME major fixtures' `gen-ed-core`.
+#   - ENGL 10600 vs ENGL 10800 vary BY MAJOR (a real Purdue distinction — 10800 is the
+#     accelerated track some programs point students toward) — modeled here as a choice
+#     between the two rather than picking one and hiding the other.
+#   - `gen-ed-selective` menus vary in size (2-9 options) and content per major; the six
+#     courses below (HIST 10300, PHIL 15000, PSY 12000, SOC 10000, ANTH 10000, POL 10100) are
+#     the ones that recur across the MOST fixtures — a representative pool, not exhaustive, and
+#     not claimed to be any specific major's actual menu.
+#
+# WORLD LANGUAGE — only Spanish is modeled (SPAN 10100/10200/20100), as a representative case
+# exercising the same `real_db.build_scenario_database`/`_language_path_options` machinery every
+# live-sourced fixture's `world_language` scenario field already uses; this fixture is
+# fixture-sourced (see below) so nothing here comes from a live crawl. Extending to every
+# language Purdue offers is real future work, not attempted in this first pass.
+#
+# FIXTURE-SOURCED (`program.source: fixture`) — same reasoning as `agriculture_core.yaml`: no
+# Postgres round trip, Mode B/C read this file's own `courses`/`requirement_groups` directly,
+# rendered with `catalog_export.render_context_lean`.
+# =============================================================================
+
+program:
+  name: "University Core Requirements + World Language"
+  slug: "gen_ed_world_language"
+  source: "fixture"
+  catalog_year: "2026-2027"
+  campus: "West Lafayette"
+  total_credits_min: 16
+  verified: false
+  major_subject: "NONE"
+  preferred_major_courses_per_semester: 5
+  max_major_courses_per_semester: 5
+  target_credits_per_semester: 15
+  hard_credit_cap: 18
+
+courses:
+  # ---- Written communication (choose 1 — a real per-major alternate, not a menu) ----
+  - code: "ENGL 10600"
+    title: "First-Year Composition"
+    credits: 4
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [gen-ed, writing]
+  - code: "ENGL 10800"
+    title: "Accelerated First-Year Composition"
+    credits: 4
+    prereqs: []
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [gen-ed, writing]
+
+  # ---- Oral communication (required, universal across every fixture in this directory) ----
+  - code: "COM 11400"
+    title: "Fundamentals Of Speech Communication"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [required, gen-ed, oral-communication]
+
+  # ---- Gen-ed selective pool (representative, not exhaustive — see header) ----
+  - code: "HIST 10300"
+    title: "Introduction To The Modern World"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [gen-ed, humanities]
+  - code: "PHIL 15000"
+    title: "Principles Of Logic"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [gen-ed, humanities]
+  - code: "PSY 12000"
+    title: "Elementary Psychology"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [gen-ed, social-science]
+  - code: "SOC 10000"
+    title: "Introductory Sociology"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [gen-ed, social-science]
+  - code: "ANTH 10000"
+    title: "Introduction To Anthropology"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [gen-ed, social-science]
+  - code: "POL 10100"
+    title: "American Government"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [gen-ed, social-science]
+
+  # ---- World language — Spanish sequence (representative; see header) ----
+  - code: "SPAN 10100"
+    title: "Elementary Spanish I"
+    credits: 4
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [world-language]
+  - code: "SPAN 10200"
+    title: "Elementary Spanish II"
+    credits: 4
+    prereqs: ["SPAN 10100"]
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [world-language]
+  - code: "SPAN 20100"
+    title: "Intermediate Spanish"
+    credits: 3
+    prereqs: ["SPAN 10200"]
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [world-language]
+
+# --- degree requirements -----------------------------------------------------
+requirement_groups:
+  - id: gen-ed-writing
+    name: "University Core — written communication"
+    kind: choose
+    choose_credits: 4
+    courses: ["ENGL 10600", "ENGL 10800"]
+
+  - id: gen-ed-oral
+    name: "University Core — oral communication"
+    kind: all
+    courses: ["COM 11400"]
+
+  - id: gen-ed-selective
+    name: "University Core — additional selectives"
+    kind: choose
+    choose_credits: 6
+    courses: ["HIST 10300", "PHIL 15000", "PSY 12000", "SOC 10000", "ANTH 10000", "POL 10100"]
+
+  - id: world-language
+    name: "World Language — Spanish"
+    kind: choose
+    choose_credits: 9
+    courses: ["SPAN 10100", "SPAN 10200", "SPAN 20100"]
+
+# --- scenarios ---------------------------------------------------------------
+scenarios:
+  - id: genedwl-fresh-start
+    label: "Incoming student, nothing completed, starting Spanish from scratch"
+    profile:
+      name: "Avery"
+      degree_program: "University Core Requirements + World Language"
+      completed_courses: []
+      start_term: fall
+      start_year: 2026
+      semesters_to_plan: 4
+      max_credits_per_semester: 16
+    feedback: >-
+      I haven't done any of my gen-ed or language requirements yet. Spread
+      them out — don't front-load everything into my first semester.
+    assertions:
+      - kind: max_credits_at_most
+        value: 16
+    world_language:
+      subject: SPAN
+      level: 1
+
+  - id: genedwl-partial-credit
+    label: "Student with AP writing credit and one semester of Spanish already done"
+    profile:
+      name: "Jordan"
+      degree_program: "University Core Requirements + World Language"
+      completed_courses: ["ENGL 10600", "SPAN 10100"]
+      start_term: fall
+      start_year: 2026
+      semesters_to_plan: 3
+      max_credits_per_semester: 16
+    feedback: >-
+      I have AP credit for composition and already took Spanish I. Finish
+      the rest of my gen-ed and language requirement.
+    assertions:
+      - kind: max_credits_at_most
+        value: 16
+    world_language:
+      subject: SPAN
+      level: 2
+
+  - id: genedwl-light-load
+    label: "Student who needs a reduced credit load"
+    profile:
+      name: "Sam"
+      degree_program: "University Core Requirements + World Language"
+      completed_courses: ["COM 11400"]
+      start_term: fall
+      start_year: 2026
+      semesters_to_plan: 4
+      max_credits_per_semester: 15
+    feedback: >-
+      I'm working part time, so please cap me at 12 credits a semester.
+    assertions:
+      - kind: max_credits_at_most
+        value: 12
+        why: "The student named an explicit cap; honouring it is the whole ask."
+      - kind: proposal_sets_credit_cap
+        value: 12
+    world_language:
+      subject: SPAN
+      level: 1
+
+  - id: genedwl-spring-start
+    label: "Spring-start transfer student"
+    profile:
+      name: "Devin"
+      degree_program: "University Core Requirements + World Language"
+      completed_courses: ["HIST 10300", "PHIL 15000", "PSY 12000"]
+      start_term: spring
+      start_year: 2027
+      semesters_to_plan: 4
+      max_credits_per_semester: 16
+    feedback: >-
+      I transferred in with three of my gen-ed selectives already done,
+      starting in the spring. Finish the rest, including the language
+      requirement.
+    assertions:
+      - kind: max_credits_at_most
+        value: 16
+    world_language:
+      subject: SPAN
+      level: 1

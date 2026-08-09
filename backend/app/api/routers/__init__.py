@@ -1,1 +1,1 @@
-"""One router module per API domain: system, academic, planning, advisor, students."""
+"""One router module per API domain: system, academic, planning, advisor, admin."""

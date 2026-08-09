@@ -20,8 +20,6 @@ from app.models.schemas import AdminTableInfo, AdminTableRowsResponse
 # here 404s. ``academic_rules`` is included for row inspection, but its pgvector column is
 # stripped (HIDDEN_COLUMNS) — a 768-float embedding per row is noise, not information.
 BROWSABLE_TABLES: tuple[str, ...] = (
-    "students",
-    "plans",
     "programs",
     "requirement_groups",
     "requirement_options",

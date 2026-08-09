@@ -64,6 +64,24 @@ already in use.
 Note the eval port is **8099**, not llama.cpp's default 8080 — the `purdueio-api` container
 already owns 8080 on this box.
 
+### WSL memory (lives outside this repo)
+
+Because the server is a native Linux process, model weights are WSL's memory, and WSL2 is slow
+to hand memory back to Windows after a sweep. Two settings bound it, neither of them in this
+repo:
+
+- **`C:\Users\<you>\.wslconfig`** — `memory=40GB` caps the VM (was 56 GiB, which left Windows
+  8 GiB of the box's 64 GB and bounded nothing), and `[experimental] autoMemoryReclaim=gradual`
+  is what actually shrinks the VM back down once a model exits. The file carries its own
+  reasoning. Editing it needs `wsl --shutdown` from PowerShell — **between** runs, not during
+  one. The cap is sized against the largest GGUF in the sweep; a bigger model needs it raised
+  or `mlock: false` on its config entry, or `--mlock` fails.
+- **`--no-mmap`**, always passed (see `build_argv`). Weights land in anonymous memory that is
+  freed at process exit rather than in a page-cache mapping that lingers, so memory comes back
+  between models without a `wsl --shutdown`. The tradeoff is a real read of the GGUF on every
+  launch — which is what we want anyway, since a warm-mapped model would post load times no
+  deployment ever sees.
+
 ---
 
 ## Term offerings are observed, not invented
@@ -131,9 +149,11 @@ model with sequencing?*
 published sample plan, then as Mode B with the scorer's findings fed back for up to 3 retries.
 The second version worked — it took gemma4-26b from 22% to 61% viable at 2 median iterations —
 but at ~2x Mode B's latency, which does not survive being a web server with concurrent users.
-Both live in git history if the tradeoff changes. The sample plan is still loaded so
-`template_slot_match` can measure how much of it a model reproduces from memory; it is prompt
-input to nothing.
+Both live in git history if the tradeoff changes. The published sample plan and the
+`template_slot_match` diagnostic that measured how much of it a model reproduced from memory
+were removed with it on 2026-08-07 — Purdue's catalog sits behind a WAF that blocks automated
+fetches, so keeping the diagnostic alive per major meant hand-pasting a page from a browser
+every time, for a number that never decided a score.
 
 ### Mode C — retry to convergence (added 2026-07-31)
 
@@ -142,11 +162,14 @@ how many does a model need — and how long — to land a plan with no errors in
 closer to how the product is used; a student iterates rather than accepting or binning a single
 plan.
 
+Folded into `run`/`report` like every other mode — `--tasks converge` picks it out on its own,
+and it is in `run.default_tasks` by default, so a plain `python run.py run` includes it.
+
 ```bash
-python run.py converge --preflight     # validate the locked slots, spend no GPU time
-python run.py converge                 # every model, both variants, all 9 scenarios
-python run.py converge --variants feedback --models qwen3.5-9b
-python run.py converge-report          # results/convergence_report.md
+python run.py run --tasks converge --preflight     # validate the locked slots, spend no GPU time
+python run.py run --tasks converge                 # every model, all variants, all 9 scenarios
+python run.py run --tasks converge --variants feedback --models qwen3.5-9b
+python run.py report                                # results/report.md, Mode C section included
 ```
 
 **It is Mode C, not Mode C, and that is not cosmetic.** `results_old8/runs_*.jsonl` on this box
@@ -213,7 +236,7 @@ over the person it is planning for.
 to every attempt and the model may never move it; only the slots the model fills itself are
 revisable. They live in `plan_fixtures/*.locked_slots.yaml` — deliberately **outside**
 `fixture_hash`, because Mode A/B never see them and folding them in would invalidate those
-records for a change they did not observe (same argument as the sample plan). Each is lifted
+records for a change they did not observe. Each is lifted
 from the deterministic planner's own output, so the set is demonstrably satisfiable, and
 `--preflight` re-verifies that every pin is legal where it sits.
 
@@ -303,7 +326,7 @@ group:
 |---|---|
 | `prereq_violation` | Scheduled before a prerequisite completes. Same-semester does **not** count as satisfied. |
 | `term_offering_violation` | Scheduled in a term the course isn't offered |
-| `credit_cap_violation` | Semester exceeds the student's cap |
+| `credit_cap_violation` | Semester exceeds `hard_credit_cap` (18), the registrar's ceiling — *not* the student's stated cap; see the credit cap split below |
 | `major_overload_violation` | More than `max_major_courses_per_semester` courses from the major's own subject in one term (default: more than **3 CS courses**) |
 | `hallucinated_course` | Code not in the catalog |
 | `duplicate_course` | Scheduled twice, or already completed |
@@ -322,8 +345,8 @@ prerequisite violation for a prettier credit distribution. They are recorded as 
 `major_overload_violation` is the one hard violation the registrar would *not* stop you from
 committing, and it is scored anyway. Reading the transcripts, models routinely put four and
 five CS courses in a single semester — and so did this repo's own deterministic planner
-(`mi-fresh-start` and `mi-spring-start` each had a 5-CS term, `mi-tight-horizon` had 5 out of
-5 courses). No student follows that plan. Set from what students actually report: two at a
+(`mi-fresh-start` and `mi-spring-start` each had a 5-CS term, and the since-removed
+`mi-tight-horizon` had 5 out of 5 courses). No student follows that plan. Set from what students actually report: two at a
 time is sustainable, three is the ceiling a 4+1 BS/MS student hits fitting BS and MS courses
 into the same terms, four is where a plan stops describing a real semester.
 
@@ -340,6 +363,30 @@ block, the values on the student line next to the credit limit — so no model i
 constraint it was not told. The deterministic planner enforces the hard cap and respects the
 soft one (filling with non-major requirements first), in **both** `harness/planner.py` and
 `backend/app/services/planner.py`; `run.py parity` is what keeps those two honest.
+
+### The credit cap split (added 2026-08-02 — this changed `fixture_hash`)
+
+Same shape as the CS-load cap above, for the same reason, one table over. `credit_cap_violation`
+used to fire off `max_credits_per_semester` — the number the *student* names in their own words
+("keep every semester at 16 credits or under"). So a 17-credit term made a plan NOT VIABLE: the
+same verdict, and the same weight in every ranking, as scheduling a course before its own
+prerequisite. Those are not the same failure. One is a registration wall; the other is a
+semester the student would have to be talked into.
+
+It was also billed twice, because the student's number is *already* scored by name as the
+`max_credits_at_most` assertion under **Ask honoured** — which is where ignoring a stated
+preference belongs.
+
+| Key | Default | Effect |
+|---|---|---|
+| `max_credits_per_semester` | 15–16, per scenario | **Soft.** The student's ask. Over it (and within the hard cap) increments `soft_credit_overages`, reported as *Over-ask terms*, and fails `max_credits_at_most` where a scenario asserts it. Drives the planner and the prompt's "hard limit" line. **Not** part of PLAN_VIABLE. |
+| `hard_credit_cap` | 18 | **Hard.** Purdue's full-time overload ceiling; past it needs a dean's signature. Over it is `credit_cap_violation` and the plan is not viable. Program-level, in the fixture's `program:` block. |
+
+Unlike the CS-load pair, `hard_credit_cap` is **deliberately absent from every prompt**. Models
+are told the student's number and a target to aim for — `ceil(credits outstanding / semesters
+available)`, printed on the student line — and naming 18 would just hand them a bigger number to
+fill to, which is the front-loading this harness spent 2026-07-29 removing. It is a scoring-side
+constant only.
 
 ### The courses the sample plan names, and the scenario that refuses them
 
@@ -393,17 +440,30 @@ for the `avoid_tags: [suggested-elective]` handle.
 It is scored on Mode B, where the model chooses the whole schedule and can therefore choose
 to include courses the student refused.
 
-### One scenario is unsatisfiable on purpose
+### The unsatisfiable scenario was removed on 2026-08-03
 
-`mi-tight-horizon` (one semester left, 21 credits of requirements) cannot be solved. It is
-excluded from the headline rate — 0% for everyone tells you nothing about a model — and
-scored separately on the honesty question: does the model report what didn't fit, or
-fabricate a semester and blow the credit cap to make the numbers work? On a public advising
-site the second failure is far worse, because it looks like a complete plan.
+`mi-tight-horizon` (one semester left, 21 credits of requirements) could not be solved by
+design. It was excluded from the headline rate — 0% for everyone tells you nothing about a
+model — and scored separately on the honesty question: does the model report what didn't fit,
+or fabricate a semester and blow the credit cap to make the numbers work?
 
-`python run.py check` verifies the deterministic planner *can* produce a viable plan for
-every other scenario. If it can't, every model scores 0 for reasons unrelated to the model —
-which is a fixture bug, and the check catches it before you spend GPU hours.
+**It is gone, and so is that question.** Nothing in the fixture now tests whether a model says
+"this does not fit" instead of inventing room, which on a public advising site is the worse
+failure of the two because it looks like a complete plan. If that behaviour starts mattering,
+re-add a scenario with `expect_unsatisfiable: true` — the machinery that reads the flag is
+still in `fixtures.py`, `report.py` and `run.py check`, and only the scenario body was deleted.
+
+Note what the old row was actually worth before you trust its successor. `_unsatisfiable_section`
+filtered on `not r.get("error")` and never on `structure_ok`, so a model that produced **no
+parseable plan at all** scored 100% "stayed in horizon", 100% "respected credit cap" and 0.0
+violations/plan — gemma4-26b's three runs on 2026-08-03 were exactly that (a repetition loop
+into the token ceiling) and the table read them as exemplary. Any replacement needs that guard,
+and needs a `no output` column, or it will flatter the same failure again.
+
+All 8 remaining scenarios are satisfiable. `python run.py check` verifies the deterministic
+planner *can* produce a viable plan for every one of them. If it can't, every model scores 0
+for reasons unrelated to the model — which is a fixture bug, and the check catches it before
+you spend GPU hours.
 
 ### How long the student waits
 
@@ -435,26 +495,27 @@ the weights to page in from disk, which for the larger ggufs is minutes, not sec
 | `plan_fixtures/cs_machine_intelligence.yaml` | **The scoring authority.** Catalog, requirement groups, scenarios. Read its provenance header before quoting any number. The one place to edit a course, a prerequisite or a requirement. |
 | `mock_db/*.json` | **What the model is shown.** A mock of the two real databases in their real table shapes, GENERATED from the fixture by `run.py build-mock-db` — never hand-edited. See *The database is the context* below. |
 | `harness/mock_db.py` | Loads the mock database, checks the referential integrity a real FK would enforce, and renders the whole thing as Mode B's context. The seam RAG replaces. |
-| `plan_fixtures/cs_machine_intelligence.sample_plan.yaml` | The department's published sample 4-year plan, hand-saved from the catalog. **No longer prompt input** (the reference arm was replaced 2026-07-30) — retained solely so `template_slot_match` can measure how much of it a model reproduces from parametric memory. Decides nothing, hashes into nothing. |
 | `questions.yaml` | Grounded-QA items with their retrieved chunks **pinned in the file** — retrieval belongs to the embedding model, so letting it vary would smear a retrieval difference across every model's score. |
 | `harness/server.py` | llama-server lifecycle as a native local process: builds argv from config, waits for `/health`, parses per-layer offload from stderr, stops between models. |
 | `harness/llamacpp_client.py` | Streaming stdlib client for `/v1/chat/completions`. TTFT from the stream, token counts from `usage`, timings from llama.cpp's own `timings`. |
 | `harness/planner.py` | **Vendored copy** of the app's deterministic planner + `_apply_proposal`. Mode A can only measure production if these match — see the drift warning below. |
 | `harness/fixtures.py` | Loads the fixture; ports `planner_catalog.select_remaining_courses` so Mode A starts from production's baseline. |
-| `harness/plan_scorers.py` | Viability, requirement coverage, scenario assertions, proposal groundedness. All automatic and decidable. |
+| `harness/plan_scorers.py` | Viability, requirement coverage, scenario assertions, proposal groundedness — against the fixture. Scores Mode A (legal by construction, by design) and Mode C (see the known-gap note on `convergence.py`, below). Not used for Mode B any more. |
+| `harness/real_scoring.py` | Mode B's scorer, and the only one it uses: every check `plan_scorers.py` runs, against `ctx.database` (the real, live catalog Mode B was actually shown and grammar-constrained to) instead of the fixture. Exists because scoring Mode B against the fixture produced real courses flagged `hallucinated_course` and invented gen-ed groups counted as missing requirements — see its module docstring. |
 | `harness/prompts.py` | Static-first prompts for the app's four live call sites. sha256 of each static block **and its response schema** travels with every record. |
 | `harness/scorers.py` | JSON extraction, faithfulness/recall heuristics, abstention detection. |
 | `harness/runner.py` | Orchestration: server lifecycle, warmup + discard, VRAM delta, N replicates, one request at a time. Plan tasks run **first** so a cut-short run keeps the data that matters. |
-| `harness/convergence.py` | **Mode C.** Locked slots, the retry loop, both variants, censoring. Computes convergence *from* `plan_scorers` output rather than reimplementing it, so D and B validate against one instrument. Own results file, own lock, and it refuses to start while any other run holds the GPU. |
-| `harness/convergence_report.py` | Mode C's report. Kaplan-Meier over right-censored data; progress traces per attempt. Separate from `report.py` because the record schema is a survival observation, not pass/fail. |
+| `harness/convergence.py` | **Mode C.** Locked slots, the retry loop, both variants, censoring. Computes convergence *from* `plan_scorers` output rather than reimplementing it, so D and B validate against one instrument. Own results file, own lock, and it refuses to start while any other run holds the GPU. **KNOWN GAP** (2026-08-04): Mode C shows the model `ctx.database` (real, grammar-constrained) exactly like Mode B does, but still scores it against the fixture, same class of bug `real_scoring.py` exists to fix for Mode B — not yet ported here because the retry/repair logic is coupled to `plan_scorers.score_plan`'s specific violation objects (the `repair` variant mutates them directly). Lower-risk in practice for the CS Machine Intelligence program specifically, because the convergence criterion is violations-only, not coverage (see `run.py run --tasks converge`'s report section) — the gen-ed-mismatch class of bug that hit Mode B's coverage number doesn't move this one. Still fixture-scored; treat accordingly. |
+| `harness/convergence_report.py` | Mode C's tables and Kaplan-Meier estimator over right-censored data; progress traces per attempt. Own module because the record schema is a survival observation, not pass/fail — but `report.py` imports `mode_c_lines()` and splices it into the one `results/report.md`, not a separate file. |
 | `plan_fixtures/*.locked_slots.yaml` | Mode C's locked slots. Prompt input, **not** scoring authority — recorded in `meta_convergence.json` and on each record, never folded into `fixture_hash`. |
 | `harness/report.py` | Plan tables first, validity guards, manual review queue. No composite score exists. |
 | `results/transcripts/` | One markdown file per (model, stage, item, replicate): system prompt, user prompt, raw output, verdict. The raw text is in the JSONL too, but a JSONL field is not something you can read — and reading what a model literally said is how you catch a metric measuring the wrong thing. Disable with `run.save_transcripts: false`. |
 | `setup/allow_wsl_llamacpp.ps1` | Leftover from the Windows-interop era; not needed now that llama-server runs natively in WSL. |
 
 Data flow: `plan_fixtures/*.yaml` + `questions.yaml` → `prompts.py` → `server.py` +
-`llamacpp_client.py` → `plan_scorers.py` / `scorers.py` → `results/runs_*.jsonl` →
-`report.py` → `results/report.md` + `results/review_queue.jsonl`.
+`llamacpp_client.py` → `plan_scorers.py` / `scorers.py` / `convergence.py` →
+`results/runs_*.jsonl` → `report.py` (pulling in `convergence_report.mode_c_lines()`) →
+`results/report.md` + `results/review_queue.jsonl`.
 
 ---
 
@@ -467,7 +528,6 @@ Data flow: `plan_fixtures/*.yaml` + `questions.yaml` → `prompts.py` → `serve
 | **Proposal groundedness** | **Automatic.** Do the named codes/tags exist in the student's actual course list. |
 | **Ask honoured** | **Automatic**, but only for what a scenario declares as a machine-checkable assertion. "Did it understand the student" in the broad sense is not measured. |
 | **Structure OK** | **Automatic.** Under grammar-constrained decoding this should be ~100%; anything less is a real signal (truncation, a template mismatch, or a model that ignores the grammar). |
-| **Slot match** (Mode B/C) | **Automatic, and deliberately not a score.** Decidable — a course either landed in the sample plan's semester slot or it didn't — but "higher" is not "better", and since 2026-07-30 no arm is shown the plan, so this is purely a parametric-memory base rate. |
 | **Behavior OK (QA)** | **Automatic-ish.** Abstention is a phrase heuristic. A polite correction and a polite refusal look the same to it — read the adversarial items. |
 | **FAITHFULNESS** | **Manual, full stop.** The heuristic catches *entity* hallucination only (codes/numbers absent from the context). Relational hallucination ("X must come before Y") is not machine-checkable without a judge model, which is deliberately not here — judging small models with another model smuggles in a second unvalidated instrument. Quote your manual grade, not the flag rate. |
 | **LATENCY** | Automatic. Tiebreaker only, and **box-specific**. As of 2026-07-27 this box is an **RTX 2060 SUPER (8 GB)** running the native WSL build; earlier numbers in `results_*/` were taken on a 5070 Ti (16 GB) over Windows interop. Latency does not transfer between them — different architecture, bandwidth and thermals — and on an 8 GB card neither does the *offload fraction*, so re-read layers-offloaded from the env row rather than assuming. Only quality scores transfer between boxes. |

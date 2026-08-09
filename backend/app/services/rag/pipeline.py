@@ -6,8 +6,13 @@ calls is independently testable; this file wires them into the two end-to-end fl
 
 Retrieval is two-tier, cheapest-first:
 
-    1. EXACT — course codes mentioned in the question are pulled from ``academic_rules`` by
-       metadata match (deterministic SQL, no embedding, similarity pinned to 1.0).
+    1. EXACT — course codes mentioned in the question are answered from SQL directly, with no
+       embedding and similarity pinned to 1.0. TWO sources, because they know different
+       things: the ``advisor`` schema's prerequisite edges and observed term offerings
+       (``planner_db.fetch_course_facts``), and the crawled Acalog description held in
+       ``academic_rules``. Acalog publishes no prerequisites at all, so without the first the
+       advisor confidently answers "no prerequisites listed" about a course with a four-deep
+       chain behind it — while the planner sequences every plan from exactly those edges.
     2. SEMANTIC — the question is embedded and the nearest chunks are pulled by cosine
        distance, floored by ``rag_min_similarity``.
 
@@ -27,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from app.core.config import settings
+from app.services import planner_db
 from app.services.llamacpp_client import LlamaCppClient
 from app.services.rag import embeddings, store
 
@@ -162,17 +168,29 @@ async def answer_question(
     *,
     top_k: int | None = None,
     client: LlamaCppClient | None = None,
+    seed: int | None = None,
 ) -> dict[str, Any]:
     """Step 3 end-to-end: exact + semantic retrieval -> budgeted context -> generate.
 
     Returns the answer plus the matches (with similarities) so callers/UI can show sources
     and so the retrieval quality is observable, not a black box.
+
+    ``seed`` only re-rolls the GENERATION. Retrieval is deterministic and deliberately stays
+    so: a student pressing "regenerate" on a confusing answer wants it said differently, not
+    grounded in different rules, and re-rolling the evidence under them would make two answers
+    to the same question disagree for reasons neither of them shows.
     """
     top_k = top_k or settings.rag_top_k
     client = client or LlamaCppClient()
 
-    # Tier 1: deterministic — course codes named in the question, straight from SQL.
-    exact = store.fetch_by_course_codes(extract_course_codes(question))
+    # Tier 1: deterministic — course codes named in the question, straight from SQL. Two
+    # sources, because they know different things: `academic_rules` holds the crawled Acalog
+    # description, and the `advisor` schema holds the prerequisites and term offerings Acalog
+    # does not publish. Facts first — "what do I need before CS 25100" is the commonest
+    # question there is, and answering it from the description alone produces a confident
+    # "no prerequisites listed" about a course with a four-deep chain behind it.
+    codes = extract_course_codes(question)
+    exact = [*planner_db.fetch_course_facts(codes), *store.fetch_by_course_codes(codes)]
 
     # Tier 2: semantic — embed the question (query-side instruction), cosine search, floor.
     query_vector = await asyncio.to_thread(embeddings.embed_query, question)
@@ -189,7 +207,7 @@ async def answer_question(
     # Fold into the prompt and let the local model write the grounded answer.
     context = _format_context(matches)
     user_prompt = f"CONTEXT:\n{context}\n\nSTUDENT QUESTION:\n{question}"
-    answer = await client.generate(_ADVISOR_SYSTEM_PROMPT, user_prompt)
+    answer = await client.generate(_ADVISOR_SYSTEM_PROMPT, user_prompt, seed=seed)
 
     return {
         "answer": answer,

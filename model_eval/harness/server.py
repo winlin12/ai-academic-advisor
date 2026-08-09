@@ -394,7 +394,10 @@ def check_slot_context(run: dict[str, Any], longest_prompt_tokens: int) -> str |
     )
 
 
-def build_argv(cfg: dict[str, Any], model_cfg: dict[str, Any], host: str) -> list[str]:
+def build_argv(
+    cfg: dict[str, Any], model_cfg: dict[str, Any], host: str, *,
+    thinking_budget: int | None = None,
+) -> list[str]:
     """The single place a llama-server command line is constructed.
 
     Everything that could differ between models and pollute the comparison is read from
@@ -419,7 +422,6 @@ def build_argv(cfg: dict[str, Any], model_cfg: dict[str, Any], host: str) -> lis
         "--host", bind_host,
         "--port", str(llama["port"]),
         "-c", str(run["num_ctx"]),       # fixed at launch under llama.cpp — the whole reason
-        "--n-gpu-layers", str(run["n_gpu_layers"]),
         "--flash-attn", "on",            # required to quantize the V cache
         "--cache-type-k", run["cache_type_k"],
         "--cache-type-v", run["cache_type_v"],
@@ -439,6 +441,28 @@ def build_argv(cfg: dict[str, Any], model_cfg: dict[str, Any], host: str) -> lis
         # offloaded model from one silently running half on the CPU. Costs a few MB of log.
         "-lv", str(llama.get("log_verbosity", 5)),
     ]
+    # OMITTING --n-gpu-layers IS A DELIBERATE SETTING, not an oversight. llama.cpp runs a
+    # `--fit` pass that sizes the offload to the memory actually free on each device, and that
+    # pass refuses to run against an explicit -ngl:
+    #
+    #   common_fit_params: failed to fit params to free device memory:
+    #                      n_gpu_layers already set by user to 999, abort
+    #
+    # With the hardcoded 999 that used to live here, an over-subscribed split did not get
+    # trimmed — it died with a raw `cudaMalloc failed: out of memory` partway through loading,
+    # which is how the 35B looked like a broken model rather than a mis-sized split.
+    #
+    # AUTO-FIT IS ALL-OR-NOTHING, so unsetting this is only half of it: with -ngl unset but
+    # `--n-cpu-moe` pinned, the fit pass still declines to size the split and falls back to the
+    # default VRAM-proportional one (MEASURED: n_cpu_moe 10 and 14 both then retried the same
+    # 8225 MiB allocation on the 8 GB card and OOMed, exactly as -ngl 999 did). A model that
+    # pins n_cpu_moe must therefore hand-size --tensor-split too; see qwen3.6-35b-a3b in
+    # config.yaml. Pinning nothing yields a split that always loads but is not tuned — 17.03
+    # tok/s against 23.50 for the hand-sized one on that model.
+    n_gpu_layers = run.get("n_gpu_layers")
+    if n_gpu_layers is not None:
+        argv += ["--n-gpu-layers", str(n_gpu_layers)]
+
     # MoE expert offload to CPU. A no-op on dense models, so it is applied uniformly rather
     # than conditionally — one fewer axis on which models differ. Configured either as
     # `n_cpu_moe` (llama.cpp's own bottom-up count) or `n_gpu_moe` (layers of experts kept on
@@ -448,7 +472,16 @@ def build_argv(cfg: dict[str, Any], model_cfg: dict[str, Any], host: str) -> lis
         argv += ["--n-cpu-moe", str(n_cpu_moe)]
     # Reasoning off at launch: the only switch that behaves the same across Qwen3, gpt-oss
     # and GLM templates. Per-request chat_template_kwargs is a backstop in the client.
-    if model_cfg.get("think") is False:
+    #
+    # THINKING_BUDGET OVERRIDES ALL OF THIS, on purpose. It exists for exactly one caller —
+    # `runner.run_thinking_experiment`, the Mode B pre-plan-reasoning experiment — which needs
+    # a server launched with reasoning ENABLED and capped, not disabled. It is a separate
+    # server process from every baseline run (own `start_server` call, own model lifetime), so
+    # this can never leak into a `--reasoning off` baseline launch; the two are simply
+    # different `argv`s built at different times.
+    if thinking_budget is not None:
+        argv += ["--reasoning-budget", str(thinking_budget)]
+    elif model_cfg.get("think") is False:
         argv += ["--reasoning", "off", "--reasoning-budget", "0"]
     # --mlock OOMs on models larger than this box's RAM; see config's mlock_max_gb.
     if model_cfg.get("mlock", True):
@@ -458,12 +491,13 @@ def build_argv(cfg: dict[str, Any], model_cfg: dict[str, Any], host: str) -> lis
 
 
 def start_server(
-    cfg: dict[str, Any], model_cfg: dict[str, Any], log_dir: Path, *, host: str | None = None
+    cfg: dict[str, Any], model_cfg: dict[str, Any], log_dir: Path, *, host: str | None = None,
+    thinking_budget: int | None = None,
 ) -> ServerHandle:
     windows = is_windows_exe(cfg["llamacpp"]["server_exe"])
     host = host or resolve_host(cfg["llamacpp"].get("host", "auto"),
                                 cfg["llamacpp"]["server_exe"])
-    argv = build_argv(cfg, model_cfg, host)
+    argv = build_argv(cfg, model_cfg, host, thinking_budget=thinking_budget)
     base_url = f"http://{host}:{cfg['llamacpp']['port']}"
 
     # A survivor from an earlier crashed run owns the port and skews the VRAM baseline that

@@ -1,0 +1,280 @@
+# =============================================================================
+# PLAN-OF-STUDY GROUND TRUTH — First-Year Engineering (College of Engineering core gate)
+#
+#   verified: false     <-- READ THIS BEFORE QUOTING ANY NUMBER FROM A RUN
+#
+# WHY THIS FIXTURE EXISTS. Added 2026-08-09 alongside `agriculture_core.yaml` and
+# `gen_ed_world_language.yaml`, splitting out of the 16 major fixtures (which now set
+# `requirement_scope: major` — see their own headers) a domain a 27B model was being asked to
+# reason about in the SAME call as real prerequisite sequencing, despite it having almost none
+# of its own: "pick 8 shallow, mostly-parallel requirements from an intro-level menu" is a
+# different task from "sequence a major's multi-year prerequisite chain," and bundling them was
+# part of what produced qwen3.6-27b's Mode B catalog-echo duplicates (see that investigation).
+#
+# UNLIKE `agriculture_core.yaml`/`gen_ed_world_language.yaml`, this one is LIVE-SOURCED
+# (`program.source` left at its default "real_db"), not fixture-sourced — Purdue's own crawl
+# already has First-Year Engineering as its OWN standalone program (not a subgroup of any major's
+# tree; see `real_db.FYE_PROGRAM_ID`/`is_college_of_engineering`'s docstrings for why a College
+# of Engineering major has no FK to it), so Mode B/C read it exactly the way any other major is
+# read, live, real, no hand-curation needed for the requirement content itself.
+#
+# PROVENANCE: `courses`/`requirement_groups` below are a representative subset of
+# `real_db_program_id`'s own 8 "Requirement #N" groups, read live 2026-08-09 (see this file's
+# own scenarios for the shape) — a hand-authored MIRROR for Mode A/the scorer, same relationship
+# every other fixture in this directory has to its own live program. Every FYE requirement is,
+# by Purdue's own framing, meant to clear within the student's FIRST TWO SEMESTERS — that is
+# this fixture's `semesters_to_plan`, not the usual 6-8, because "does it all fit in the real
+# window" is itself part of what this test case measures.
+# =============================================================================
+
+program:
+  name: "First-Year Engineering"
+  slug: "engineering_core"
+  real_db_program_id: "bebe0ff3-d003-4d43-8674-3b39cc11407d"
+  catalog_year: "2026-2027"
+  campus: "West Lafayette"
+  total_credits_min: 30
+  verified: false
+  major_subject: "ENGR"
+  preferred_major_courses_per_semester: 4
+  max_major_courses_per_semester: 5
+  target_credits_per_semester: 16
+  hard_credit_cap: 18
+
+courses:
+  # ---- Requirement #8: Written and Oral Communication (required, 6 credits) ----
+  - code: "SCLA 11000"
+    title: "Transformative Texts Seminar I"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, fye]
+  - code: "SCLA 11100"
+    title: "Transformative Texts Seminar II"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, fye]
+
+  # ---- Requirement #1: Intro to Engineering I (choose, 2-4 credits) ----
+  - code: "ENGR 13100"
+    title: "Transforming Ideas To Innovation I"
+    credits: 2
+    prereqs: []
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [fye-selective]
+  - code: "ENGR 16100"
+    title: "Honors Introduction To Innovation And The Physical Science Of Engineering Design I"
+    credits: 4
+    prereqs: []
+    offered_terms: [fall]                   # NOT observed — hand-written, unverified
+    requirement_tags: [fye-selective]
+  - code: "EPCS 11100"
+    title: "First Year Participation In EPICS I"
+    credits: 1
+    prereqs: []
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [fye-selective]
+
+  # ---- Requirement #2: Intro to Engineering II (choose, 2-4 credits) ----
+  - code: "ENGR 13200"
+    title: "Transforming Ideas To Innovation II"
+    credits: 2
+    prereqs: []
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [fye-selective]
+  - code: "ENGR 16200"
+    title: "Honors Introduction To Innovation And The Physical Science Of Engineering Design II"
+    credits: 4
+    prereqs: []
+    offered_terms: [spring]                 # NOT observed — hand-written, unverified
+    requirement_tags: [fye-selective]
+
+  # ---- Requirement #3/#4: Calculus I & II (required in sequence) ----
+  - code: "MA 16100"
+    title: "Plane Analytic Geometry And Calculus I"
+    credits: 5
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [required, fye, mathematics]
+  - code: "MA 16200"
+    title: "Plane Analytic Geometry And Calculus II"
+    credits: 5
+    prereqs: ["MA 16100"]
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [required, fye, mathematics]
+
+  # ---- Requirement #5: Chemistry (choose, 4-6 credits) ----
+  - code: "CHM 11510"
+    title: "General Chemistry"
+    credits: 4
+    prereqs: []
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [fye-selective]
+  - code: "CHM 11100"
+    title: "General Chemistry"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [fye-selective]
+
+  # ---- Requirement #6: Physics (choose, 4-8 credits) ----
+  - code: "PHYS 17200"
+    title: "Modern Mechanics"
+    credits: 4
+    prereqs: []
+    coreqs: ["MA 16100"]
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [fye-selective]
+
+  # ---- Requirement #7: First-Year Engineering Selective (choose, 3-4 credits) ----
+  - code: "CHM 11610"
+    title: "General Chemistry Honors"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [fye-selective]
+  - code: "CS 15900"
+    title: "C Programming"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [fye-selective]
+  - code: "BIOL 11000"
+    title: "Fundamentals Of Biology I"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [fye-selective]
+
+# --- degree requirements -----------------------------------------------------
+requirement_groups:
+  - id: fye-comm
+    name: "Requirement #8: Written and Oral Communication"
+    kind: all
+    courses: ["SCLA 11000", "SCLA 11100"]
+
+  - id: fye-intro-1
+    name: "Requirement #1: Intro to Engineering I"
+    kind: choose
+    choose_credits: 2
+    courses: ["ENGR 13100", "ENGR 16100", "EPCS 11100"]
+
+  - id: fye-intro-2
+    name: "Requirement #2: Intro to Engineering II"
+    kind: choose
+    choose_credits: 2
+    courses: ["ENGR 13200", "ENGR 16200"]
+
+  - id: fye-calc-1
+    name: "Requirement #3: Calculus I"
+    kind: all
+    courses: ["MA 16100"]
+
+  - id: fye-calc-2
+    name: "Requirement #4: Calculus II"
+    kind: all
+    courses: ["MA 16200"]
+
+  - id: fye-chemistry
+    name: "Requirement #5: Chemistry"
+    kind: choose
+    choose_credits: 4
+    courses: ["CHM 11510", "CHM 11100"]
+
+  - id: fye-physics
+    name: "Requirement #6: Physics"
+    kind: choose
+    choose_credits: 4
+    courses: ["PHYS 17200"]
+
+  - id: fye-selective
+    name: "Requirement #7: First-Year Engineering Selective"
+    kind: choose
+    choose_credits: 3
+    courses: ["CHM 11610", "CS 15900", "BIOL 11000"]
+
+# --- scenarios ---------------------------------------------------------------
+scenarios:
+  - id: fye-fresh-start
+    label: "Incoming engineering student, nothing completed"
+    profile:
+      name: "Avery"
+      degree_program: "First-Year Engineering"
+      completed_courses: []
+      start_term: fall
+      start_year: 2026
+      semesters_to_plan: 2
+      max_credits_per_semester: 17
+    feedback: >-
+      I'm starting from scratch and want everything on the First-Year
+      Engineering checklist done within my first two semesters, like the
+      college requires.
+    assertions:
+      - kind: max_credits_at_most
+        value: 17
+    world_language: null
+
+  - id: fye-ap-credit
+    label: "Incoming student with AP credit for calculus and chemistry"
+    profile:
+      name: "Jordan"
+      degree_program: "First-Year Engineering"
+      completed_courses: ["MA 16100", "CHM 11510"]
+      start_term: fall
+      start_year: 2026
+      semesters_to_plan: 2
+      max_credits_per_semester: 17
+    feedback: >-
+      I came in with AP credit for Calc I and general chemistry already
+      done. Get me through everything else on the checklist in two
+      semesters.
+    assertions:
+      - kind: max_credits_at_most
+        value: 17
+    world_language: null
+
+  - id: fye-light-load
+    label: "Engineering student who needs a reduced credit load"
+    profile:
+      name: "Sam"
+      degree_program: "First-Year Engineering"
+      completed_courses: ["SCLA 11000"]
+      start_term: fall
+      start_year: 2026
+      semesters_to_plan: 3
+      max_credits_per_semester: 14
+    feedback: >-
+      I'm on a modified course load this year, so please cap me at 14
+      credits a semester even if that pushes finishing FYE into a third
+      semester.
+    assertions:
+      - kind: max_credits_at_most
+        value: 14
+        why: "The student named an explicit cap; honouring it is the whole ask."
+      - kind: proposal_sets_credit_cap
+        value: 14
+    world_language: null
+
+  - id: fye-spring-start
+    label: "Spring-start transfer student"
+    profile:
+      name: "Devin"
+      degree_program: "First-Year Engineering"
+      completed_courses: ["MA 16100", "MA 16200", "SCLA 11000", "SCLA 11100"]
+      start_term: spring
+      start_year: 2027
+      semesters_to_plan: 2
+      max_credits_per_semester: 17
+    feedback: >-
+      I transferred in with both calculus courses and my communication
+      sequence already done, starting in the spring. Finish the rest of
+      FYE for me.
+    notes: >-
+      A spring start shifts ENGR 16100/16200's fall/spring-only offerings —
+      models that assume every FYE selective is offered every term collect
+      violations here.
+    assertions:
+      - kind: max_credits_at_most
+        value: 17
+    world_language: null

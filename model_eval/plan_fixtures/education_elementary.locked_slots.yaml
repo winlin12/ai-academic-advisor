@@ -1,0 +1,42 @@
+# =============================================================================
+# LOCKED SLOTS — Mode C (retry-to-convergence) only.
+#
+# See `cs_machine_intelligence.locked_slots.yaml`'s header for the full rationale (why this is
+# a separate file, not folded into `fixture_hash`, and why every slot below is lifted from the
+# deterministic planner's own output rather than hand-invented). Nothing here differs in kind —
+# only in program.
+#
+# CHOICE OF SLOTS: one shallow anchor (a zero-prereq course, semester 0) and one DEEP anchor —
+# `EDCI 49600` (Student Teaching In The Elementary School) — the capstone, gated behind
+# six methods courses (EDCI 36401/36402/36501/36502/36303, EDPS 43000), this fixture's
+# longest prerequisite chain by construction.
+# Every scenario opens with a zero-prereq EDCI course at semester 0.
+#
+# `run.py run --tasks converge --preflight` re-verifies every lock below is legal where pinned
+# before spending any GPU time on this fixture.
+# =============================================================================
+
+source:
+  derived_from: "harness/planner.generate_plan, 2026-08-09"
+  fixture: "education_elementary.yaml"
+  note: >-
+    Slots are positions in the planning horizon, 0-based: semester_index 0 is
+    the student's start term. They are NOT catalog facts and are not scored
+    against the catalog; they are the student's stated intent.
+
+scenarios:
+  elem-fresh-start:
+    - {semester_index: 0, course: "EDCI 20500"}
+    - {semester_index: 7, course: "EDCI 49600"}
+
+  elem-sophomore-catchup:
+    - {semester_index: 0, course: "EDCI 28550"}
+    - {semester_index: 6, course: "EDCI 49600"}
+
+  elem-light-load:
+    - {semester_index: 0, course: "EDCI 21510"}
+    - {semester_index: 7, course: "EDCI 49600"}
+
+  elem-spring-start:
+    - {semester_index: 0, course: "EDCI 20500"}
+    - {semester_index: 7, course: "EDCI 49600"}

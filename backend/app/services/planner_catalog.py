@@ -5,14 +5,19 @@ from the ``catalog_ingestion`` database instead of the bundled 8-course ``course
 fixture, and (when the profile carries a ``program_id``) derives ``remaining_courses`` from
 the program's requirement rows instead of the client hand-listing codes.
 
-Mapping notes (what the catalog does and does not know):
+TWO PATHS LIVE HERE, and the difference is whether a major was chosen:
 
-* ``prereqs`` — Purdue's Acalog catalog does not publish prerequisites (see TODO §2.5), so
-  DB-backed courses have no prereq edges. The planner simply won't block on them; we do not
-  fabricate structure the source doesn't have.
-* ``offered_terms`` — term offerings are likewise not in the catalog, so every course is
-  treated as offered every term.
-* ``workload_score`` — no signal in the catalog; everything gets the schema default.
+* ``program_id`` SET → ``resolve_program`` delegates to :mod:`planner_db`, which returns the
+  whole :class:`ProgramCatalog`: requirement groups, alias map, and courses carrying the real
+  prerequisite edges and observed term offerings from the ``advisor``
+  schema. This is the path the app takes, and the one Mode B needs.
+
+* ``program_id`` ABSENT → the loose per-code path below. It looks the student's own course
+  codes up in ``courses`` and can only produce the degraded ``Course`` that
+  ``_course_from_row`` builds: no prereq edges and every term allowed, because Acalog
+  publishes neither (TODO §2.5) and nothing here fabricates structure the source lacks. A plan
+  built this way is a plan that believes CS 25100 can be taken in the first semester, which is
+  exactly why choosing a major matters and why the AI planner refuses without one.
 
 ``courses.json`` remains the documented offline fixture: it is used whenever the academic
 database is unreachable or knows none of the requested course codes, so the demo profile and
@@ -31,6 +36,17 @@ from app.core.config import settings
 from app.models.schemas import Course, StudentProfile
 from app.services.catalog import load_catalog
 from app.services.planner import TERM_ORDER
+# ProgramNotFoundError is RE-EXPORTED, not redefined. ``deps.resolve_for_planning`` catches it
+# by the name it imports from here, so there must be exactly one class — two identically-named
+# exceptions would make the 404 mapping depend on which module happened to raise.
+from app.services.planner_db import (
+    ProgramCatalog,
+    ProgramNotFoundError,
+    load_program_catalog,
+)
+from app.services.planner_db import (
+    select_remaining_courses as select_remaining_from_groups,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,10 +57,6 @@ SELECTIVE_TYPES = {"selective", "elective", "free_elective"}
 # When a selective group gives no credit target and no option credits, assume a standard
 # 3-credit course so "cover the group's credits" degrades to "choose one".
 DEFAULT_OPTION_CREDITS = 3.0
-
-
-class ProgramNotFoundError(LookupError):
-    """Raised when a profile's ``program_id`` does not exist in the academic database."""
 
 
 def normalize_course_code(code: str) -> str:
@@ -203,21 +215,51 @@ def derive_remaining_courses(program_id: str, completed: set[str]) -> list[str]:
     return select_remaining_courses(rows, completed)
 
 
+def resolve_program(profile: StudentProfile) -> tuple[StudentProfile, ProgramCatalog]:
+    """Resolve a program-driven profile into (planner-ready profile, the program's catalog).
+
+    THE MAJOR IS WHAT DECIDES THE COURSES. ``remaining_courses`` is derived from the selected
+    program's requirement rows minus what the student has completed — any codes the client
+    listed are ignored, because a plan for "Computer Science: Security" is defined by that
+    program's requirement groups and not by what a form was pre-filled with.
+
+    Two fields are derived from the program rather than asked of the student, because neither
+    is a fact about a person: ``major_subject`` (the department contributing the most required
+    courses) and ``degree_program`` (the catalog's own program title). A profile naming the
+    wrong major subject silently disables the per-semester major-course cap, which is a limit
+    the student would notice only by being handed four CS courses in one term.
+    """
+    catalog = load_program_catalog(
+        profile.program_id or "", extra_codes=set(profile.completed_courses), profile=profile
+    )
+    completed = {normalize_course_code(code) for code in profile.completed_courses}
+    remaining = select_remaining_from_groups(catalog.groups, completed, catalog.credits)
+    profile = profile.model_copy(update={
+        "completed_courses": sorted(completed),
+        "remaining_courses": remaining,
+        "major_subject": catalog.major_subject(),
+        # The catalog's own title wins over whatever the client sent. StudentProfile defaults
+        # `degree_program` to "Computer Science", so honouring the client value would print
+        # that on a Mechanical Engineering plan for anyone whose form did not overwrite it.
+        "degree_program": catalog.name,
+    })
+    return profile, catalog
+
+
 def resolve_profile_and_catalog(profile: StudentProfile) -> tuple[StudentProfile, list[Course]]:
     """Resolve a request profile into (planner-ready profile, planner catalog).
 
-    * ``program_id`` set → ``remaining_courses`` is derived from the program's requirement
-      rows minus completed courses (any client-listed codes are ignored, per TODO §4.2).
-      A missing program raises :class:`ProgramNotFoundError`; a database failure propagates
-      (the caller maps it to 503) because a program-driven plan is meaningless without the DB.
+    * ``program_id`` set → the program's own catalog answers, complete with the prerequisite
+      edges and observed term offerings the ``advisor`` schema holds
+      (see ``planner_db``). A missing program raises :class:`ProgramNotFoundError`; a database
+      failure propagates (the caller maps it to 503) because a program-driven plan is
+      meaningless without the DB.
     * Otherwise the profile's own codes are looked up in the academic DB; if it is unreachable
       or knows none of them, the bundled ``courses.json`` fixture answers instead, unchanged.
     """
     if profile.program_id:
-        remaining = derive_remaining_courses(profile.program_id, set(profile.completed_courses))
-        profile = profile.model_copy(update={"remaining_courses": remaining})
-        catalog = fetch_courses_by_codes(set(remaining) | set(profile.completed_courses))
-        return profile, list(catalog.values())
+        profile, catalog = resolve_program(profile)
+        return profile, catalog.courses
 
     requested = set(profile.remaining_courses) | set(profile.completed_courses)
     try:

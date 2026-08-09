@@ -74,7 +74,17 @@ class LlamaCppConnectionError(RuntimeError):
 
 class ModelResponseError(RuntimeError):
     """The server answered, but not with usable content (empty output, a non-2xx status, or —
-    for propose() — JSON that still won't validate after one retry)."""
+    for propose() — JSON that still won't validate after one retry).
+
+    ``raw`` carries the model's last output when there was one. Callers that can do something
+    with a partial answer use it: a plan of study truncated at the token ceiling still holds
+    most of a valid schedule, and throwing the text away turns a recoverable draft into a total
+    failure (see ai_planner._salvage_semesters).
+    """
+
+    def __init__(self, message: str, raw: str = ""):
+        super().__init__(message)
+        self.raw = raw
 
 
 def _is_local_hostname(hostname: str) -> bool:
@@ -124,11 +134,13 @@ class LlamaCppClient:
         *,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        timeout: float | None = None,
     ):
         self.base_url = (base_url or settings.llamacpp_base_url).rstrip("/")
         self.model = model or settings.llamacpp_model
         self.temperature = temperature if temperature is not None else settings.llamacpp_temperature
         self.max_tokens = max_tokens or settings.llamacpp_max_tokens
+        self.timeout = timeout if timeout is not None else settings.llamacpp_timeout_s
 
         if settings.llamacpp_local_only and not is_local_model_endpoint(self.base_url):
             raise LocalModelEndpointError(
@@ -160,6 +172,9 @@ class LlamaCppClient:
         user_prompt: str,
         *,
         response_format: dict[str, Any] | None = None,
+        seed: int | None = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self.model,
@@ -167,14 +182,22 @@ class LlamaCppClient:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
+            "temperature": self.temperature if temperature is None else temperature,
+            "max_tokens": max_tokens or self.max_tokens,
         }
+        # SEED IS WHAT MAKES "REGENERATE" MEAN ANYTHING. At temperature 0.15 an identical
+        # request returns a near-identical answer, so a student pressing regenerate on a plan
+        # they dislike would get the same plan back. llama-server takes a per-request seed;
+        # callers vary it (services/ai_planner.py bumps it per attempt) to resample properly
+        # rather than by nudging temperature, which would also change answer quality.
+        if seed is not None:
+            payload["seed"] = seed
         if response_format is not None:
             payload["response_format"] = response_format
 
+        timeout = self.timeout
         try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
+            async with httpx.AsyncClient(timeout=timeout) as client:
                 resp = await client.post(f"{self.base_url}/v1/chat/completions", json=payload)
         except httpx.ConnectError as exc:
             raise LlamaCppConnectionError(
@@ -183,7 +206,8 @@ class LlamaCppClient:
             ) from exc
         except httpx.TimeoutException as exc:
             raise LlamaCppConnectionError(
-                f"llama.cpp server at {self.base_url} timed out after 120s (model={self.model})"
+                f"llama.cpp server at {self.base_url} timed out after {timeout:g}s "
+                f"(model={self.model})"
             ) from exc
 
         try:
@@ -195,9 +219,16 @@ class LlamaCppClient:
             ) from exc
         return resp.json()
 
-    async def generate(self, system_prompt: str, user_prompt: str) -> str:
+    async def generate(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        seed: int | None = None,
+        max_tokens: int | None = None,
+    ) -> str:
         """Free-text generation grounded by the caller-supplied prompts."""
-        data = await self._chat_raw(system_prompt, user_prompt)
+        data = await self._chat_raw(system_prompt, user_prompt, seed=seed, max_tokens=max_tokens)
         self._log_usage("generate", data)
         content = data["choices"][0]["message"]["content"] or ""
         text = strip_reasoning(content)
@@ -211,6 +242,9 @@ class LlamaCppClient:
         user_prompt: str,
         output_type: type[T],
         schema: dict | None = None,
+        *,
+        seed: int | None = None,
+        max_tokens: int | None = None,
     ) -> T:
         """Schema-constrained generation, validated against ``output_type``.
 
@@ -232,7 +266,14 @@ class LlamaCppClient:
         prompt = user_prompt
 
         for attempt in (1, 2):
-            data = await self._chat_raw(system_prompt, prompt, response_format=response_format)
+            data = await self._chat_raw(
+                system_prompt, prompt, response_format=response_format,
+                # The retry must not resample the same tokens: with an identical seed and a
+                # temperature this low, "try again" reproduces the malformed output verbatim
+                # and burns a second generation to fail the same way.
+                seed=None if seed is None else seed + attempt - 1,
+                max_tokens=max_tokens,
+            )
             self._log_usage("propose", data)
             content = data["choices"][0]["message"]["content"] or ""
             raw = _extract_json_object(content)
@@ -242,7 +283,8 @@ class LlamaCppClient:
             except (json.JSONDecodeError, ValidationError) as exc:
                 if attempt == 2:
                     raise ModelResponseError(
-                        f"No schema-valid output from {self.model} after retry: {exc}"
+                        f"No schema-valid output from {self.model} after retry: {exc}",
+                        raw=raw,
                     ) from exc
                 logger.warning("propose(): invalid output on attempt 1, retrying: %s", exc)
                 prompt = (

@@ -57,9 +57,18 @@ def prereqs_satisfied(course: Course, completed: set[str]) -> bool:
     legal — never a registration wall — at the cost of occasionally scheduling a term later than
     strictly necessary. Validation of a plan the student built themselves applies the true
     same-semester rule, so a hand-edited plan is not flagged for something legal.
+
+    ``prereq_groups`` is AND-of-ORs and wins when present: a course needing "CS 25100 or
+    CS 25300" is unlocked by either, and reading the flat ``prereqs`` union instead would
+    demand both and strand the course forever. Catalogs that carry only the flat list (the
+    bundled courses.json fixture, tests) are unaffected — an empty group list falls through
+    to the old rule.
     """
-    required = set(course.prereqs) | set(course.coreqs)
-    return all(code in completed for code in required)
+    if not all(code in completed for code in course.coreqs):
+        return False
+    if course.prereq_groups:
+        return all(any(code in completed for code in group) for group in course.prereq_groups)
+    return all(code in completed for code in course.prereqs)
 
 
 def is_major_course(code: str, subject: str) -> bool:
@@ -173,7 +182,6 @@ def generate_plan(
             key=lambda c: (
                 priority.get(c.code, len(priority)),
                 "required" not in c.requirement_tags,
-                c.workload_score,
                 c.code,
             )
         )
@@ -236,12 +244,6 @@ def generate_plan(
         completed.update(planned_codes)
         remaining = [code for code in remaining if code not in planned_codes]
 
-        avg_workload = (
-            round(sum(course.workload_score for course in selected) / len(selected), 2)
-            if selected
-            else 0.0
-        )
-
         semesters.append(
             SemesterPlan(
                 term=term,
@@ -251,12 +253,10 @@ def generate_plan(
                         code=course.code,
                         title=course.title,
                         credits=course.credits,
-                        workload_score=course.workload_score,
                     )
                     for course in selected
                 ],
                 total_credits=selected_credits,
-                average_workload=avg_workload,
                 warnings=semester_warnings,
             )
         )
@@ -273,7 +273,7 @@ def generate_plan(
         )
 
     plan = PlanResponse(
-        student_name=profile.name,
+        profile_label=profile.profile_label,
         degree_program=profile.degree_program,
         semesters=semesters,
         unplanned_courses=remaining,

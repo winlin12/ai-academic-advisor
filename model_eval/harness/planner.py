@@ -56,7 +56,6 @@ class Course:
     coreqs: tuple[str, ...] = ()
     offered_terms: tuple[str, ...] = ()
     requirement_tags: tuple[str, ...] = ()
-    workload_score: int = 3
     # The course this one is an approved substitute for ("MA 16500" -> "MA 16100"). Carried
     # here only so the fixture row round-trips; NOTHING in this module reads it, and that is
     # deliberate. Equivalence is a SCORING question ("has the degree requirement been met?"),
@@ -90,6 +89,24 @@ class Profile:
     # semester at the end. Set an integer to pin it; set it equal to `max` to get the old
     # fill-to-the-cap behaviour back.
     target_credits_per_semester: int | None = None
+    # THE REGISTRAR'S CEILING, as distinct from the two above — added 2026-08-02, and the only
+    # one of the three that is a rule about what the UNIVERSITY permits rather than about what
+    # this student wants. 18 credits is a normal full-time overload at Purdue; above it you need
+    # a dean's signature, which is what makes 19 a different kind of thing from 17.
+    #
+    # Why it exists: `max_credits_per_semester` was doing both jobs, and scoring one 17-credit
+    # semester as `credit_cap_violation` made the whole plan NOT VIABLE — the same word the
+    # scorer uses for a course scheduled before its own prerequisite. Those are not the same
+    # failure. A plan with a 17-credit term is a plan the registrar accepts and the student
+    # merely did not ask for; a plan with a broken prereq chain cannot be registered at all.
+    # Charging viability for the first also billed it twice, since the student's own number is
+    # ALREADY scored, by name, as a `max_credits_at_most` assertion.
+    #
+    # So: `max_credits_per_semester` stays the student's number — it drives the planner, the
+    # prompt's "hard limit" line and the assertion — and only a semester above THIS one is a
+    # violation. Same reasoning as the coreq rule in plan_scorers: do not charge a violation
+    # for a schedule the registrar would accept.
+    hard_credit_cap: int = 18
     # MAJOR-COURSE LOAD, a second cap alongside credits. A 16-credit semester is not one
     # workload: four 4-credit CS courses and a CS course plus three gen-eds are the same number
     # and nothing like the same term. The credit cap alone cannot tell them apart, and the
@@ -298,7 +315,6 @@ def generate_plan(profile: Profile, catalog: list[Course], *, _spread: bool = Tr
             key=lambda c: (
                 priority.get(c.code, len(priority)),
                 "required" not in c.requirement_tags,
-                c.workload_score,
                 c.code,
             )
         )

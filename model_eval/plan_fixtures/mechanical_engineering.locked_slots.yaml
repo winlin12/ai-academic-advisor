@@ -1,0 +1,64 @@
+# =============================================================================
+# LOCKED SLOTS — Mode C (retry-to-convergence) only.
+#
+# See `cs_machine_intelligence.locked_slots.yaml`'s header for the full
+# rationale (why this is a separate file, not folded into `fixture_hash`, and
+# why every slot below is lifted from the deterministic planner's own output
+# rather than hand-invented). Nothing here differs in kind — only in program.
+#
+# CHOICE OF SLOTS: one shallow anchor (a zero-prereq course, semester 0) and
+# one deep anchor per scenario. `ME 46300` (Engineering Design, the capstone)
+# is the deep anchor for every scenario but one — it is this fixture's
+# longest prerequisite chain by construction (needs ME 35400 + ME 36400 +
+# ME 31500, each itself several courses deep off PHYS 17200), the same role
+# CS 25200 plays in `cs_machine_intelligence.yaml`. `me-thermal-focus` and
+# `me-no-automotive` start with so much already completed that no zero-prereq
+# course from THIS fixture remains among their earliest eligible options
+# except an engineering-gen-ed-selective row, so the shallow anchor there is
+# `PHIL 15000` instead of a CS/ME course — still zero-prereq, still
+# semester 0 in the deterministic plan.
+#
+# `run.py run --tasks converge --preflight` re-verifies every lock below is
+# legal where pinned before spending any GPU time on this fixture.
+# =============================================================================
+
+source:
+  derived_from: "harness/planner.generate_plan, 2026-08-07"
+  fixture: "mechanical_engineering.yaml"
+  note: >-
+    Slots are positions in the planning horizon, 0-based: semester_index 0 is
+    the student's start term. They are NOT catalog facts and are not scored
+    against the catalog; they are the student's stated intent.
+
+scenarios:
+  me-fresh-start:
+    - {semester_index: 0, course: "CS 15900"}
+    - {semester_index: 7, course: "ME 46300"}
+
+  me-sophomore-catchup:
+    - {semester_index: 0, course: "CS 15900"}
+    - {semester_index: 5, course: "ME 46300"}
+
+  me-light-load:
+    - {semester_index: 0, course: "ME 16400"}
+    - {semester_index: 6, course: "ME 46300"}
+
+  me-thermal-focus:
+    - {semester_index: 0, course: "PHIL 15000"}
+    - {semester_index: 3, course: "ME 46300"}
+
+  me-summer-accelerate:
+    - {semester_index: 0, course: "CS 15900"}
+    - {semester_index: 7, course: "ME 46300"}
+
+  me-spring-start:
+    - {semester_index: 0, course: "CS 15900"}
+    - {semester_index: 6, course: "ME 46300"}
+
+  me-controls-averse:
+    - {semester_index: 0, course: "CS 15900"}
+    - {semester_index: 5, course: "ME 46300"}
+
+  me-no-automotive:
+    - {semester_index: 0, course: "PHIL 15000"}
+    - {semester_index: 3, course: "ME 46300"}

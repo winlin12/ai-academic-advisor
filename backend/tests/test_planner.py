@@ -26,11 +26,26 @@ def test_generate_plan_has_semesters():
 
 
 def test_next_term_crosses_calendar_year_at_spring():
-    from app.services.planner import next_term
+    """The year rolls at spring, which is what makes fall the start of an academic year.
 
+    Summer is NOT in the sequence, and that is a policy rather than an oversight: summer
+    enrolment carries cost, aid and residency consequences the planner cannot reason about, so
+    ``PLANNER_INCLUDE_SUMMER`` defaults to false and fall is what follows spring. Offerings
+    data still records summer availability — this only constrains what we schedule INTO.
+    """
+    from app.services.planner import next_term, planning_terms
+
+    assert "summer" not in planning_terms()
     assert next_term("fall", 2026) == ("spring", 2027)
-    assert next_term("spring", 2027) == ("summer", 2027)
-    assert next_term("summer", 2027) == ("fall", 2027)
+    assert next_term("spring", 2027) == ("fall", 2027)
+
+
+def test_next_term_includes_summer_when_the_setting_is_flipped(monkeypatch):
+    from app.services import planner
+
+    monkeypatch.setattr(planner.settings, "planner_include_summer", True)
+    assert planner.next_term("spring", 2027) == ("summer", 2027)
+    assert planner.next_term("summer", 2027) == ("fall", 2027)
 
 
 def test_unknown_course_warning():

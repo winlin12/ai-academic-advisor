@@ -70,22 +70,23 @@ from .fixtures import Fixture, Scenario
 from .llamacpp_client import LlamaCppClient, LlamaCppError
 from .planner import Profile, generate_plan
 from .prompts import json_response_format, plan_schema
+from .real_db import fixture_from_database
+from .real_scoring import score_against_real_db
 
-# The spec's definition of a valid plan of study, verbatim: prerequisites, credit-hour caps,
-# term offerings. See `CONVERGENCE_CRITERION_CAVEAT` for what this leaves out and why the
-# report prints a second column next to it.
+# The spec's definition of a valid plan of study, PREREQUISITES ONLY. Credit-hour caps and term
+# offerings were dropped 2026-08-07 — neither is a registration wall a student can't talk their
+# way around, and offering data isn't knowable in advance anyway. See `CONVERGENCE_CRITERION_
+# CAVEAT` for what this leaves out and why the report prints a second column next to it.
 DEFAULT_VIOLATION_CLASSES = (
     "prereq_violation",
-    "credit_cap_violation",
-    "term_offering_violation",
 )
 
 CONVERGENCE_CRITERION_CAVEAT = """\
-`converged` uses the three violation classes Mode C was specified with, over FILLED slots only,
+`converged` uses the violation class(es) Mode C was configured with, over FILLED slots only,
 with no requirement-coverage condition. An EMPTY PLAN THEREFORE CONVERGES ON ATTEMPT 1: zero
 filled slots is zero violations. That is not a hypothetical — the feedback variant actively
 pushes toward it, because deleting the course named in a violation always removes that
-violation. `converged_strict` (full PLAN_VIABLE: all seven violation classes plus 100%
+violation. `converged_strict` (full PLAN_VIABLE: every remaining hard violation class plus 100%
 requirement coverage) and `degenerate` are recorded on every attempt so this is visible rather
 than silently inflating the headline. Read them together."""
 
@@ -109,6 +110,22 @@ class LockedSlots:
 
     def for_scenario(self, scenario_id: str) -> list[LockedSlot]:
         return self.by_scenario.get(scenario_id, [])
+
+
+def locked_slots_path_for(fixture) -> Path | None:
+    """The `<fixture-stem>.locked_slots.yaml` sibling for `fixture`, if one exists.
+
+    BY CONVENTION, not config — `config.yaml`'s `convergence.locked_slots` used to name a
+    single, fixed path, which only ever worked because exactly one fixture was ever active at a
+    time. Multi-school support (`run.py run`'s default loop, `--major`) makes the active fixture
+    change per school, so Mode C now looks next to WHICHEVER fixture is loaded rather than at a
+    path that only ever matched `cs_machine_intelligence.yaml`. Only `cs_machine_intelligence.
+    yaml` and `mechanical_engineering.yaml` have a matching file today; every other fixture
+    returns `None` here, and callers must treat that as "skip Mode C for this fixture," not an
+    error to route around.
+    """
+    candidate = fixture.path.with_name(fixture.path.stem + ".locked_slots.yaml")
+    return candidate if candidate.exists() else None
 
 
 def load_locked_slots(path: Path) -> LockedSlots:
@@ -386,9 +403,23 @@ def auto_repair(
 ) -> tuple[list[list[str]], list[str], list[str]]:
     """Delete violating placements until the plan is clean. Never touches a locked slot.
 
+    ``locked`` MUST be the repair variant's full ratcheted set (``working_locked``), not just
+    the student's true pins, on attempt 2+. The two used to be conflated — the caller passed
+    only the true pins — and it silently ate the ratchet's whole point. Live case,
+    qwen3.6-27b / mi-fresh-start: the model's own reply added two new, badly-placed courses
+    that pushed a semester's CS count to 5 (limit 3); nothing protected the THREE already-
+    confirmed CS courses sitting in that same semester from a prior attempt, so this function
+    was free to remove any of the five, and it is only luck whether the ones it picks are the
+    model's fresh mistakes or three attempts of prior progress. Across the following attempts it
+    was not luck — the case's coverage went 56% -> 22% -> 44% -> ... -> 0%, converging to
+    nothing. A course an earlier attempt got right must outrank a course this attempt has not
+    validated yet; only the true pins passed as ``locked`` in every OTHER caller (release
+    intentionally un-freezes some of ``working_locked`` first, precisely so this function is
+    then allowed to treat the released courses as ordinary candidates again).
+
     Returns (repaired, removed, unrepairable). ``unrepairable`` is non-empty when the only way
-    to clear a violation would be to move a course the STUDENT pinned — the harness must not,
-    so it reports the conflict instead of silently overriding the person it is planning for.
+    to clear a violation would be to move a course in ``locked`` — the harness must not, so it
+    reports the conflict instead of silently overriding confirmed or student-pinned work.
 
     Removal cascades on purpose: dropping CS 25100 can invalidate a CS 37300 that depended on
     it, so the loop re-scores after each pass rather than computing one removal set up front.
@@ -417,25 +448,6 @@ def auto_repair(
         blocked: list[str] = []
         for violation in score.violations:
             kind, code, index = parse_violation(violation)
-
-            if kind in ("credit_cap_violation", "major_overload_violation"):
-                # No single course is "the" offender; the semester is over a limit. Shed the
-                # cheapest non-locked courses until it is not.
-                if index is None or not 0 <= index < len(working):
-                    continue
-                is_major = kind == "major_overload_violation"
-                candidates = [
-                    c for c in (plan_scorers.normalize_code(x) for x in working[index])
-                    if c not in protected
-                    and (not is_major or plan_scorers.is_major_course(c, profile.major_subject))
-                ]
-                if not candidates:
-                    blocked.append(
-                        f"{violation} (every course in it is locked or holds up a locked one)")
-                    continue
-                candidates.sort(key=lambda c: _removal_priority(fixture, c, depended_on))
-                drop.append((index, candidates[0]))
-                continue
 
             if code is None:
                 continue
@@ -601,15 +613,27 @@ def legal_slots(
     CS 42200 were each legal in EXACTLY ONE semester out of eight. Asking a 4B model to find a
     single legal slot by trial and error, while also re-transcribing twenty-five confirmed
     placements, is a search problem wearing a planning problem's clothes.
+
+    THE COMPARISON MUST BE ON THE SET OF VIOLATIONS, NOT THE COUNT — a real bug, live case
+    gemma4-26b / mi-fresh-start: CS 25100 sat committed with its prerequisite CS 24000 not yet
+    placed anywhere, which is itself one standing violation ("CS 25100 needs CS 24000"). Trying
+    CS 24000 in semester 1 — alongside CS 18000, its OWN prerequisite, same semester — swaps
+    that violation for a different one ("CS 24000 needs CS 18000"): the count stays at one, so
+    a `<=` on `len(...)` called it legal. The hint told the model semester 1 was fine, the model
+    placed it there, auto-repair deleted it as a genuine violation next pass, and the hint
+    offered the same bad slot again — a loop that looked like the model getting confused but was
+    the harness lying to it. A slot is only legal if it adds nothing to the violation set that
+    was not already there.
     """
-    base = len(plan_scorers.score_plan(fixture, profile, semesters).violations)
+    base = set(plan_scorers.score_plan(fixture, profile, semesters).violations)
     out: list[int] = []
     for index in range(max(len(semesters), profile.semesters_to_plan)):
         trial = [list(courses) for courses in semesters]
         while len(trial) <= index:
             trial.append([])
         trial[index].append(code)
-        if len(plan_scorers.score_plan(fixture, profile, trial).violations) <= base:
+        trial_violations = set(plan_scorers.score_plan(fixture, profile, trial).violations)
+        if trial_violations <= base:
             out.append(index + 1)
     return out
 
@@ -667,12 +691,15 @@ def is_deadlocked(fixture: Fixture, profile: Profile,
     wanted = unmet_candidates(fixture, profile, semesters)
     if not wanted:
         return False
-    base = len(plan_scorers.score_plan(fixture, profile, semesters).violations)
+    # Set comparison, not count — see `legal_slots` for why a `<=` on `len(...)` calls a
+    # sideways trade of one violation for another "legal" when it is not.
+    base = set(plan_scorers.score_plan(fixture, profile, semesters).violations)
     for code in wanted:
         for index in range(len(semesters)):
             trial = [list(courses) for courses in semesters]
             trial[index].append(code)
-            if len(plan_scorers.score_plan(fixture, profile, trial).violations) <= base:
+            trial_violations = set(plan_scorers.score_plan(fixture, profile, trial).violations)
+            if trial_violations <= base:
                 return False
     return True
 
@@ -839,6 +866,7 @@ class AttemptResult:
     seed: int
     temperature: float
     feedback_given: list[str] = field(default_factory=list)
+    duplicates_removed: list[str] = field(default_factory=list)
 
     def as_record(self) -> dict[str, Any]:
         return {
@@ -864,6 +892,7 @@ class AttemptResult:
             "seed": self.seed,
             "temperature": self.temperature,
             "feedback_given": self.feedback_given,
+            "duplicates_removed": self.duplicates_removed,
         }
 
 
@@ -945,8 +974,20 @@ def run_case(
     progress* (7 violations, then 4, then 1) or just resampling noise (7, 6, 8, 7) is the most
     diagnostic thing this mode produces, and it is invisible in a record that keeps only the
     terminal state.
+
+    SCORED AGAINST THE LIVE DATABASE, NOT THE STATIC FIXTURE — the one line below is the
+    entire migration. Every helper this function calls (`legal_slots`, `auto_repair`,
+    `unmet_candidates`, `placement_hints`, `release_blockers`, `surplus_placements`) takes
+    whatever `Fixture` it's handed and has no idea whether it came from YAML or Postgres, so
+    swapping it in here is enough — see `real_db.fixture_from_database`'s docstring for why
+    scoring Mode C against the fixture was capping every well-behaved model's coverage at
+    66.7% (the fixture invents gen-ed/science course codes the real database, and the
+    prompt, both correctly say do not exist). `ctx.fixture` is still used elsewhere in this
+    module (case/scenario enumeration) — only the SCORING authority changes here, mirroring
+    Mode B's own migration off the fixture (`real_scoring.py`).
     """
-    fixture: Fixture = ctx.fixture
+    database = ctx.database_for(scenario)
+    fixture: Fixture = fixture_from_database(database)
     profile = scenario.profile
     timeout_s = float(conv_cfg["timeout_s"])
     max_attempts = int(conv_cfg["max_attempts"])
@@ -1011,7 +1052,7 @@ def run_case(
             temperature = base_temp
             given = list(feedback) if variant == "feedback" else []
 
-        system, user, static_hash = ctx.prompts.plan_convergence(
+        system, user, static_hash = ctx.prompts_for(scenario).plan_convergence(
             scenario, working_locked, feedback=given,
             confirmed=(variant == "repair" and attempt > 1),
             missing_requirements=missing if variant == "repair" else None,
@@ -1035,9 +1076,15 @@ def run_case(
                 system, user, options=options, think=model_cfg.get("think"),
                 response_format=json_response_format(
                     "PlanOfStudy",
+                    # THIS SCENARIO's own `database`, NOT `fixture.catalog` — see runner.py's
+                    # `_run_freeform_plan` for why: this enum grammar-constrains the model's
+                    # OUTPUT, so building it from the fixture forces the model to answer in
+                    # CS Machine Intelligence course codes even when `database` (what the
+                    # prompt text actually showed it) is a different program, or a different
+                    # elective selection, entirely.
                     plan_schema(
                         ctx.cfg["run"]["planning_terms"],
-                        [c.code for c in fixture.catalog],
+                        sorted(database.course_codes),
                     ),
                 ),
             )
@@ -1080,13 +1127,32 @@ def run_case(
         semesters, alterations = apply_locked_slots(
             raw_semesters, working_locked, profile.semesters_to_plan
         )
+        # DEDUPE BEFORE SCORING, every variant — see plan_scorers.dedupe_semesters's docstring
+        # and Mode B's identical call in runner.py. `apply_locked_slots` already guarantees each
+        # PINNED course appears exactly once; this catches everything else the model repeated.
+        # `repair`'s own `auto_repair` below still runs afterward for the violations this does
+        # not touch (prereq/coreq/hallucination) — the two do not conflict, since a cleaned plan
+        # simply gives `auto_repair` nothing duplicate left to find.
+        fixture_canon = fixture.canonical
+        canon = lambda code: fixture_canon.get(code, code)  # noqa: E731
+        completed = {canon(plan_scorers.normalize_code(c)) for c in profile.completed_courses}
+        semesters, duplicates_removed = plan_scorers.dedupe_semesters(
+            semesters, canon=canon, completed=completed
+        )
 
         if variant == "repair":
             # THE HARNESS CLEARS THE VIOLATIONS. Anything the validator can name, it can
             # delete — asking a model to do it costs a round trip and, in practice, costs the
             # rest of the plan too.
+            # working_locked, NOT locked. auto_repair must never treat a course confirmed by an
+            # earlier attempt as more disposable than the model's fresh, still-unvalidated
+            # additions from THIS round — see auto_repair's docstring for the live case
+            # (qwen3.6-27b / mi-fresh-start) where passing only the true pins let a CS-overload
+            # caused by two new, badly-placed courses get "fixed" by deleting three
+            # already-confirmed ones instead, and the case collapsed from 56% coverage to 0%
+            # over the following attempts.
             semesters, removed_now, unrepairable = auto_repair(
-                fixture, profile, semesters, locked
+                fixture, profile, semesters, working_locked
             )
             repair_removed += removed_now
             repair_unrepairable = unrepairable
@@ -1163,6 +1229,7 @@ def run_case(
             elapsed_s=res.total_s, ttft_s=res.ttft_s, eval_count=res.eval_count,
             prompt_eval_count=res.prompt_eval_count, predicted_ms=res.predicted_ms,
             output=res.text, seed=seed, temperature=temperature, feedback_given=given,
+            duplicates_removed=duplicates_removed,
         ))
         ctx.write_transcript(
             model_cfg["name"], f"mode_c_{variant}", f"{scenario.id}__a{attempt}", 0,
@@ -1212,7 +1279,25 @@ def run_case(
 
     wall = time.monotonic() - started
     converged_at = next((a.attempt for a in attempts if a.converged), None)
-    record = {
+
+    # MODE B'S OWN SCORE, ON WHATEVER THE CASE ENDED WITH. `attempts[-1]` is the converged
+    # attempt when the loop broke early (`converged_at` is not None) and the last one tried
+    # otherwise (out of attempts, out of clock, or plateaued) — either way it is the plan a
+    # student would actually be looking at when the case stopped, "last attempt (or sooner)".
+    # This is the SAME scorer and SAME field surface `_run_freeform_plan` uses for Mode B
+    # (`real_scoring.score_against_real_db` / `RealScore.as_record()`), so a Mode C case is
+    # comparable to a Mode B run on every metric Mode B reports, not just the convergence-
+    # specific ones (`converged`, `attempts_to_converge`, ...) this module already tracked.
+    final_semesters = attempts[-1].semesters if attempts else []
+    real_score = score_against_real_db(
+        database, profile, final_semesters, assertions=scenario.assertions
+    )
+    record: dict[str, Any] = dict(real_score.as_record())
+    record.update({
+        "semester_count": len(final_semesters),
+        "over_horizon": len(final_semesters) > profile.semesters_to_plan,
+    })
+    record.update({
         "model": model_cfg["name"],
         "stage": "plan_mode_c",
         "variant": variant,
@@ -1254,8 +1339,9 @@ def run_case(
         "tokens_per_s": _median([t for t in (_tokens_per_s(a.eval_count, a.predicted_ms)
                                              for a in attempts) if t]),
         "locked_alterations_total": sum(len(a.locked_alterations) for a in attempts),
+        "duplicates_removed_total": sum(len(a.duplicates_removed) for a in attempts),
         "attempts": [a.as_record() for a in attempts],
-    }
+    })
     out.write(json.dumps(record, default=str) + "\n")
     out.flush()
     return record
@@ -1323,7 +1409,14 @@ def run_convergence(
     if not conv_cfg:
         raise SystemExit("config.yaml has no `convergence:` block.")
 
-    slots_path = root / conv_cfg["locked_slots"]
+    slots_path = locked_slots_path_for(ctx.fixture)
+    if slots_path is None:
+        raise SystemExit(
+            f"no locked-slots file for {ctx.fixture.path.name} — Mode C needs "
+            f"{ctx.fixture.path.with_suffix('').name}.locked_slots.yaml next to the fixture. "
+            f"Only fixtures with one support `converge`; see `run.py`'s multi-school loop, "
+            f"which skips this task automatically for fixtures that don't have it."
+        )
     locked_slots = load_locked_slots(slots_path)
 
     selected = [
@@ -1429,7 +1522,6 @@ def run_convergence(
 
 
 def _write_meta(ctx, conv_cfg, locked_slots: LockedSlots, selected, variants, cases) -> None:
-    scenario = ctx.fixture.scenarios[0]
     meta = {
         "tag": "convergence",
         "mode": "D",
@@ -1446,7 +1538,13 @@ def _write_meta(ctx, conv_cfg, locked_slots: LockedSlots, selected, variants, ca
             "hash": ctx.fixture.fixture_hash,
             "verified": ctx.fixture.verified,
         },
-        "mock_db": {"path": ctx.database.path.name, "hash": ctx.database.db_hash},
+        # ONE PER CASE now — each scenario's own gen_ed_preference/world_language narrows the
+        # real database differently; see `harness/real_db.py`'s module docstring and
+        # `runner.write_meta`'s matching `database_by_scenario`.
+        "database_by_scenario": {
+            s.id: {"path": (db := ctx.database_for(s)).path.name, "hash": db.db_hash}
+            for s in cases
+        },
         # Locked slots are prompt input, not scoring authority — recorded here (and per record)
         # rather than folded into fixture_hash, so adding them cannot invalidate a Mode A/B row.
         "locked_slots": {
@@ -1457,8 +1555,11 @@ def _write_meta(ctx, conv_cfg, locked_slots: LockedSlots, selected, variants, ca
                           for k, v in locked_slots.by_scenario.items()},
         },
         "static_hashes": {
-            "plan_mode_c": ctx.prompts.plan_convergence(
-                scenario, locked_slots.for_scenario(scenario.id))[2],
+            "plan_mode_c_by_scenario": {
+                s.id: ctx.prompts_for(s).plan_convergence(
+                    s, locked_slots.for_scenario(s.id))[2]
+                for s in cases
+            },
         },
     }
     (ctx.results_dir / "meta_convergence.json").write_text(json.dumps(meta, indent=2))

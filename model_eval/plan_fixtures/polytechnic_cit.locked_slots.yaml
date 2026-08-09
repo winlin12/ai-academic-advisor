@@ -1,0 +1,41 @@
+# =============================================================================
+# LOCKED SLOTS — Mode C (retry-to-convergence) only.
+#
+# See `cs_machine_intelligence.locked_slots.yaml`'s header for the full rationale (why this is
+# a separate file, not folded into `fixture_hash`, and why every slot below is lifted from the
+# deterministic planner's own output rather than hand-invented). Nothing here differs in kind —
+# only in program.
+#
+# CHOICE OF SLOTS: one shallow anchor (a zero-prereq course, semester 0) and one DEEP anchor —
+# `CNIT 48000` (Managing Information Technology Projects), behind CNIT 38000 + CNIT
+# 34400 — this fixture's longest prerequisite chain.
+# Every scenario opens with `CNIT 11000` (zero-prereq) at semester 0.
+#
+# `run.py run --tasks converge --preflight` re-verifies every lock below is legal where pinned
+# before spending any GPU time on this fixture.
+# =============================================================================
+
+source:
+  derived_from: "harness/planner.generate_plan, 2026-08-09"
+  fixture: "polytechnic_cit.yaml"
+  note: >-
+    Slots are positions in the planning horizon, 0-based: semester_index 0 is
+    the student's start term. They are NOT catalog facts and are not scored
+    against the catalog; they are the student's stated intent.
+
+scenarios:
+  cit-fresh-start:
+    - {semester_index: 0, course: "CNIT 11000"}
+    - {semester_index: 4, course: "CNIT 48000"}
+
+  cit-sophomore-catchup:
+    - {semester_index: 0, course: "CNIT 11000"}
+    - {semester_index: 4, course: "CNIT 48000"}
+
+  cit-light-load:
+    - {semester_index: 0, course: "CNIT 11000"}
+    - {semester_index: 4, course: "CNIT 48000"}
+
+  cit-spring-start:
+    - {semester_index: 0, course: "CNIT 11000"}
+    - {semester_index: 4, course: "CNIT 48000"}

@@ -9,74 +9,134 @@ llamacpp:
   keep_log_lines: 400
 
 run:
-  # 32768 as of 2026-07-31, up from 16384. The elective menu widened the same day (13 more
-  # courses in the plan fixture), and the mock-database export that IS Mode B's system prompt
-  # grows with it — ~9.8k tokens before, and the headroom over max_plan_tokens was the thing
-  # that would have gone first. KV cache is f16, so this doubles KV VRAM — which is what
-  # n_gpu_moe: 6 below is paying for.
+  # DROPPED BACK TO 16384, 2026-08-06 — was 32768 since 2026-07-31, when the mock-database
+  # export grew past 16384's headroom. That export is gone now: `course_prerequisites` is
+  # inlined into `courses` instead of a separate table, `course_planner_terms` was removed
+  # outright (no more offering-term scoring — see catalog_export.py's module docstring), and
+  # `unresolved_requirement_groups` was trimmed from 8 entries to 1. Measured against the real
+  # program (`real_db.program_id` below) at this size: 14311 of 14336 tokens available
+  # (num_ctx minus max_plan_tokens), comfortably under, across every `world_language`/
+  # `gen_ed_preference` combination tried. Revert to 32768 (or higher) first if Mode B starts
+  # exceed_context_size_error-ing again — that error is unambiguous, unlike a silently
+  # truncated plan.
   num_ctx: 16384
   parallel: 1
   n_gpu_layers: 999
-  n_cpu_moe: 24
-  # 6 as of 2026-07-31, down from 7: doubling num_ctx doubled the f16 KV cache, and on this
-  # box's 8 GB card the MoE expert layers are what has to give way. One fewer expert layer on
-  # the GPU costs throughput on the two `server`-bracket models and nothing on the dense 8gb
-  # ones. Read the [env] offload row per model rather than assuming this was enough.
-  # n_gpu_moe: 6
-  cache_type_k: "f16"        
-  cache_type_v: "f16"       
+  n_cpu_moe: 7
+  cache_type_k: "f16"
+  cache_type_v: "f16"
   temperature: 0.15
   seed: 67
   top_p: 0.9
   max_output_tokens: 1048
   max_plan_tokens: 2048
-  runs_per_pair: 3            # N replicates per (model x item) — variance, not luck
+  runs_per_pair: 1            # N replicates per (model x item) — variance, not luck
   warmup_discard: 2           # generations per model discarded before measurement
   request_timeout_s: 600
   revise_max_iterations: 3
   explain_question: "Why is my plan sequenced this way, and where is it risky?"
   planning_terms: [fall, spring]
   save_transcripts: true
-  # plan_a | plan_b | qa | explain
-  default_tasks: [plan_a, plan_b, qa, explain]
+  # plan_a | plan_b | qa | explain | converge (Mode C — see the `convergence:` block below for
+  # its own knobs). `run.py run` with no --tasks runs every one of these; `--tasks` narrows it.
+  default_tasks: [plan_a, plan_b, qa, explain, converge]
 
 models:
-  - name: "gemma4-12b"
-    gguf: "gemma4-12b/gemma-4-12b-it-IQ4_XS.gguf"
-    bracket: server         
-    think: false
-    n_cpu_moe: 0
-  - name: "gemma4-26b"
-    gguf: "gemma4-26b/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"
-    bracket: server         
-    think: false 
-    n_cpu_moe: 22
-  - name: "gemma4-26b-s"
-    gguf: "gemma4-26b-s/gemma-4-26B-A4B-it-UD-IQ4_NL.gguf"
-    bracket: server         
-    think: false
-    n_cpu_moe: 20
-  - name: "qwen3.6-35b-a3b"
-    gguf: "qwen3.6-35b-a3b/Qwen_Qwen3.6-35B-A3B-Q4_K_M.gguf"
+  
+  - name: "qwen3.6-27b"
+    gguf: "qwen3.6-27b/Qwen3.6-27B-Q4_K_M.gguf"
     bracket: server
     think: false
-    n_cpu_moe: 32
-  - name: "gemma4-e4b"
-    gguf: "gemma4-e4b/gemma-4-E4B-it-Q4_K_M.gguf"
-    bracket: 8gb
+    # TENSOR-SPLIT SWEEP, 2026-08-09 (RTX 3060 12GB @ CUDA0 / RTX 2060 SUPER 8GB @ CUDA1). Was
+    # 0.62,0.38. Measured across 0.45,0.55 -> 0.70,0.30 (400-token /v1/chat/completions bench,
+    # server restarted fresh each point): 0.45/0.50 OOM CUDA1 outright, 0.55 crashed (SIGSEGV,
+    # right at the edge), 0.60 was the best of everything that ran clean at 19.9 tok/s, then
+    # monotonically WORSE moving toward CUDA0 (0.62: 19.3, 0.65: 18.8, 0.70: 17.8) — this model
+    # keeps `n_cpu_moe: 7` on top of the split, so loading CUDA0 (the card already doing the
+    # most work) further only makes it slower, it does not buy headroom. 0.60 is also not a
+    # knife's edge pick: 0.55 already failed, so this sits one full step inside the safe range,
+    # not AT the boundary a slightly heavier prompt could cross.
+    extra_args: ["--tensor-split", "0.60,0.40"]
+  # COMMENTED OUT 2026-08-08 for the school-fixture sweep — only qwen3.6-27b and gemma4-26b are
+  # in scope, for time's sake. Uncomment to restore the full model sweep.
+  # - name: "qwen3.5-9b"
+  #   gguf: "qwen3.5-9b/Qwen3.5-9B-Q4_K_M.gguf"
+  #   bracket: 12gb
+  #   think: false
+  #   extra_args: ["--split-mode", "none", "--main-gpu", "0"]
+  #   extra_args: ["--tensor-split", "0.63,0.37"]
+  # - name: "gemma4-12b"
+  #   gguf: "gemma4-12b/gemma-4-12b-it-IQ4_XS.gguf"
+  #   bracket: 12gb
+  #   think: false
+  #   extra_args: ["--split-mode", "none", "--main-gpu", "0"]
+  - name: "gemma4-26b"
+    gguf: "gemma4-26b/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"
+    bracket: server
     think: false
-  
-  - name: "qwen3.5-9b"
-    gguf: "qwen3.5-9b/Qwen3.5-9B-Q4_K_M.gguf"
-    bracket: 8gb
-    think: false
- 
+    n_cpu_moe: 0
+    # TENSOR-SPLIT SWEEP, 2026-08-09 — see qwen3.6-27b's own note just above for the method.
+    # Was 0.62,0.38. 0.45/0.50 OOM CUDA1 (this model is fully GPU-resident, `n_cpu_moe: 0`, so
+    # it has less slack than qwen's partially-CPU-offloaded footprint). 0.55 and 0.60 tied for
+    # best (65.3 / 65.5 tok/s); 0.60 chosen for the same reason as qwen — one step off the
+    # observed failure boundary rather than adjacent to it. 0.62 measured 64.1, 0.65 measured
+    # 60.6, and 0.70 OOM'd CUDA0 outright (`cudaMalloc failed: out of memory` allocating the KV
+    # cache buffer) — this card is the bottleneck past ~0.65, not the one that wants more of
+    # the model.
+    extra_args: ["--tensor-split", "0.60,0.40"]
+  # - name: "qwen3.6-35b-a3b"
+  #   gguf: "qwen3.6-35b-a3b/Qwen_Qwen3.6-35B-A3B-Q4_K_M.gguf"
+  #   bracket: server
+  #   think: false
+  #   n_cpu_moe: 9
+  #   extra_args: ["--tensor-split", "0.63,0.37"]
+  #   # ~5.5 GiB of experts live in system RAM here, past RLIMIT_MEMLOCK; --mlock only produces a
+  #   # failed-to-lock warning on every start. The 23.50 above was measured without it.
+  #   mlock: false
+  # - name: "gemma4-e4b"
+  #   gguf: "gemma4-e4b/gemma-4-E4B-it-Q4_K_M.gguf"
+  #   bracket: 12gb
+  #   think: false
+  #   extra_args: ["--split-mode", "none", "--main-gpu", "0"]
+
+
 paths:
   plan_fixture: "plan_fixtures/cs_machine_intelligence.yaml"
-  mock_db: "mock_db"
-  sample_plan: "plan_fixtures/cs_machine_intelligence.sample_plan.yaml"
   questions: "questions.yaml"
   results_dir: "results"
+
+# Mode B's context: the REAL catalog_ingestion/advisor Postgres DB, read live — no JSON mock
+# any more (see harness/real_db.py, harness/catalog_export.py). `program_id` is the real,
+# crawled "Computer Science: Machine Intelligence" program (48 requirement groups; NOT the
+# 9-group synthetic row that mirrors plan_fixture — see real_db.py's module docstring for why
+# that matters for scoring). Override at the CLI with `--major "<search text>"` (interactive
+# if it matches more than one program) or MODEL_EVAL_REAL_DB_URL / _PROGRAM_ID directly.
+real_db:
+  url: "postgresql://catalog:catalog@localhost:5433/catalog_ingestion"
+  program_id: "4aecc496-3cfd-4090-b822-334e09007668"
+  # UNSET ON PURPOSE. Widens the course universe beyond what a requirement_options row
+  # explicitly names — every undergraduate course under these subject prefixes becomes a
+  # real, choosable elective, budget permitting — but a FIXED subject applied to every
+  # program is wrong the instant `--major` points this at something that isn't CS (see
+  # real_db.py's module docstring for the WGSS incident that found this). Leaving this unset
+  # auto-detects the one subject required most often by whichever program is actually
+  # loaded. Only set it here if you want every run pinned to a specific subject regardless
+  # of program — e.g. `broaden_subjects: [CS]` to always widen CS even for a non-CS major.
+  # broaden_subjects: [CS]
+
+  # MANUAL OVERRIDE, same spirit as convergence.excluded_prereq_edges below: groups this crawl
+  # leaves untyped (requirement_type/credits_min both null) that real_db.py's structural
+  # heuristics (container-child, generic "Sequence N"/"Option N" naming, multi-subject) cannot
+  # tell apart from a genuine "take every course listed" requirement, because they are
+  # single-subject with a descriptive (non-generic) name. Verified by hand for THIS program —
+  # confirmed 2026-08-06: "Statistics" is one course, not all five; "PHYSICS I" and "PHYSICS II"
+  # are a paired sequence (one course from EACH group -- the group's own name says "Physics I
+  # AND Physics II are required for a sequence"), not five PHYS courses combined. Exact
+  # requirement_groups.name match; re-verify after any re-crawl since names can drift.
+  force_selective_groups:
+    - "Statistics"
+    - "PHYSICS I - Physics I AND Physics II are required for a sequence."
+    - "PHYSICS II - Physics I AND Physics II are required for a sequence."
 
 # --- MODE C: retry to convergence -------------------------------------------------------------
 # The name is reused: `results_old8/runs_*.jsonl` still holds `"stage": "plan_mode_c"` records
@@ -84,13 +144,20 @@ paths:
 # them apart is the file (`runs_convergence.jsonl`, not `runs_baseline.jsonl`) and the `variant`
 # field, which the old records lack — check for it before pooling. See harness/convergence.py.
 convergence:
-  # repair   — the harness deletes violating placements (deterministic; no model needed) and
-  #            FREEZES everything that validates, so good work is never lost. The model is only
-  #            ever asked to fill what is missing. Scored STRICTLY (clean AND fully covered),
-  #            because the repair step makes "clean" free and therefore uninformative.
   # feedback — the model is told what is wrong and must fix it itself.
   # blind    — the model is told nothing; new sample each attempt.
-  enabled_variants: [repair, feedback, blind]
+  #
+  # "repair" REMOVED 2026-08-08, deliberately, as part of adding multi-school support. It used
+  # to also be an option here: the harness deletes violating placements (deterministic; no
+  # model needed) and FREEZES everything that validates, so the model is only ever asked to
+  # fill what is missing. That auto-repair step has no equivalent in the shipped app —
+  # `advisor_agent.revise_plan` never silently deletes and re-plans around a bad placement on
+  # the student's behalf — so scoring a model against it was scoring against a capability the
+  # product doesn't have. Once every school needs its own plan fixture for Mode C to run at
+  # all (see `harness/convergence.locked_slots_path_for`), keeping a variant that measures a
+  # non-shippable behavior stopped being worth the added fixture-authoring cost per school.
+  # feedback/blind remain — both mirror something a real revise-plan turn can actually do.
+  enabled_variants: [feedback, blind]
 
   # PER TEST CASE, not shared across the batch. A shared budget makes each case's result depend
   # on how slow the previous ones were, which is not a property of the model. 600 s sits in the
@@ -98,10 +165,16 @@ convergence:
   # request_timeout_s, so one attempt can never outlive its own case.
   timeout_s: 600
 
+  # CAPPED AT 3, 2026-08-07 (was 10). A model that hasn't converged in 3 tries is not going to be
+  # driven to 100% by burning another 7 GPU-minutes on it — in practice a student stops iterating
+  # with the assistant and finishes the schedule by hand well before then. Whatever state the case
+  # is in at attempt 3 (converged sooner, or not) is now also scored on Mode B's own metrics — see
+  # `run_case`'s `real_score`/`rec.update(real_score.as_record())` — so a censored case still
+  # yields a comparable viability/coverage snapshot instead of only "did not converge".
   # Independent of the clock, and reported separately (`censor_reason`). A fast model can
-  # exhaust 10 attempts well inside 600 s while a slow one times out on attempt 2 — those are
+  # exhaust 3 attempts well inside 600 s while a slow one times out on attempt 2 — those are
   # different findings and collapsing them into one "did not converge" would hide it.
-  max_attempts: 10
+  max_attempts: 3
 
   # null = show every violation. A full list makes convergence close to transcription: the
   # model is told exactly which courses are wrong and where, and the mode stops measuring
@@ -112,9 +185,14 @@ convergence:
   # THE CONVERGENCE CRITERION, as specified: filled slots only, no coverage condition.
   # WARNING: an empty plan satisfies this on attempt 1. `converged_strict` and `degenerate`
   # are recorded next to it for exactly that reason — read all three. Add the other classes
-  # (duplicate_course, hallucinated_course, coreq_violation, major_overload_violation) here to
-  # tighten it.
-  violation_classes: [prereq_violation, credit_cap_violation, term_offering_violation]
+  # (duplicate_course, hallucinated_course, coreq_violation) here to tighten it.
+  # credit_cap_violation, term_offering_violation, and major_overload_violation are not valid
+  # additions any more — all three were REMOVED 2026-08-07, not just left off this list: none
+  # of the three is a registration wall a student can't talk their way around (a heavy
+  # semester, credit- or major-course-wise, is the student's own call; a future offering
+  # pattern isn't knowable from this data at all), so none of them should decide whether a
+  # plan "converged" or is PLAN_VIABLE. See `plan_scorers.py`'s module docstring.
+  violation_classes: [prereq_violation]
 
   # Blind resampling only. The feedback variant holds seed and temperature fixed so its retries
   # differ in CONTEXT alone — otherwise self-correction and resampling luck are confounded.
@@ -135,8 +213,9 @@ convergence:
   plateau_patience: 3
   # `blind` is deliberately absent: repetition IS its measurement — it samples independently to
   # estimate how often a good plan appears by luck, so identical draws are expected and
-  # early-stopping on them would truncate the distribution being measured.
-  plateau_variants: [repair, feedback]
+  # early-stopping on them would truncate the distribution being measured. `repair` dropped
+  # 2026-08-08 with the variant itself — see `enabled_variants` above.
+  plateau_variants: [feedback]
 
   seed_stride: 1000
   temperature_step: 0.05
@@ -148,10 +227,40 @@ convergence:
   # the report header and stored in meta_convergence.json.
   excluded_prereq_edges: []
 
-  locked_slots: "plan_fixtures/cs_machine_intelligence.locked_slots.yaml"
+  # NO LONGER A CONFIG KEY, as of 2026-08-08 (was a single fixed path here, e.g.
+  # "plan_fixtures/cs_machine_intelligence.locked_slots.yaml"). Multi-school support means the
+  # active fixture changes per school, so a single hard-coded path stopped making sense — Mode C
+  # now looks BY CONVENTION for a "<fixture-stem>.locked_slots.yaml" sibling of whichever fixture
+  # is currently loaded (see `harness/convergence.locked_slots_path_for`), and skips the task
+  # entirely for a fixture that doesn't have one rather than erroring.
 
 decision:
   mode_b_viable_floor: 0.90
   mode_a_grounded_floor: 0.90
   plan_viable_gap_pp: 15
   min_plan_scenarios: 8
+
+# --- MODE B THINKING EXPERIMENT -----------------------------------------------------------------
+# `--tasks plan_b_thinking` only — see harness/runner.run_thinking_experiment. NOT in
+# run.default_tasks, so it never runs unless asked for by name. Launches its OWN server per
+# model with reasoning ENABLED (`--reasoning-budget budget_tokens`, no `--reasoning off`) —
+# completely separate from every other task's server, which still launches exactly as before
+# (`--reasoning off --reasoning-budget 0` when the model's own `think: false`). Results go to
+# `runs_thinking.jsonl`, never `runs_baseline.jsonl`, so the two settings can never mix in one
+# comparison.
+#
+# WHY THIS EXISTS, not the removed post-hoc `rationale` field it might look like a revival of:
+# `rationale` was written AFTER `semesters` was already fixed (prompts.PLAN_SCHEMA's own
+# history note) — pure narration, correctly cut for the ~40% wall-clock it cost without ever
+# being able to change the plan it explained. Reasoning BEFORE the grammar-constrained JSON
+# starts is a different mechanism: it happens before any course is chosen, so it can at least
+# in principle change what gets picked. This experiment measures whether it actually does, on
+# these two models, against the identical prompt/schema/scorer `plan_b` already uses.
+#
+# budget_tokens IS A CEILING ON THE REASONING PORTION ONLY. `_run_freeform_plan` widens the
+# request's own `max_tokens` by this same amount (`max_plan_tokens + budget_tokens`) so a full
+# reasoning budget can never crowd out the JSON plan that has to follow it — without that, a
+# truncated plan would be an artifact of too-small a token ceiling, not a finding about
+# reasoning itself.
+thinking:
+  budget_tokens: 512

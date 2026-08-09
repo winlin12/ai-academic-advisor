@@ -45,6 +45,12 @@ class GenerationResult:
     predicted_ms: float | None      # llama.cpp's own generation time
     finish_reason: str | None = None
     raw_final: dict[str, Any] = field(default_factory=dict)
+    # llama-server streams reasoning as `delta.reasoning_content`, a channel separate from
+    # `delta.content` — NOT inline `<think>` tags in `text` (those only show up if a build/
+    # template doesn't split the two). Captured here rather than left to fall on the floor,
+    # for the one caller that turns reasoning on (`runner.run_thinking_experiment`); empty for
+    # every normal call, where reasoning stays off at launch and this channel never fires.
+    reasoning_text: str = ""
 
     @property
     def truncated(self) -> bool:
@@ -74,6 +80,20 @@ class LlamaCppClient:
         except urllib.error.URLError as exc:
             raise LlamaCppError(
                 f"Cannot reach llama-server at {self.base_url} ({exc.reason})."
+            ) from exc
+        except OSError as exc:
+            # NOT a urllib.error.URLError: a reset/broken-pipe/timeout that happens AFTER the
+            # TCP connect succeeds (`ConnectionResetError`, `BrokenPipeError`, socket-level
+            # `TimeoutError`) raises the raw `OSError` subclass, not `URLError` — urlopen only
+            # wraps failures during the connect itself. Uncaught, this crashed a whole sweep
+            # (2026-08-04): `server.start_server`'s health-check poll hit a `ConnectionReset`
+            # while llama-server was still binding its port, and the exception propagated all
+            # the way out of `run_convergence`, killing the harness process mid-run and
+            # orphaning the GPU-resident server it had just launched. `health()`/`props()`
+            # already treat `LlamaCppError` as "not ready yet, keep polling" — this makes a
+            # startup-window connection hiccup one of those instead of a fatal crash.
+            raise LlamaCppError(
+                f"{method} {path} -> connection to {self.base_url} reset or failed ({exc})."
             ) from exc
 
     # --- probes ---------------------------------------------------------------------------
@@ -137,15 +157,24 @@ class LlamaCppClient:
         # the only switch that works uniformly across templates. This per-request kwarg is the
         # belt to that suspenders: Qwen3-family templates read `enable_thinking`, gpt-oss reads
         # `reasoning_effort`. Anything the model still emits is stripped by the scorers.
+        #
+        # `think is True` is the mirror case, used only by the server the thinking experiment
+        # launches with reasoning enabled (see server.build_argv's `thinking_budget`) — this is
+        # the request-level ask that goes with that server-level allowance, not an override of
+        # a `--reasoning off` launch (which per llama.cpp's own budget=0 behavior a per-request
+        # kwarg cannot undo).
         kwargs = dict(chat_template_kwargs or {})
         if think is False:
             kwargs.setdefault("enable_thinking", False)
+        elif think is True:
+            kwargs.setdefault("enable_thinking", True)
         if kwargs:
             payload["chat_template_kwargs"] = kwargs
 
         start = time.perf_counter()
         ttft: float | None = None
         parts: list[str] = []
+        reasoning_parts: list[str] = []
         usage: dict[str, Any] = {}
         timings: dict[str, Any] = {}
         finish_reason: str | None = None
@@ -169,7 +198,11 @@ class LlamaCppClient:
                 if chunk.get("timings"):
                     timings = chunk["timings"]
                 for choice in chunk.get("choices") or []:
-                    piece = (choice.get("delta") or {}).get("content") or ""
+                    delta = choice.get("delta") or {}
+                    reasoning_piece = delta.get("reasoning_content") or ""
+                    if reasoning_piece:
+                        reasoning_parts.append(reasoning_piece)
+                    piece = delta.get("content") or ""
                     if piece:
                         if ttft is None:
                             ttft = time.perf_counter() - start
@@ -187,4 +220,5 @@ class LlamaCppClient:
             predicted_ms=timings.get("predicted_ms"),
             finish_reason=finish_reason,
             raw_final={"usage": usage, "timings": timings},
+            reasoning_text="".join(reasoning_parts).strip(),
         )

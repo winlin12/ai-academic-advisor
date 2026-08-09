@@ -24,7 +24,7 @@
 # hand-invented lock ("CS 38100 in semester 1") can be unreachable, and an
 # unreachable lock makes convergence impossible for reasons that have nothing to
 # do with the model, which is the same class of bug `run.py check`'s reachability
-# pass exists to catch. `run.py converge --preflight` re-verifies this: it plans
+# pass exists to catch. `run.py run --tasks converge --preflight` re-verifies this: it plans
 # each scenario deterministically and confirms every locked slot is legal where
 # it is pinned.
 #
@@ -73,11 +73,7 @@ scenarios:
     - {semester_index: 0, course: "CS 25100"}
     - {semester_index: 3, course: "CS 37300"}
 
-  # One semester, and it is already unsatisfiable for COVERAGE by design. The lock
-  # is deliberately light: the scenario's value is the honesty probe, and pinning
-  # more of a 1-semester horizon would turn it into a transcription exercise.
-  mi-tight-horizon:
-    - {semester_index: 0, course: "CS 37300"}
+  # mi-tight-horizon's locks removed 2026-08-03 with the scenario itself.
 
   mi-no-filler:
     - {semester_index: 0, course: "CS 25100"}

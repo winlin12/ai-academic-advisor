@@ -1,10 +1,13 @@
-"""MODE C's report. Kept out of ``report.py`` because the record schema is different.
+"""MODE C's tables and estimator, folded into ``report.py``'s single ``results/report.md``.
 
-Mode A/B records are pass/fail per plan. A Mode C record is a SURVIVAL OBSERVATION: a case
-either converged at attempt k / second t, or it is right-censored at the point the clock or the
-attempt budget ran out. Pooling those into the same "% viable" table would either throw away
-the censored cases or count them as failures, and both distort the answer in the same
-direction. So this module has its own tables and its own estimator.
+Kept in its own MODULE because the record schema is different — Mode A/B records are pass/fail
+per plan, a Mode C record is a SURVIVAL OBSERVATION: a case either converged at attempt k /
+second t, or it is right-censored at the point the clock or the attempt budget ran out. Pooling
+those into the same "% viable" table would either throw away the censored cases or count them
+as failures, and both distort the answer in the same direction. So this module has its own
+tables and its own estimator. It does NOT get its own report file: `mode_c_section()` returns
+lines for `report.generate_report` to splice in as one more numbered section, at `###` nesting,
+because the user should not have to open two documents to read one evaluation run.
 
 THE ESTIMATOR. `median attempts to converge` over censored data is not `median(observed
 values)`. A case censored at attempt 7 is evidence that the model needed MORE than 7, and
@@ -237,7 +240,7 @@ def _total_time_table(records: list[dict]) -> list[str]:
     rows.sort()
 
     out = [
-        "## Total time to run every case",
+        "### Total time to run every case",
         "",
         "**The apples-to-apples number.** Total wall-clock for the whole suite per model — "
         "every scenario, every attempt, censored cases included. Same card, same scenarios, "
@@ -362,27 +365,141 @@ def _progress_table(records: list[dict]) -> list[str]:
     return lines
 
 
-def generate_report(root: Path, tag: str = "convergence") -> Path:
-    results = root / "results"
+def _school_model_grid(records: list[dict], variant: str) -> list[str]:
+    """school x model grid for one variant: converged/n and median attempts, compact enough to
+    sit next to the pooled table without repeating the whole `_table` output per school."""
+    scoped = [r for r in records if r.get("stage") in _STAGES and r.get("variant") == variant]
+    schools = sorted({r["_school"] for r in scoped})
+    models = sorted({r["model"] for r in scoped})
+    if not schools or not models:
+        return []
+    lines = [
+        "| school | " + " | ".join(f"`{m}` converged / attempts p50" for m in models) + " |",
+        "|---|" + "---|" * len(models),
+    ]
+    for school in schools:
+        cells = []
+        for model in models:
+            cases = [r for r in scoped if r["_school"] == school and r["model"] == model]
+            if not cases:
+                cells.append("—")
+                continue
+            stats = _model_stats(cases)
+            cells.append(f"{stats['converged']}/{stats['n']} ({stats['attempts_p50']})")
+        lines.append(f"| `{school}` | " + " | ".join(cells) + " |")
+    lines.append("")
+    return lines
+
+
+def mode_c_cross_school_lines(
+    school_dirs: list[tuple[str, Path]], tag: str = "convergence"
+) -> list[str]:
+    """Mode C's section of `results/summary.md` — the cross-school counterpart to `mode_c_lines`.
+
+    Pools `runs_convergence.jsonl` from every `results/results_<slug>/` the multi-school loop
+    wrote (same discovery `report._discover_school_dirs` uses for Mode A/B), tags each record
+    with `_school`, and reports both an OVERALL table (every school pooled, same shape as
+    `mode_c_lines`'s per-variant table) and a PER-SCHOOL grid — because a school with no
+    `<fixture-stem>.locked_slots.yaml` sibling silently has no Mode C data at all (see
+    `harness.convergence.locked_slots_path_for`), and that has to be visible here rather than
+    just making the pooled numbers quietly rest on fewer schools than Mode A/B's tables above
+    them.
+
+    THE FIXTURE-HASH GUARD IN `mode_c_lines` DOES NOT APPLY HERE UNCHANGED: multiple schools
+    are SUPPOSED to have different fixture hashes (`cs` and `me` are different programs by
+    design), so warning about that would just be noise on every multi-school run. What still
+    needs the warning is a SINGLE school's own file containing more than one hash — that is
+    the actual config-drift bug the guard exists to catch — so it is re-checked per school
+    instead of across the whole pool.
+    """
+    pooled: list[dict[str, Any]] = []
+    mixed_hash_schools: dict[str, set[str]] = {}
+    for slug, d in school_dirs:
+        recs = _load(d / f"runs_{tag}.jsonl")
+        if not recs:
+            continue
+        hashes = {r.get("fixture_hash") for r in recs if r.get("fixture_hash")}
+        if len(hashes) > 1:
+            mixed_hash_schools[slug] = hashes
+        for rec in recs:
+            rec = dict(rec)
+            rec["_school"] = slug
+            pooled.append(rec)
+
+    out: list[str] = [
+        "How many attempts, and how long, until a model lands a plan with no errors in it — "
+        "pooled across every school that ran Mode C.",
+        "",
+    ]
+
+    schools_with_data = sorted({r["_school"] for r in pooled})
+    all_schools = sorted(slug for slug, _ in school_dirs)
+    missing = sorted(set(all_schools) - set(schools_with_data))
+
+    if not pooled:
+        out += [
+            "_No Mode C records found for any school. Mode C only runs for a school with a "
+            "`<fixture-stem>.locked_slots.yaml` sibling next to its plan fixture — see "
+            "`plan_fixtures/*.locked_slots.yaml` — and only after `python run.py run --tasks "
+            "converge` (or a full `run.py run`, which includes it automatically for schools "
+            "that have one)._",
+            "",
+        ]
+        return out
+
+    out += [
+        f"{len(schools_with_data)}/{len(all_schools)} school(s) with Mode C data: "
+        + ", ".join(f"`{s}`" for s in schools_with_data),
+        "",
+    ]
+    if missing:
+        out += [
+            "_No Mode C data yet for: " + ", ".join(f"`{s}`" for s in missing) + " — either no "
+            "`.locked_slots.yaml` sibling for that fixture, or `--tasks converge` hasn't been "
+            "run for it._",
+            "",
+        ]
+    for slug, hashes in sorted(mixed_hash_schools.items()):
+        out += [
+            f"> ⚠️ **`{slug}` has {len(hashes)} different fixture hashes within its own "
+            f"`runs_{tag}.jsonl`** ({', '.join(sorted(h[:8] for h in hashes))}). That school's "
+            f"own Mode C records describe different experiments and should not be pooled even "
+            f"with each other, let alone with the rest of this table.",
+            "",
+        ]
+
+    variants_present = sorted({r["variant"] for r in pooled if r.get("variant")})
+    for variant in variants_present:
+        rows = _variant_rows(pooled, variant)
+        out += [f"### Variant: {variant} — overall (every school pooled)", ""]
+        out += _table(rows)
+        out += [f"### Variant: {variant} — per school", ""]
+        out += _school_model_grid(pooled, variant)
+
+    out += _total_time_table(pooled)
+    return out
+
+
+def mode_c_lines(results: Path, tag: str = "convergence") -> list[str]:
+    """Mode C's section of `report.md`, at `###` nesting under whatever `##` heading the caller
+    gives it. Returns lines only — no file I/O, no numbering, no top-level heading; that is
+    `report.generate_report`'s job, the same as every other section in that file."""
     records = _load(results / f"runs_{tag}.jsonl")
     meta_path = results / f"meta_{tag}.json"
     meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
 
     out: list[str] = [
-        "# Mode C — retry to convergence",
-        "",
         "How many attempts, and how long, until a model lands a plan with no errors in it.",
         "",
     ]
 
     if not records:
-        out += ["_No Mode C records found. Run `python run.py converge`._", ""]
-        (results / "convergence_report.md").write_text("\n".join(out))
-        return results / "convergence_report.md"
+        out += ["_No Mode C records found. Run `python run.py run --tasks converge`._", ""]
+        return out
 
     conv = meta.get("convergence", {})
     out += [
-        "## Run settings",
+        "### Run settings",
         "",
         f"- timeout: **{conv.get('timeout_s')} s per case**, "
         f"max attempts: **{conv.get('max_attempts')}**",
@@ -429,14 +546,14 @@ def generate_report(root: Path, tag: str = "convergence") -> Path:
                   "**Raw variance.**"),
     ):
         rows = _variant_rows(records, variant)
-        out += [f"## Variant: {variant}", "", blurb, ""]
+        out += [f"### Variant: {variant}", "", blurb, ""]
         out += _table(rows)
         if variant == "repair" and rows:
             out += _ratchet_guard(rows)
 
     out += _total_time_table(records)
     out += [
-        "## Throughput is not quality",
+        "### Throughput is not quality",
         "",
         "`tok/s` above is generation throughput on **this box only** (see the env rows in the "
         "baseline run). A model needing 3 attempts at 23 tok/s can beat a model needing 1 "
@@ -444,13 +561,14 @@ def generate_report(root: Path, tag: str = "convergence") -> Path:
         "reasoning column; `wall p50` is the reasoning column multiplied by this card. Rank on "
         "attempts; quote wall-clock only about this hardware.",
         "",
-        "## Progress traces",
+        "### Progress traces",
         "",
         "Violations per attempt, in order. A descending trace is self-correction; a flat or "
         "bouncing one is resampling.",
         "",
     ]
     out += _progress_table(records)
+    return out
 
     path = results / "convergence_report.md"
     path.write_text("\n".join(out))

@@ -38,9 +38,6 @@
 #                                        penalised for a constraint that does not
 #                                        exist. Treat term-violation counts as the
 #                                        softest metric in the report.
-#   workload_score .................... invented (1-5). Used only for tie-breaking
-#                                        inside the deterministic planner, never
-#                                        for scoring.
 #
 # HOW TO VERIFY (do this before the write-up, not before the run — the run is
 # still useful for ranking while unverified):
@@ -57,34 +54,43 @@
 
 program:
   name: "Computer Science, BS — Machine Intelligence concentration"
+  slug: "cs"
+  # Real, crawled Postgres program this fixture's scenarios were written against —
+  # Mode B/C read this program's live catalog via `harness/real_db.py`, same source
+  # `mechanical_engineering.yaml`'s own header describes. Selected by `run.py`'s
+  # `--major`/multi-school loop, not a live DB text search — see `run.py resolve_major`.
+  real_db_program_id: "4aecc496-3cfd-4090-b822-334e09007668"
+  # SCOPE, added 2026-08-09 — Mode B/C now measure ONLY this program's own major-scope
+  # requirement groups (real_db._scope_for == "program"); college/university-scoped groups
+  # (gen-ed, First-Year Engineering, ...) are dropped from what the model is shown and
+  # scored against, tested standalone instead by their own pseudo-major fixture — see
+  # engineering_core.yaml / agriculture_core.yaml / gen_ed_world_language.yaml and
+  # real_db.fetch_real_db_base's `scope_filter` docstring. "" (absent) = unfiltered, the
+  # old/default behaviour every fixture had before this field existed.
+  requirement_scope: "major"
   catalog_year: "2026-2027"
   campus: "West Lafayette"
   total_credits_min: 120
   verified: false
 
-  # MAJOR-COURSE LOAD CAP — added 2026-07-29, and unlike everything else in this file it is a
-  # STUDENT-EXPERIENCE rule, not a registration rule. Nothing at Purdue stops you enrolling in
-  # five CS courses at once; the reason it belongs in the scoring authority is that the models
-  # kept doing it (4- and 5-CS semesters all over the transcripts) and so did this repo's own
-  # deterministic planner, and a plan nobody would follow is not a plan.
+  # MAJOR-COURSE LOAD CAP — added 2026-07-29, and unlike a prerequisite it is a
+  # STUDENT-EXPERIENCE rule, not a registration rule: nothing at Purdue stops you enrolling in
+  # five CS courses at once. It stayed in the scoring authority as a SOFT signal because the
+  # models kept doing it (4- and 5-CS semesters all over the transcripts) and so did this
+  # repo's own deterministic planner, and a plan nobody would follow is worth noticing even
+  # though it is not illegal.
   #
-  #   max_       = 3   the ceiling. Reported by a 4+1 BS/MS student fitting BS and MS courses
-  #                    into the same terms, i.e. from about the heaviest real load there is —
-  #                    which is what makes 4 a plan defect rather than an ambitious semester.
-  #                    HARD: a fourth CS course in one term is `major_overload_violation` and
-  #                    the plan is not viable.
+  #   max_       = 3   Reported by a 4+1 BS/MS student fitting BS and MS courses into the same
+  #                    terms, i.e. about the heaviest real load there is. SOFT as of
+  #                    2026-08-07 — a fourth CS course in one term no longer makes the plan
+  #                    NOT VIABLE (`major_overload_violation` was removed the same way and for
+  #                    the same reason as the credit-cap violation: it is a term the student
+  #                    can adjust by asking, not a wall they hit). It still counts toward
+  #                    `soft_major_overloads`.
   #
-  #   preferred_ = 3   EQUAL TO THE HARD CAP, i.e. the soft preference is OFF as of 2026-07-31.
-  #                    It was 2 — the load students describe as sustainable — and it stayed a
-  #                    genuine finding, but as a PROMPT it was a second limit on the same
-  #                    quantity that the model was also told to break when nothing else fit.
-  #                    That is a judgement call small models make badly, and it was competing
-  #                    for attention with the credit target and the prerequisite chain, both of
-  #                    which were going wrong more often and cost more when they did. The
-  #                    machinery is untouched: `soft_major_overloads` still scores, the
-  #                    planner's two-pass selection still runs (both passes just use the same
-  #                    limit now), and `major_load_line` prints one number instead of two.
-  #                    Put it back to 2 to re-enable, and expect the static prompt hash to move.
+  #   preferred_ = 3   EQUAL TO `max_`, i.e. the soft preference is OFF as of 2026-07-31 — see
+  #                    git history if re-enabling a stricter preferred value than the (now also
+  #                    soft) ceiling above.
   #
   # Scenario profiles inherit these and may override either one (a student who asks for a
   # lighter major load gets it via their own `profile:` block).
@@ -108,7 +114,36 @@ program:
   # horizon (was 1-3 terms short), credit spread fell from 7-13 to 2-4, coverage and viability
   # unchanged, 0 courses unplanned. Set this to the same value as the cap to get the old
   # front-loading back; set it per scenario to model a student who wants a specific load.
-  target_credits_per_semester: null
+  #
+  # SET TO 15, 2026-08-06 — a typical full-time load, on request. This trades back some of the
+  # even-spread benefit above: a scenario whose remaining credits divided by semesters is well
+  # under 15 will now aim higher early and can run out of degree requirements to place in the
+  # last term(s) — the exact front-loading shape the `null` default was added to fix. Revert to
+  # `null` if that reappears in the transcripts.
+  target_credits_per_semester: 15
+
+  # THE REGISTRAR'S CEILING — added 2026-08-02, the third and last number in this family, and
+  # the only one that is a rule about the UNIVERSITY rather than about a student. 18 credits is
+  # a normal full-time overload at Purdue; past it you need a dean's signature. That is what
+  # makes 19 categorically different from 17, and 17 not different at all.
+  #
+  # What this fixed: `max_credits_per_semester` (per scenario, 15 or 16 — the number the student
+  # ASKS FOR in their own words) was also the viability threshold, so a 17-credit term scored as
+  # `credit_cap_violation` and took PLAN_VIABLE to false — the same verdict the scorer gives a
+  # course scheduled before its own prerequisite. One of those is a registration wall; the other
+  # is a term the student would have to be talked into. Observed on qwen3.6-27b/mi-fresh-start:
+  # 100% requirement coverage, a legal 8-semester shape, failed on 17 credits in term 1.
+  #
+  # It was also double billing. The student's number is ALREADY scored by name, as the
+  # `max_credits_at_most` assertion under "did it do what the student asked" — where a plan that
+  # ignores a stated preference belongs. It now shows up there and only there, plus a
+  # `soft_credit_overages` count, and viability is reserved for what a registrar would refuse.
+  #
+  # This is deliberately NOT in any prompt. Models are told the student's number and a target to
+  # AIM for (ceil(credits outstanding / semesters available)); telling them 18 exists would just
+  # hand them a bigger number to fill to, which is the front-loading failure this file spent
+  # 2026-07-29 removing. It is a scoring-side constant.
+  hard_credit_cap: 18
 
 # `requirement_tags` are the vocabulary the revise-plan agent's `avoid_tags`
 # knob operates over (see backend/app/services/advisor_agent.py), so they are
@@ -122,49 +157,42 @@ courses:
     prereqs: []
     offered_terms: [fall, spring, summer]   # observed in 9 PurdueIO terms
     requirement_tags: [required, cs-core, programming]
-    workload_score: 4
   - code: "CS 18200"
     title: "Foundations Of Computer Science"
     credits: 3
     prereqs: ["CS 18000", "MA 16100"]
     offered_terms: [fall, spring, summer]   # observed in 9 PurdueIO terms
     requirement_tags: [required, cs-core, theory-heavy]
-    workload_score: 4
   - code: "CS 24000"
     title: "Programming In C"
     credits: 3
     prereqs: ["CS 18000"]
     offered_terms: [fall, spring, summer]   # observed in 9 PurdueIO terms
     requirement_tags: [required, cs-core, programming]
-    workload_score: 3
   - code: "CS 25000"
     title: "Computer Architecture"
     credits: 4
     prereqs: ["CS 18200", "CS 24000"]
     offered_terms: [fall, spring, summer]   # observed in 9 PurdueIO terms
     requirement_tags: [required, cs-core, systems]
-    workload_score: 4
   - code: "CS 25100"
     title: "Data Structures And Algorithms"
     credits: 3
     prereqs: ["CS 18200", "CS 24000"]
     offered_terms: [fall, spring, summer]   # observed in 9 PurdueIO terms
     requirement_tags: [required, cs-core, theory-heavy]
-    workload_score: 4
   - code: "CS 25200"
     title: "Systems Programming"
     credits: 4
     prereqs: ["CS 25000", "CS 25100"]
     offered_terms: [fall, spring, summer]   # observed in 9 PurdueIO terms
     requirement_tags: [required, cs-core, systems, project-heavy]
-    workload_score: 5
   - code: "CS 38100"
     title: "Introduction To The Analysis Of Algorithms"
     credits: 3
     prereqs: ["CS 25100", "MA 26100"]
     offered_terms: [fall, spring]   # observed in 6 PurdueIO terms
     requirement_tags: [required, cs-core, theory-heavy]
-    workload_score: 5
 
   # ---- Machine Intelligence: required ----
   - code: "CS 37300"
@@ -179,21 +207,18 @@ courses:
     coreqs: ["STAT 35000"]
     offered_terms: [fall, spring]   # observed in 6 PurdueIO terms
     requirement_tags: [required, machine-intelligence, ai, project-heavy]
-    workload_score: 4
   - code: "CS 47100"
     title: "Introduction To Artificial Intelligence"
     credits: 3
     prereqs: ["CS 25100"]
     offered_terms: [fall, spring]   # observed in 6 PurdueIO terms
     requirement_tags: [machine-intelligence, ai]
-    workload_score: 4
   - code: "CS 47300"
     title: "Web Information Search And Management"
     credits: 3
     prereqs: ["CS 25100"]
     offered_terms: [fall]   # observed in 3 PurdueIO terms
     requirement_tags: [machine-intelligence, ai]
-    workload_score: 4
 
   # ---- Machine Intelligence: selectives ----
   - code: "CS 43900"
@@ -202,35 +227,30 @@ courses:
     prereqs: ["CS 25100"]
     offered_terms: [fall]   # observed in 3 PurdueIO terms
     requirement_tags: [machine-intelligence, ai, project-heavy]
-    workload_score: 3
   - code: "CS 44800"
     title: "Introduction To Relational Database Systems"
     credits: 3
     prereqs: ["CS 25100"]
     offered_terms: [fall, spring]   # observed in 6 PurdueIO terms
     requirement_tags: [machine-intelligence, systems, project-heavy]
-    workload_score: 4
   - code: "CS 45600"
     title: "Programming Languages"
     credits: 3
     prereqs: ["CS 25200"]
     offered_terms: [fall, spring]   # observed in 4 PurdueIO terms
     requirement_tags: [machine-intelligence, theory-heavy]
-    workload_score: 4
   - code: "CS 45800"
     title: "Introduction To Robotics"
     credits: 3
     prereqs: ["CS 25100", "MA 26500"]
     offered_terms: [fall, spring]   # observed in 4 PurdueIO terms
     requirement_tags: [machine-intelligence, ai, project-heavy]
-    workload_score: 4
   - code: "CS 48300"
     title: "Introduction To The Theory Of Computation"
     credits: 3
     prereqs: ["CS 38100"]
     offered_terms: [fall, spring]   # observed in 3 PurdueIO terms
     requirement_tags: [machine-intelligence, theory-heavy]
-    workload_score: 5
 
   # ---- MI selectives added 2026-07-31: WIDENING A STARVED CHOICE ---------------
   # THIS CHANGED `fixture_hash`. Every run recorded before 2026-07-31 is no longer
@@ -268,21 +288,18 @@ courses:
     prereqs: ["CS 25100"]
     offered_terms: [fall, spring]           # NOT observed — hand-written, re-run refresh-offerings
     requirement_tags: [machine-intelligence, systems, project-heavy]
-    workload_score: 4
   - code: "CS 47500"
     title: "Human-Computer Interaction"
     credits: 3
     prereqs: ["CS 25100"]
     offered_terms: [fall, spring]           # NOT observed — hand-written, re-run refresh-offerings
     requirement_tags: [machine-intelligence, project-heavy]
-    workload_score: 3
   - code: "STAT 41600"
     title: "Probability"
     credits: 3
     prereqs: ["MA 26100"]
     offered_terms: [fall, spring]           # NOT observed — hand-written, re-run refresh-offerings
     requirement_tags: [machine-intelligence, mathematics, statistics, theory-heavy]
-    workload_score: 4
 
   # ---- additional 400-level CS electives ----
   - code: "CS 35200"
@@ -291,42 +308,36 @@ courses:
     prereqs: ["CS 25200"]
     offered_terms: [fall, spring]   # observed in 6 PurdueIO terms
     requirement_tags: [cs-elective, systems, project-heavy]
-    workload_score: 5
   - code: "CS 35400"
     title: "Operating Systems"
     credits: 3
     prereqs: ["CS 25200"]
     offered_terms: [fall, spring]   # observed in 6 PurdueIO terms
     requirement_tags: [cs-elective, systems, project-heavy]
-    workload_score: 5
   - code: "CS 42200"
     title: "Computer Networks"
     credits: 3
     prereqs: ["CS 25200"]
     offered_terms: [fall, spring]   # observed in 6 PurdueIO terms
     requirement_tags: [cs-elective, systems]
-    workload_score: 4
   - code: "CS 42600"
     title: "Computer Security"
     credits: 3
     prereqs: ["CS 25200"]
     offered_terms: [fall, spring]   # observed in 6 PurdueIO terms
     requirement_tags: [cs-elective, systems]
-    workload_score: 4
   - code: "CS 44000"
     title: "Large Scale Data Analytics"
     credits: 3
     prereqs: ["CS 37300"]
     offered_terms: [fall, spring]   # observed in 6 PurdueIO terms
     requirement_tags: [cs-elective, ai, project-heavy]
-    workload_score: 4
   - code: "CS 49000"
     title: "Topics In Computer Science For Undergraduates"
     credits: 3
     prereqs: ["CS 25200"]
     offered_terms: [fall, spring, summer]   # observed in 8 PurdueIO terms
     requirement_tags: [cs-elective]
-    workload_score: 3
 
   # Added 2026-07-31 with the MI selectives above — see that block for the reasoning
   # and the append-don't-insert rule. These four exist specifically to break the
@@ -342,28 +353,24 @@ courses:
     prereqs: ["CS 18000", "MA 26500"]
     offered_terms: [fall, spring]           # NOT observed — hand-written, re-run refresh-offerings
     requirement_tags: [cs-elective, theory-heavy]
-    workload_score: 4
   - code: "CS 33400"
     title: "Fundamentals Of Computer Graphics"
     credits: 3
     prereqs: ["CS 25100", "MA 26500"]
     offered_terms: [fall, spring]           # NOT observed — hand-written, re-run refresh-offerings
     requirement_tags: [cs-elective, project-heavy]
-    workload_score: 4
   - code: "CS 30700"
     title: "Software Engineering I"
     credits: 3
     prereqs: ["CS 25200"]
     offered_terms: [fall, spring]           # NOT observed — hand-written, re-run refresh-offerings
     requirement_tags: [cs-elective, project-heavy]
-    workload_score: 4
   - code: "CS 40800"
     title: "Software Testing"
     credits: 3
     prereqs: ["CS 30700"]
     offered_terms: [fall, spring]           # NOT observed — hand-written, re-run refresh-offerings
     requirement_tags: [cs-elective, project-heavy]
-    workload_score: 4
 
   # ---- course-for-course equivalents ----------------------------------------
   # ADDED 2026-07-27. Purdue's published sample plan offers each of these as an
@@ -389,7 +396,6 @@ courses:
     offered_terms: [fall, spring, summer]   # NOT observed — hand-written, re-run refresh-offerings
     equivalent_to: "MA 16100"
     requirement_tags: [required, mathematics]
-    workload_score: 4
   - code: "MA 16600"
     title: "Analytic Geometry And Calculus II"
     credits: 4
@@ -397,7 +403,6 @@ courses:
     offered_terms: [fall, spring, summer]   # NOT observed — hand-written, re-run refresh-offerings
     equivalent_to: "MA 16200"
     requirement_tags: [required, mathematics]
-    workload_score: 4
   - code: "MA 27101"
     title: "Honors Multivariate Calculus"
     credits: 5
@@ -405,7 +410,6 @@ courses:
     offered_terms: [fall]                   # NOT observed — hand-written, re-run refresh-offerings
     equivalent_to: "MA 26100"
     requirement_tags: [required, mathematics]
-    workload_score: 5
   - code: "MA 35100"
     title: "Elementary Linear Algebra"
     credits: 3
@@ -413,7 +417,6 @@ courses:
     offered_terms: [fall, spring]           # NOT observed — hand-written, re-run refresh-offerings
     equivalent_to: "MA 26500"
     requirement_tags: [required, mathematics]
-    workload_score: 3
   - code: "STAT 51100"
     title: "Statistical Methods"
     credits: 3
@@ -421,7 +424,6 @@ courses:
     offered_terms: [fall, spring]           # NOT observed — hand-written, re-run refresh-offerings
     equivalent_to: "STAT 35000"
     requirement_tags: [required, mathematics, statistics]
-    workload_score: 3
 
   # ---- courses the sample plan suggests for its elective slots ---------------
   # ADDED 2026-07-27, same reason: the published plan names them ("Elective —
@@ -459,28 +461,24 @@ courses:
     prereqs: []
     offered_terms: [fall, spring]           # NOT observed — hand-written, re-run refresh-offerings
     requirement_tags: [cs-elective, suggested-elective, programming]
-    workload_score: 1
   - code: "CS 29100"
     title: "Sophomore Seminar"
     credits: 1
     prereqs: []
     offered_terms: [fall, spring]           # NOT observed — hand-written, re-run refresh-offerings
     requirement_tags: [cs-elective, suggested-elective]
-    workload_score: 1
   - code: "CS 39100"
     title: "Junior Resources Seminar"
     credits: 1
     prereqs: []
     offered_terms: [fall, spring]           # NOT observed — hand-written, re-run refresh-offerings
     requirement_tags: [cs-elective, suggested-elective]
-    workload_score: 1
   - code: "COM 21700"
     title: "Science Writing And Presentation"
     credits: 3
     prereqs: []
     offered_terms: [fall, spring, summer]   # NOT observed — hand-written, re-run refresh-offerings
     requirement_tags: [gen-ed, suggested-elective, writing]
-    workload_score: 2
 
   # ---- mathematics ----
   - code: "MA 16100"
@@ -489,51 +487,52 @@ courses:
     prereqs: []
     offered_terms: [fall, spring, summer]   # observed in 9 PurdueIO terms
     requirement_tags: [required, mathematics]
-    workload_score: 4
   - code: "MA 16200"
     title: "Plane Analytic Geometry And Calculus II"
     credits: 5
     prereqs: ["MA 16100"]
     offered_terms: [fall, spring, summer]   # observed in 9 PurdueIO terms
     requirement_tags: [required, mathematics]
-    workload_score: 4
   - code: "MA 26100"
     title: "Multivariate Calculus"
     credits: 4
     prereqs: ["MA 16200"]
     offered_terms: [fall, spring, summer]   # observed in 9 PurdueIO terms
     requirement_tags: [required, mathematics]
-    workload_score: 4
   - code: "MA 26500"
     title: "Linear Algebra"
     credits: 3
     prereqs: ["MA 16200"]
     offered_terms: [fall, spring, summer]   # observed in 9 PurdueIO terms
     requirement_tags: [required, mathematics]
-    workload_score: 3
   - code: "STAT 35000"
     title: "Introduction To Statistics"
     credits: 3
     prereqs: ["MA 16200"]
     offered_terms: [fall, spring, summer]   # observed in 10 PurdueIO terms
     requirement_tags: [required, mathematics, statistics]
-    workload_score: 3
 
   # ---- laboratory science sequence ----
   - code: "PHYS 17200"
     title: "Modern Mechanics"
     credits: 4
-    prereqs: ["MA 16100"]
+    # COREQUISITE, not a prerequisite — corrected 2026-08-02. Purdue lets you take PHYS 17200
+    # alongside MA 16100; the catalog line is "Prerequisite or concurrent: MA 16100". Recording
+    # it as a hard prereq made the single most natural first semester an incoming CS major can
+    # have — CS 18000 + MA 16100 + PHYS 17200 + ENGL 10600 — score as a prereq_violation, i.e.
+    # the same class of error as scheduling CS 38100 before CS 25100. It also pushed the whole
+    # science sequence back a term for every model that got it "right", since PHYS 24100 sits
+    # behind it. Same correction, same reason, as the CS 37300 / STAT 35000 coreq.
+    prereqs: []
+    coreqs: ["MA 16100"]
     offered_terms: [fall, spring, summer]   # observed in 9 PurdueIO terms
     requirement_tags: [required, science]
-    workload_score: 4
   - code: "PHYS 24100"
     title: "Electricity And Optics"
     credits: 3
     prereqs: ["PHYS 17200", "MA 16200"]
     offered_terms: [fall, spring, summer]   # observed in 9 PurdueIO terms
     requirement_tags: [required, science]
-    workload_score: 4
 
   # ---- general education ----
   - code: "ENGL 10600"
@@ -542,42 +541,36 @@ courses:
     prereqs: []
     offered_terms: [fall, spring, summer]   # observed in 9 PurdueIO terms
     requirement_tags: [required, gen-ed, writing]
-    workload_score: 2
   - code: "COM 11400"
     title: "Fundamentals Of Speech Communication"
     credits: 3
     prereqs: []
     offered_terms: [fall, spring, summer]   # observed in 9 PurdueIO terms
     requirement_tags: [required, gen-ed, oral-communication]
-    workload_score: 2
   - code: "SCLA 10100"
     title: "Transformative Texts: Critical Thinking And Communication I"
     credits: 3
     prereqs: []
     offered_terms: [fall, spring, summer]   # observed in 9 PurdueIO terms
     requirement_tags: [required, gen-ed, humanities]
-    workload_score: 2
   - code: "PHIL 15000"
     title: "Principles Of Logic"
     credits: 3
     prereqs: []
     offered_terms: [fall, spring, summer]   # observed in 8 PurdueIO terms
     requirement_tags: [gen-ed, humanities]
-    workload_score: 2
   - code: "ECON 25100"
     title: "Microeconomics"
     credits: 3
     prereqs: []
     offered_terms: [fall, spring, summer]   # observed in 9 PurdueIO terms
     requirement_tags: [gen-ed, social-science]
-    workload_score: 2
   - code: "PSY 12000"
     title: "Elementary Psychology"
     credits: 3
     prereqs: []
     offered_terms: [fall, spring, summer]   # observed in 12 PurdueIO terms
     requirement_tags: [gen-ed, social-science]
-    workload_score: 2
 
   # Added 2026-07-31. `gen-ed-selective` asked for 6 credits from THREE options — two
   # of the three were effectively mandatory, which is a required block wearing a
@@ -592,42 +585,36 @@ courses:
     prereqs: []
     offered_terms: [fall, spring, summer]   # NOT observed — hand-written, re-run refresh-offerings
     requirement_tags: [gen-ed, humanities]
-    workload_score: 2
   - code: "PHIL 11000"
     title: "Introduction To Philosophy"
     credits: 3
     prereqs: []
     offered_terms: [fall, spring, summer]   # NOT observed — hand-written, re-run refresh-offerings
     requirement_tags: [gen-ed, humanities]
-    workload_score: 2
   - code: "POL 10100"
     title: "American Government And Politics"
     credits: 3
     prereqs: []
     offered_terms: [fall, spring, summer]   # NOT observed — hand-written, re-run refresh-offerings
     requirement_tags: [gen-ed, social-science]
-    workload_score: 2
   - code: "SOC 10000"
     title: "Introductory Sociology"
     credits: 3
     prereqs: []
     offered_terms: [fall, spring, summer]   # NOT observed — hand-written, re-run refresh-offerings
     requirement_tags: [gen-ed, social-science]
-    workload_score: 2
   - code: "ANTH 10000"
     title: "Being Human: Introduction To Anthropology"
     credits: 3
     prereqs: []
     offered_terms: [fall, spring, summer]   # NOT observed — hand-written, re-run refresh-offerings
     requirement_tags: [gen-ed, social-science]
-    workload_score: 2
   - code: "ECON 25200"
     title: "Macroeconomics"
     credits: 3
     prereqs: []
     offered_terms: [fall, spring, summer]   # NOT observed — hand-written, re-run refresh-offerings
     requirement_tags: [gen-ed, social-science]
-    workload_score: 2
 
 # --- degree requirements -----------------------------------------------------
 # `kind: all`    -> every listed course must appear in the plan (or be completed)
@@ -739,7 +726,7 @@ scenarios:
     feedback: >-
       I'm starting from scratch and I want to concentrate in machine intelligence.
       Please get me into the AI and machine learning courses as early as the
-      prerequisites allow, and keep every semester at 16 credits or under.
+      prerequisites allow.
     assertions:
       - kind: scheduled_before
         course: "CS 37300"
@@ -747,13 +734,18 @@ scenarios:
         why: "MI's anchor course; a plan that defers it to the last year is a bad MI plan."
       - kind: max_credits_at_most
         value: 16
+    # Starting from scratch — matches this scenario's own feedback text.
+    world_language:
+      subject: FR
+      level: 1
 
   - id: mi-sophomore-catchup
     label: "Second-year student switching into the MI track"
     profile:
       name: "Jordan"
       degree_program: "Computer Science, BS — Machine Intelligence"
-      completed_courses: ["CS 18000", "CS 18200", "CS 24000", "MA 16100", "MA 16200", "ENGL 10600"]
+      completed_courses: ["CS 18000", "CS 18200", "CS 24000", "MA 16100", "MA 16200", "ENGL 10600",
+                          "COM 11400", "PSY 12000"]
       start_term: fall
       start_year: 2026
       semesters_to_plan: 6
@@ -770,13 +762,16 @@ scenarios:
         why: "CS 25100 gates every MI course; late placement cascades into an unfinishable plan."
       - kind: max_credits_at_most
         value: 15
+    world_language:
+      subject: GER
+      level: 2
 
   - id: mi-light-load
     label: "MI student who needs a reduced credit load"
     profile:
       name: "Sam"
       degree_program: "Computer Science, BS — Machine Intelligence"
-      completed_courses: ["CS 18000", "MA 16100", "ENGL 10600", "COM 11400"]
+      completed_courses: ["CS 18000", "MA 16100", "ENGL 10600", "COM 11400", "SOC 10000"]
       start_term: fall
       start_year: 2026
       semesters_to_plan: 8
@@ -790,6 +785,10 @@ scenarios:
         why: "The student named an explicit cap; honouring it is the whole ask."
       - kind: proposal_sets_credit_cap
         value: 12
+    # Two semesters of Spanish already behind them — see harness/real_db._language_window.
+    world_language:
+      subject: SPAN
+      level: 3
 
   - id: mi-ai-early
     label: "MI student who wants AI coursework front-loaded"
@@ -797,7 +796,8 @@ scenarios:
       name: "Riley"
       degree_program: "Computer Science, BS — Machine Intelligence"
       completed_courses: ["CS 18000", "CS 18200", "CS 24000", "CS 25000", "CS 25100",
-                          "MA 16100", "MA 16200", "MA 26100", "STAT 35000", "ENGL 10600"]
+                          "MA 16100", "MA 16200", "MA 26100", "STAT 35000", "ENGL 10600",
+                          "COM 11400", "PHIL 11000", "HIST 10300"]
       start_term: fall
       start_year: 2026
       semesters_to_plan: 4
@@ -813,13 +813,18 @@ scenarios:
       - kind: any_scheduled_before
         courses: ["CS 47100", "CS 47300"]
         semester_index: 2
+    # Free-text theme -> harness/real_db._GEN_ED_THEMES keyword match.
+    gen_ed_preference: "more leadership and project-based options"
+    world_language:
+      subject: CHNS
+      level: 2
 
   - id: mi-summer-accelerate
     label: "MI student compressing the degree using summers"
     profile:
       name: "Casey"
       degree_program: "Computer Science, BS — Machine Intelligence"
-      completed_courses: ["CS 18000", "MA 16100", "ENGL 10600"]
+      completed_courses: ["CS 18000", "MA 16100", "ENGL 10600", "COM 11400"]
       start_term: summer
       start_year: 2026
       semesters_to_plan: 9
@@ -833,13 +838,17 @@ scenarios:
     assertions:
       - kind: max_credits_at_most
         value: 16
+    world_language:
+      subject: ITAL
+      level: 1
 
   - id: mi-spring-start
     label: "Spring-start transfer student"
     profile:
       name: "Devin"
       degree_program: "Computer Science, BS — Machine Intelligence"
-      completed_courses: ["MA 16100", "MA 16200", "ENGL 10600", "COM 11400", "PSY 12000"]
+      completed_courses: ["MA 16100", "MA 16200", "ENGL 10600", "COM 11400", "PSY 12000",
+                          "PHIL 11000", "HIST 10300", "SOC 10000", "POL 10100"]
       start_term: spring
       start_year: 2027
       semesters_to_plan: 8
@@ -857,6 +866,9 @@ scenarios:
         semester_index: 2
       - kind: max_credits_at_most
         value: 16
+    world_language:
+      subject: JPNS
+      level: 3
 
   - id: mi-theory-averse
     label: "MI student who wants theory pushed back"
@@ -864,7 +876,7 @@ scenarios:
       name: "Emerson"
       degree_program: "Computer Science, BS — Machine Intelligence"
       completed_courses: ["CS 18000", "CS 18200", "CS 24000", "MA 16100", "MA 16200",
-                          "ENGL 10600", "COM 11400"]
+                          "ENGL 10600", "COM 11400", "PSY 12000"]
       start_term: fall
       start_year: 2026
       semesters_to_plan: 6
@@ -883,48 +895,31 @@ scenarios:
       - kind: any_scheduled_before
         courses: ["CS 47100", "CS 47300"]
         semester_index: 4
+    world_language:
+      subject: ARAB
+      level: 1
 
-  - id: mi-tight-horizon
-    label: "One semester left, more requirements than fit"
-    # Declares to `run.py check` that a viable plan is IMPOSSIBLE here by design, so the
-    # reachability check doesn't flag it as a broken scenario. The report reads the same
-    # flag and scores this row on violations and honest reporting, not on PLAN_VIABLE.
-    expect_unsatisfiable: true
-    profile:
-      name: "Frankie"
-      degree_program: "Computer Science, BS — Machine Intelligence"
-      completed_courses: ["CS 18000", "CS 18200", "CS 24000", "CS 25000", "CS 25100",
-                          "CS 25200", "MA 16100", "MA 16200", "MA 26100", "MA 26500",
-                          "STAT 35000", "ENGL 10600", "COM 11400", "SCLA 10100",
-                          "PHYS 17200", "PHYS 24100", "PSY 12000", "ECON 25100"]
-      start_term: fall
-      start_year: 2026
-      semesters_to_plan: 1
-      max_credits_per_semester: 15
-    feedback: >-
-      I have one semester left. Tell me the best I can do and be honest about what
-      won't fit.
-    notes: >-
-      DELIBERATELY UNSATISFIABLE — 21 credits of requirements remain and one
-      15-credit semester cannot hold them. The right behaviour is a legal partial plan plus an honest
-      "unplanned" list, NOT an invented extra semester or a 21-credit term. Expect
-      PLAN_VIABLE = 0% for every model (coverage cannot reach 1.0); the signal here
-      is the violation counts and `over_horizon`, so read this row differently from
-      the others.
-    assertions:
-      - kind: max_credits_at_most
-        value: 15
+  # REMOVED 2026-08-03 — `mi-tight-horizon` (one semester, 21 credits outstanding).
+  # It was the only `expect_unsatisfiable: true` scenario, and it was scored on honest
+  # reporting rather than PLAN_VIABLE. The `expect_unsatisfiable` machinery is deliberately
+  # LEFT IN PLACE (fixtures.py, report.py, run.py check) so re-adding a scenario like it is a
+  # fixture edit and nothing else. Note what leaves with it: no scenario now tests whether a
+  # model says "this does not fit" instead of fabricating room for it. Git history has the
+  # scenario body if it comes back.
+  #
+  # This changed `fixture_hash`. Runs recorded before it are not comparable to runs after.
 
   - id: mi-no-filler
     label: "Student who explicitly refuses the suggested electives"
     profile:
       name: "Kai"
       degree_program: "Computer Science, BS — Machine Intelligence"
-      completed_courses: ["CS 18000", "CS 18200", "CS 24000", "MA 16100", "MA 16200"]
+      completed_courses: ["CS 18000", "CS 18200", "CS 24000", "MA 16100", "MA 16200",
+                          "ENGL 10600", "PHIL 11000"]
       start_term: fall
       start_year: 2026
       semesters_to_plan: 6
-      max_credits_per_semester: 16
+      max_credits_per_semester: 99
     feedback: >-
       Please don't put any of the optional seminar or suggested-elective courses in my
       plan — no CS 19300, CS 29100, CS 39100 or COM 21700. I'm paying per credit hour
@@ -956,3 +951,6 @@ scenarios:
         why: "The student named these four and refused them; scheduling one ignores the ask."
       - kind: max_credits_at_most
         value: 16
+    world_language:
+      subject: KOR
+      level: 2

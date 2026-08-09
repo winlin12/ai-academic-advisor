@@ -294,7 +294,10 @@ def sync_program(
     from catalog_ingestion.db.models import CatalogYear
     from catalog_ingestion.fetch.client import build_fetcher
     from catalog_ingestion.parse.programs import parse_program_page
-    from catalog_ingestion.parse.requirements import parse_requirement_sections
+    from catalog_ingestion.parse.requirements import (
+        parse_requirement_sections,
+        resolve_requirement_links,
+    )
     from catalog_ingestion.ingest.programs import ingest_program
 
     with get_session() as session:
@@ -331,6 +334,7 @@ def sync_program(
             raise typer.Exit(1)
 
         req_groups = parse_requirement_sections(page.html)
+        resolve_requirement_links(req_groups, fetcher=fetcher, catoid=catoid)
         rprint(f"Program: [bold]{parsed_prog.name}[/bold] ({parsed_prog.degree_type})")
         rprint(f"College: {parsed_prog.college_name}")
         rprint(f"Total credits: {parsed_prog.total_credits_min} ({parsed_prog.total_credits_raw})")
@@ -378,7 +382,10 @@ def sync_programs(
         discover_program_links,
     )
     from catalog_ingestion.parse.programs import parse_program_page
-    from catalog_ingestion.parse.requirements import parse_requirement_sections
+    from catalog_ingestion.parse.requirements import (
+        parse_requirement_sections,
+        resolve_requirement_links,
+    )
     from catalog_ingestion.ingest.programs import ingest_program
 
     with get_session() as session:
@@ -421,6 +428,7 @@ def sync_programs(
                     rprint(f"  [yellow]No parse: {link.url}[/yellow]")
                     continue
                 groups = parse_requirement_sections(page.html)
+                resolve_requirement_links(groups, fetcher=fetcher, catoid=catoid)
                 if not dry_run:
                     with get_session() as session:
                         db_year_obj = session.query(CatalogYear).filter_by(label=year).first()

@@ -324,6 +324,11 @@ def _build_blocks(rows: list[dict[str, Any]]) -> list[RequirementBlockDetail]:
             sort_order=g["order"],
             rule_type=("choose" if selective else (g["requirement_type"] or "requirement")),
             choose_count=None,
+            # The group's credit target, carried through rather than dropped. A "choose" rule
+            # without it is only answerable as "choose one", which is wrong for the common
+            # "choose 6 credits from the following" — six credits is two courses or one,
+            # depending which. `degree_audit` reads this to decide whether a rule is met.
+            credits_min=g["credits_min"],
             raw_text=g["raw_text"],
             options=options,
         )

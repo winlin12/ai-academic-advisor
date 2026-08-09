@@ -1,0 +1,340 @@
+# =============================================================================
+# PLAN-OF-STUDY GROUND TRUTH — Construction Management, BS (Purdue
+# Polytechnic Institute)
+#
+#   verified: false     <-- READ THIS BEFORE QUOTING ANY NUMBER FROM A RUN
+#
+# PROVENANCE — REAL, same source and method as the rest of this directory
+# (crawled catalog Postgres, program 27bf0dad-014d-410e-9d66-1205fc1e9174
+# "Construction Management, BS", catalog year
+# 6f29fb29-07a2-426c-8b94-543c353843bf). This is Polytechnic's SECOND
+# fixture, alongside `polytechnic_cit.yaml` — same college, an entirely
+# different, hands-on-trades-adjacent course list (CM-prefixed, not CNIT/CGT)
+# next to CIT's software/IT-systems track. This is NOT "Construction
+# Engineering" (BSCNE, a real, separate College of Engineering program in
+# the same crawl) — same-sounding name, different college, different course
+# list; do not conflate the two.
+#
+# WHAT MAKES THIS PROGRAM'S REQUIREMENT SHAPE DIFFERENT: the "Departmental/
+# Program Major Courses (65-66 credits)" group crawled as one FLAT list of 19
+# real courses with NO sub-group markup at all — modeled here as a single
+# `kind: all` block, same simplification `mechanical_engineering.yaml` and
+# `education_elementary.yaml` make for their own single unbroken required
+# lists. It sums to 62 credits here (documented gap, not fully modeled, same
+# status as this directory's other under-modeled totals). The 6-credit
+# CM 40000 "Construction Capstone" is real and, at 6 credits, the single
+# heaviest course in this entire directory except Nursing's clinical courses.
+# =============================================================================
+
+program:
+  name: "Construction Management, BS"
+  slug: "construction"
+  real_db_program_id: "27bf0dad-014d-410e-9d66-1205fc1e9174"
+  # SCOPE, added 2026-08-09 — Mode B/C now measure ONLY this program's own major-scope
+  # requirement groups (real_db._scope_for == "program"); college/university-scoped groups
+  # (gen-ed, First-Year Engineering, ...) are dropped from what the model is shown and
+  # scored against, tested standalone instead by their own pseudo-major fixture — see
+  # engineering_core.yaml / agriculture_core.yaml / gen_ed_world_language.yaml and
+  # real_db.fetch_real_db_base's `scope_filter` docstring. "" (absent) = unfiltered, the
+  # old/default behaviour every fixture had before this field existed.
+  requirement_scope: "major"
+  catalog_year: "2026-2027"
+  campus: "West Lafayette"
+  total_credits_min: 120
+  verified: false
+  major_subject: "CM"
+  preferred_major_courses_per_semester: 3
+  max_major_courses_per_semester: 4
+  target_credits_per_semester: 15
+  hard_credit_cap: 18
+
+courses:
+  # ---- Construction Management Major Courses (REAL, ~62 of the real 65-66 credits;
+  # crawled flat, no sub-groups — see header) ----
+  - code: "CM 10000"
+    title: "Introduction To Construction Management"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, cm-core]
+  - code: "CM 15000"
+    title: "Construction Materials And Methods"
+    credits: 6
+    prereqs: ["CM 10000"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, cm-core]
+  - code: "CM 16000"
+    title: "Surveying"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, cm-core]
+  - code: "CM 16400"
+    title: "Construction Graphics And Digital Documentation"
+    credits: 2
+    prereqs: []
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, cm-core]
+  - code: "CM 26200"
+    title: "Introduction To Construction Graphics"
+    credits: 3
+    prereqs: ["CM 16400"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, cm-core]
+  - code: "CM 20002"
+    title: "Construction Plans And Specifications"
+    credits: 4
+    prereqs: ["CM 15000"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, cm-core]
+  - code: "CM 21500"
+    title: "Mechanical Construction"
+    credits: 3
+    prereqs: ["CM 15000"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, cm-core]
+  - code: "CM 21601"
+    title: "Electrical Construction"
+    credits: 2
+    prereqs: ["CM 15000"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, cm-core]
+  - code: "CM 27000"
+    title: "Statics"
+    credits: 3
+    prereqs: ["MA 16010"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, cm-core]
+  - code: "CM 30002"
+    title: "Estimating And Scheduling"
+    credits: 4
+    prereqs: ["CM 20002"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, cm-core]
+  - code: "CM 30101"
+    title: "Introduction To Construction Company Financial Management"
+    credits: 2
+    prereqs: ["CM 10000"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, cm-core]
+  - code: "CM 31000"
+    title: "Equipment And Field Operations"
+    credits: 3
+    prereqs: ["CM 15000"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, cm-core]
+  - code: "CM 36400"
+    title: "Jobsite Management"
+    credits: 3
+    prereqs: ["CM 30002"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, cm-core]
+  - code: "CM 36500"
+    title: "BIM For Project Managers And Field Supervision"
+    credits: 2
+    prereqs: ["CM 26200"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, cm-core]
+  - code: "CM 38000"
+    title: "Soils And Foundations"
+    credits: 3
+    prereqs: ["CM 27000"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, cm-core]
+  - code: "CM 40000"
+    title: "Construction Capstone"
+    credits: 6
+    # CAPSTONE — deepest, heaviest single course in this fixture.
+    prereqs: ["CM 36400", "CM 38000"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, cm-core, project-heavy]
+  - code: "CM 43300"
+    title: "Risk Management & Legal Issues In Design And Construction Integration"
+    credits: 2
+    prereqs: ["CM 30101"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, cm-core]
+  - code: "CM 45001"
+    title: "Project Execution Lab"
+    credits: 3
+    prereqs: ["CM 36400"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, cm-core, project-heavy]
+  - code: "CM 47500"
+    title: "Construction Project Costs/Controls"
+    credits: 2
+    prereqs: ["CM 30002"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, cm-core]
+  - code: "CM 45701"
+    title: "Construction Safety"
+    credits: 3
+    prereqs: ["CM 31000"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, cm-core]
+
+  # ---- math (applied track, same as CIT's own) ----
+  - code: "MA 16010"
+    title: "Applied Calculus I"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [required, mathematics]
+
+  # ---- gen-ed core ----
+  - code: "ENGL 10600"
+    title: "First-Year Composition"
+    credits: 4
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [required, gen-ed, writing]
+  - code: "COM 11400"
+    title: "Fundamentals Of Speech Communication"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [required, gen-ed, oral-communication]
+
+  # ---- gen-ed selective pool (reused, same simplification as `polytechnic_cit.yaml`'s
+  # own prose-only "Other Departmental" gap) ----
+  - code: "PSY 12000"
+    title: "Elementary Psychology"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [gen-ed, social-science]
+  - code: "HIST 10300"
+    title: "Introduction To The Modern World"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [gen-ed, humanities]
+
+# --- degree requirements -----------------------------------------------------
+requirement_groups:
+  - id: cm-core
+    name: "Construction Management Major Courses"
+    kind: all
+    courses: ["CM 10000", "CM 15000", "CM 16000", "CM 16400", "CM 26200", "CM 20002",
+              "CM 21500", "CM 21601", "CM 27000", "CM 30002", "CM 30101", "CM 31000",
+              "CM 36400", "CM 36500", "CM 38000", "CM 40000", "CM 43300", "CM 45001",
+              "CM 47500", "CM 45701"]
+
+  - id: mathematics
+    name: "Mathematics"
+    kind: all
+    courses: ["MA 16010"]
+
+  - id: gen-ed-core
+    name: "University Core — written and oral communication"
+    kind: all
+    courses: ["ENGL 10600", "COM 11400"]
+
+  - id: gen-ed-selective
+    name: "University Core — additional selectives"
+    kind: choose
+    choose_credits: 6
+    courses: ["PSY 12000", "HIST 10300"]
+
+# --- scenarios ---------------------------------------------------------------
+scenarios:
+  - id: construction-fresh-start
+    label: "Incoming Construction Management major, nothing completed"
+    profile:
+      name: "Avery"
+      degree_program: "Construction Management, BS"
+      completed_courses: []
+      start_term: fall
+      start_year: 2026
+      semesters_to_plan: 8
+      max_credits_per_semester: 17
+    feedback: >-
+      I'm starting from scratch in construction management and I want to
+      get into the field-operations and jobsite-management courses as early
+      as the prerequisites allow.
+    assertions:
+      - kind: scheduled_before
+        course: "CM 15000"
+        semester_index: 3
+        why: "CM 15000 gates most of the rest of the major core; deferring it stalls the whole sequence."
+      - kind: max_credits_at_most
+        value: 17
+    world_language:
+      subject: SPAN
+      level: 1
+
+  - id: construction-sophomore-catchup
+    label: "Second-year student who just declared Construction Management"
+    profile:
+      name: "Jordan"
+      degree_program: "Construction Management, BS"
+      completed_courses: ["CM 10000", "MA 16010", "ENGL 10600", "COM 11400"]
+      start_term: fall
+      start_year: 2026
+      semesters_to_plan: 6
+      max_credits_per_semester: 16
+    feedback: >-
+      I just declared construction management after a year of exploratory
+      studies and I have three years left. I want estimating and scheduling
+      on track since it gates jobsite management and the capstone, and
+      please don't stack two lab-heavy courses in the same semester.
+    assertions:
+      - kind: scheduled_before
+        course: "CM 20002"
+        semester_index: 3
+        why: "CM 20002 gates CM 30002, which itself gates jobsite management and the capstone; a late start cascades."
+      - kind: max_credits_at_most
+        value: 16
+    world_language:
+      subject: GER
+      level: 2
+
+  - id: construction-light-load
+    label: "Construction Management student who needs a reduced credit load"
+    profile:
+      name: "Sam"
+      degree_program: "Construction Management, BS"
+      completed_courses: ["CM 10000", "MA 16010", "ENGL 10600"]
+      start_term: fall
+      start_year: 2026
+      semesters_to_plan: 8
+      max_credits_per_semester: 15
+    feedback: >-
+      I'm working a part-time job on a local job site this year, so please
+      cap me at 12 credits a semester.
+    assertions:
+      - kind: max_credits_at_most
+        value: 12
+        why: "The student named an explicit cap; honouring it is the whole ask."
+      - kind: proposal_sets_credit_cap
+        value: 12
+    world_language:
+      subject: FR
+      level: 1
+
+  - id: construction-spring-start
+    label: "Spring-start transfer student"
+    profile:
+      name: "Devin"
+      degree_program: "Construction Management, BS"
+      completed_courses: ["MA 16010", "ENGL 10600", "COM 11400", "PSY 12000", "HIST 10300"]
+      start_term: spring
+      start_year: 2027
+      semesters_to_plan: 8
+      max_credits_per_semester: 16
+    feedback: >-
+      I transferred in with my math and gen-ed credits done and I'm starting
+      in the spring. Get me through the construction management core.
+    notes: >-
+      A spring start shifts sequencing built around a fall-start core chain.
+      Models that assume every prerequisite clears at the same pace
+      regardless of start term collect violations here.
+    assertions:
+      - kind: scheduled_before
+        course: "CM 10000"
+        semester_index: 2
+      - kind: max_credits_at_most
+        value: 16
+    world_language:
+      subject: JPNS
+      level: 3

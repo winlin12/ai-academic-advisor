@@ -69,7 +69,32 @@ def test_move_recalculates_credits_and_flags_violations():
     # Violations surface as warnings instead of being silently "fixed".
     spring_warnings = " ".join(edited.semesters[spring].warnings)
     assert "CS536: not offered in spring" in spring_warnings
-    assert f"exceeds the {profile.max_credits_per_semester}-credit cap" in spring_warnings
+    # The cap warning is asserted as the RULE rather than as a fixed expectation about this
+    # semester's contents: which courses the baseline planner puts in a given term depends on
+    # the calendar, and summer being excluded (PLANNER_INCLUDE_SUMMER) changed that layout.
+    # Pinning the layout made this test fail for a reason unrelated to what it checks.
+    over_cap = edited.semesters[spring].total_credits > profile.max_credits_per_semester
+    assert over_cap == (f"exceeds the {profile.max_credits_per_semester}-credit cap"
+                        in spring_warnings)
+
+
+def test_a_semester_over_the_credit_cap_is_warned_about():
+    profile = make_profile()
+    plan = make_plan(profile)
+    spring = next(i for i, s in enumerate(plan.semesters) if s.term == "spring" and s.courses)
+
+    # Pile courses into one term until it is genuinely over the cap. Every fixture course is
+    # 3 credits and the cap is 6, so three of them does it.
+    edited = plan
+    for code in ("CS502", "CS536", "CS541"):
+        if any(c.code == code for c in edited.semesters[spring].courses):
+            continue
+        edited = apply_plan_edit(edited, "move", code, spring, profile, fixture_catalog())
+
+    assert edited.semesters[spring].total_credits > profile.max_credits_per_semester
+    assert f"exceeds the {profile.max_credits_per_semester}-credit cap" in " ".join(
+        edited.semesters[spring].warnings
+    )
 
 
 def test_move_before_prerequisite_warns():

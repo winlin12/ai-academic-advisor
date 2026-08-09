@@ -33,8 +33,9 @@ import hashlib
 import json
 from typing import Any
 
-from .fixtures import Fixture, SamplePlan, Scenario
-from .mock_db import MockDatabase, render_context
+from .fixtures import Fixture, Scenario
+from .catalog_export import CatalogDatabase, render_context, render_context_lean
+from .plan_scorers import normalize_code
 from .planner import Course, Plan, Profile, first_planning_term, next_term
 
 
@@ -222,26 +223,39 @@ def catalog_tags(catalog: list[Course]) -> list[str]:
 #     The clause about completed courses still counting toward prerequisites and requirement
 #     groups is there because the obvious over-correction — treating "don't schedule it" as
 #     "it doesn't exist" — costs coverage, which is the other half of PLAN_VIABLE.
+#
+# TERM OFFERINGS PROMOTED, 2026-08-02 (moves the static hash again) — and REMOVED entirely,
+# 2026-08-06. It was a single clause carrying a constraint models kept breaking:
+# `term_offering_violation` charged for a fact stated on one field of one table. That table
+# (`course_planner_terms`) and the rule pointing at it are BOTH gone now — Purdue's published
+# offering pattern is not always a reliable predictor of a future term, and the harness was
+# scoring plans against it as if it were a hard fact. See `catalog_export.py`'s module
+# docstring for the removal and how it turns the constraint off everywhere (prompt AND
+# scorer) at once, just by no longer populating `offered_terms`.
 PLAN_SYSTEM = """\
 You build a semester-by-semester plan of study from a read-only export of the advisor\'s
 catalog database. Use only what is in that export.
 
 Where things are:
-- `courses` - every course that exists, with credit_hours_min. Listed in prerequisite order.
-- `course_prerequisites` - `prereq_groups` is AND-of-ORs; `coreq_codes` may share a semester.
-- `course_planner_terms` - `offered_terms`, the terms a course is taught in.
+- `courses` - every course that exists, with credit_hours_min, listed in prerequisite order.
+  `prereq_groups` (AND-of-ORs) and `coreq_codes` appear directly on a course's own row, present
+  only when that course actually has them.
 - `requirement_groups` + `requirement_options` - the degree requirements, joined on
   course_code. `all_of` = take every option. `choose_credits` = take enough to reach
   `credits_min`.
+- `unresolved_requirement_groups` - real requirements (e.g. university gen-ed) the catalog
+  states in prose, not as a course list. Nothing to schedule here; they are not part of
+  `requirement_groups` and "cover every requirement group" does not apply to them. Never invent
+  a course code to satisfy one.
 - `course_aliases` - `alias_of` is an approved substitute. Take one, never both.
 
 Rules, all hard:
 - PREREQUISITES COME FIRST. Every prerequisite of a course must be in a STRICTLY EARLIER
   semester than that course, or already completed. The same semester is NOT early enough.
-  Before you place a course, look it up in `course_prerequisites` and check that every code in
-  its `prereq_groups` is already behind it; a course with no row there has no prerequisites.
-  Only `coreq_codes` may share a semester. This is the constraint most plans get wrong, and one
-  mistake anywhere invalidates the whole plan.
+  Before you place a course, check its own `prereq_groups`: every code in it must already be
+  behind it. A course with no `prereq_groups` field has no prerequisites. Only `coreq_codes`
+  may share a semester. This is the constraint most plans get wrong, and one mistake anywhere
+  invalidates the whole plan.
 - NEVER SCHEDULE A COURSE THE STUDENT HAS ALREADY TAKEN. The student\'s "Already completed"
   line is the complete list of what is done; those courses are finished and must not appear
   anywhere in your plan. They still count as satisfying prerequisites and requirement groups —
@@ -252,22 +266,56 @@ Rules, all hard:
   already written and the completed list. Substitutes in `course_aliases` count as the same
   course: take one, never both.
 - Only courses in `courses`. Never invent a code.
-- Schedule a course only in a term listed in its `offered_terms`, and only in the terms in the
-  student\'s calendar.
-- Never exceed the student\'s credit limit in a semester.
-- Never exceed the student\'s limit on courses from their major\'s subject in a semester. This
-  is separate from the credit limit; both apply.
 - Cover every requirement group. A group is already covered if the student completed its
   courses — check the completed list before scheduling anything for it.
 
-SPREAD THE WORK EVENLY. Divide the courses as evenly as you can across ALL the semesters the
-student has, so every semester lands near the target credits — including the last ones. Do not
-fill the early terms to the limit and leave the later ones nearly empty, and do not leave a
-term light when something legal could go in it. Selective groups usually offer more options
-than the student needs: when a term has room, pick an option whose prerequisites are already
-satisfied and whose `offered_terms` include that term.
+SPREAD THE WORK EVENLY. Balance CREDIT HOURS, not course count, across ALL the semesters the
+student has — courses are not the same size, so an equal number of courses per semester can
+still leave credits badly uneven. Add up the credits in each semester as you place courses and
+keep that sum near the target every semester, including the last ones. Do not fill the early
+terms to the limit and leave the later ones light on credits, and do not leave a term light on
+credits when something legal could go in it. Selective groups usually offer more options than
+the student needs: when a term has room, pick an option whose prerequisites are already
+satisfied."""
 
-Put anything that does not fit in "unplanned". Never exceed a limit to fit it in."""
+# LEAN VARIANT — for a `program.source: fixture` pseudo-major (school-core / gen-ed+world-
+# language test cases), whose database is `catalog_export.render_context_lean`'s
+# requirement-groups-only export, not `render_context`'s full one. PLAN_SYSTEM's "Where things
+# are" section names `courses`/`prereq_groups`/`coreq_codes`/`course_aliases` — tables and
+# fields that render_context_lean never emits — so using it unchanged here would describe a
+# schema the model is not actually being shown. Composed the same "shared rules, one definition"
+# way as PLAN_LOCKED_RULES below: every rule that still applies (never invent a code, never
+# re-schedule a completed or already-placed course, cover every group, spread credits evenly)
+# is unchanged; only the schema description and the prerequisite-checking rule (there are none
+# to check here) differ.
+PLAN_SYSTEM_LEAN = """\
+You build a semester-by-semester plan of study from a read-only export of the advisor\'s
+catalog database. Use only what is in that export.
+
+Where things are:
+- `requirement_groups` - the degree requirements for this test case, each with its own
+  `options` (course code + credits) listed inline. `kind: "all"` = take every option.
+  `kind: "choose"` = take enough options to reach `credits_min`.
+- There is no separate course catalog and no prerequisite data here — these requirements have
+  no meaningful prerequisite chain to sequence, on purpose (see the header of whichever fixture
+  produced this export).
+
+Rules, all hard:
+- NEVER SCHEDULE A COURSE THE STUDENT HAS ALREADY TAKEN. The student\'s "Already completed"
+  line is the complete list of what is done; those courses are finished and must not appear
+  anywhere in your plan. They still count as satisfying requirement groups — a completed course
+  is credit the student already holds, not work still to do.
+- NEVER SCHEDULE THE SAME COURSE TWICE. Each course appears at most once in the WHOLE plan, not
+  once per semester. Before you add a course to a semester, check the semesters you have
+  already written and the completed list.
+- Only courses named in `requirement_groups`. Never invent a code.
+- Cover every requirement group. A group is already covered if the student completed its
+  options — check the completed list before scheduling anything for it.
+
+SPREAD THE WORK EVENLY. Balance CREDIT HOURS, not course count, across ALL the semesters the
+student has. Add up the credits in each semester as you place courses and keep that sum near
+the target every semester, including the last ones. Do not fill the early terms to the limit
+and leave the later ones light on credits."""
 
 # =============================================================================================
 # MODE C — retry-to-convergence. See harness/convergence.py for what it measures.
@@ -373,15 +421,13 @@ PLAN_SCHEMA: dict[str, Any] = {
             "type": "array", "items": {"type": "string"},
             "description": "Required course codes that did not fit in the available semesters.",
         },
-        # Same bound, same reason, and Mode B/C is where it costs the most: `semesters` — the
-        # only field that is scored — is ~470-550 tokens at the median and never exceeded ~1200
-        # anywhere in the corpus, while the largest OUTPUTS ran to 6392 tokens of which 88% was
-        # this string. Capping it is what lets max_plan_tokens come down, because the plan
-        # payload was never the thing filling the budget.
-        "rationale": {
-            "type": "string", "maxLength": 600,
-            "description": "Two or three sentences explaining the sequencing, addressed to the student.",
-        },
+        # `rationale` (free text, 2-3 sentences, up to 600 chars) lived here until 2026-08-06,
+        # same removal reason as `total_credits`/`major_course_count`/`requirements_covered`
+        # above: generation time spent on a field the harness does not need to score the plan.
+        # It fed `rationale_flags` (a faithfulness diagnostic — did the explanation mention a
+        # hallucinated or misordered course) and the review queue's free-text grading rows;
+        # both still run, they just always see an empty string now. If that diagnostic is
+        # needed again, this is the property to restore.
     },
     "required": ["semesters"],
 }
@@ -416,18 +462,67 @@ Be concise unless the student asks for depth."""
 # `prereq_depths`, `catalog_block` and `requirements_block` lived here until 2026-07-30. They
 # rendered the catalog and the degree requirements as bespoke prompt prose — a format that
 # exists nowhere in production, so Mode B was measuring a call site the app does not have.
-# Mode B is now given `harness/mock_db.render_context()`: the advisor's own database rows, in
-# the real table shapes. See harness/mock_db.py. They are in git history if the old prompt ever
-# needs reproducing.
+# Mode B is now given `harness/catalog_export.render_context()`: the advisor's own database
+# rows, in the real table shapes, read straight from Postgres (see harness/real_db.py). They
+# are in git history if the old prompt ever needs reproducing.
 #
 # The `[level N]` prefix went with them, and not only because the format changed: "level 0"
 # reads as "freshman year" and "level 3" as "junior year", which is a scheduling constraint the
 # number never expressed. The same ordering information now travels as the ORDER of the
-# `courses` rows, with `chain_depth` available in `course_prerequisites` for the cases where the
+# `courses` rows, with `chain_depth` available on each course's own row for the cases where the
 # number itself is wanted — and PLAN_SYSTEM says in as many words that it is not a year.
 
 
-def _profile_block(profile: Profile, fixture: Fixture | None = None) -> str:
+def _elective_preference_line(scenario: Scenario) -> str | None:
+    """States the student's own gen-ed/world-language choice EXPLICITLY.
+
+    THIS WAS MISSING, and it was a real bug: `harness/real_db.build_scenario_database` narrows
+    WHICH COURSES RENDER for `world_language`/`gen_ed_preference` (a Spanish-track scenario is
+    shown Spanish options and no other language's), but nothing ever told the MODEL that. A
+    model reading the database export alone sees a shorter-than-usual course list with no
+    connection to anything the student asked for — indistinguishable from an arbitrary
+    editorial cut, or from every other language simply not existing. Found 2026-08-06 by a
+    human reading a transcript and asking "does the model even know it's Spanish."
+    """
+    parts: list[str] = []
+    if scenario.world_language:
+        subject, level = scenario.world_language
+        parts.append(
+            f"World language: continuing {subject} (already through the level-{level - 1} "
+            f"course) — pick from the {subject} options below to continue it, or the culture "
+            f"course alongside it; ignore other languages' listings."
+            if level > 1 else
+            f"World language: starting {subject} from the beginning — pick from the {subject} "
+            f"options below; ignore other languages' listings."
+        )
+    if scenario.gen_ed_preference:
+        parts.append(f"Gen-ed preference: {scenario.gen_ed_preference}.")
+    return " ".join(parts) if parts else None
+
+
+def _database_degree_program(database: CatalogDatabase) -> str:
+    """The major actually loaded via `real_db.program_id`/`--major`, read off the database
+    itself rather than trusted from a hardcoded fixture field.
+
+    `profile.degree_program` is authored per-scenario in `plan_fixtures/*.yaml` and was never
+    kept in sync with whichever program `--major` points the real database at — the fixture
+    file only picks which SCENARIOS (student names, completed-course lists, assertions) exist,
+    not which catalog the model is shown. Mode B/C always render the real database, so this is
+    the one source of truth for what major the student prompt should claim: pointing `--major`
+    at a different program now changes what the model is TOLD, not just what it is SHOWN.
+    """
+    programs = database.rows("programs")
+    if not programs:
+        return "(unknown program)"
+    program = programs[0]
+    name = program.get("name") or "(unknown program)"
+    degree_type = program.get("degree_type")
+    return f"{name}, {degree_type}" if degree_type else name
+
+
+def _profile_block(profile: Profile, fixture: Fixture | None = None,
+                   scenario: Scenario | None = None,
+                   database: CatalogDatabase | None = None) -> str:
     """The student, and — explicitly — the boundary of what they have already done.
 
     THE COMPLETED LIST IS STATED AS EXHAUSTIVE, which it was not before. Students describe
@@ -454,12 +549,63 @@ def _profile_block(profile: Profile, fixture: Fixture | None = None) -> str:
     # the category contained, dropping CS 18000 from every spring-start plan.
     label = ("Already completed (complete list)" if profile.completed_courses
              else "Already completed")
+    preference_line = _elective_preference_line(scenario) if scenario is not None else None
+    degree_program = (_database_degree_program(database) if database is not None
+                      else profile.degree_program)
+    fye_line = _fye_deadline_line(profile, database)
     return (
-        f"STUDENT: {profile.name} — {profile.degree_program}\n"
+        f"STUDENT: {profile.name} — {degree_program}\n"
         f"{label}: {completed}\n"
         f"{credit_load_line(profile, fixture)}\n"
         f"{major_load_line(profile)}\n"
-        f"Semesters available ({profile.semesters_to_plan}), in order:\n  {calendar}"
+        + (f"{preference_line}\n" if preference_line else "")
+        + (f"{fye_line}\n" if fye_line else "")
+        + f"Semesters available ({profile.semesters_to_plan}), in order:\n  {calendar}"
+    )
+
+
+def _fye_deadline_line(profile: Profile, database: CatalogDatabase | None) -> str | None:
+    """One instruction naming Purdue's First-Year Engineering (FYE) deadline — ONLY for a
+    College of Engineering program, and ONLY when FYE looks genuinely unfinished. Added
+    2026-08-07 alongside `real_db.is_college_of_engineering`.
+
+    ABSENT ENTIRELY for every other program (not an empty line, not a "does not apply" note):
+    this rule does not exist outside the College of Engineering, and a line naming it anyway
+    would be a fabricated constraint spent on tokens no other program needed.
+
+    NO COURSE CODES NAMED, deliberately. `real_db._fye_meta` carries the flat union of every
+    legal alternate across Purdue's 8 numbered FYE requirements (e.g. both `CS 15900` and
+    `CHM 11610` for the ONE "First-Year Engineering Selective" slot) — printing that whole set
+    as "still due" would instruct the model to schedule courses that satisfy the SAME
+    requirement twice. Naming the requirement categories instead is true regardless of which
+    legal path the student ends up on.
+    """
+    if database is None:
+        return None
+    meta = database.rows("_fye_meta")
+    if not meta:
+        return None
+    fye_codes = set(meta[0]["fye_course_codes"])
+    if not fye_codes:
+        return None
+    alias_of = {row["course_code"]: row["alias_of"] for row in database.rows("course_aliases")}
+    canon = lambda code: alias_of.get(code, code)  # noqa: E731
+    completed = {canon(normalize_code(c)) for c in profile.completed_courses}
+    matched = sum(1 for code in fye_codes if canon(code) in completed)
+    # THRESHOLD, NOT AN EXACT AUDIT. The selective requirement alone contributes several
+    # alternates to `fye_codes` that were never all going to be completed at once, so "every
+    # code done" is never the right bar. 60% covers a student who finished FYE through any one
+    # legal combination of paths without needing to model which combination that was.
+    if fye_codes and matched / len(fye_codes) >= 0.6:
+        return None
+    return (
+        "FIRST-YEAR ENGINEERING (FYE): this is a College of Engineering program. Purdue "
+        "requires Intro to Engineering I & II, Calculus I & II, Chemistry, Physics, the "
+        "First-Year Engineering Selective (one of: General Chemistry II, C Programming, "
+        "Fundamentals of Biology I, or Fundamentals of Biology II), and Written & Oral "
+        "Communication to be completed within the student's first two semesters if not "
+        "already done — this gates continuing in the major. Prioritize any of these still "
+        "outstanding over later coursework."
     )
 
 
@@ -483,7 +629,16 @@ def credit_load_line(profile: Profile, fixture: Fixture | None = None) -> str:
     planner spends the whole plan aiming at it, so naming it is describing what a good plan
     looks like, not inventing a figure.
     """
-    limit = profile.max_credits_per_semester
+    # NO CAP LANGUAGE AT ALL, as of 2026-08-06 — an explicit experiment, not a fixed
+    # conclusion: transcripts read like the model was staying suspiciously close to the
+    # soft-cap number every time, which is at least consistent with the prompt's own "the
+    # student asked for N or fewer" wording anchoring it there regardless of the actual
+    # `hard_credit_cap`. Removing both numbers from the text answers "does it still self-limit
+    # without being told to, and to what." The scorer is UNCHANGED — `credit_cap_violation`/
+    # `soft_credit_overages` still fire exactly as before, so a model that overloads a semester
+    # now shows up as a real, measured violation instead of being warned off it in advance. If
+    # this needs reverting, `limit`/`hard_cap` are still on `profile` — only the prose describing
+    # them was removed here; see git history for the exact two lines to restore.
     target = profile.target_credits_per_semester
     remaining = 0
     if fixture is not None:
@@ -491,19 +646,19 @@ def credit_load_line(profile: Profile, fixture: Fixture | None = None) -> str:
     if not target and remaining > 0 and profile.semesters_to_plan > 0:
         target = -(-remaining // profile.semesters_to_plan)          # ceil, ints only
     if not target:
-        # No fixture to count against (Mode A's call site) — name the limit and the shape.
-        return (f"Credits per semester: never more than {limit}; spread the courses evenly "
-                f"across all {profile.semesters_to_plan} semesters instead of filling the "
-                f"early ones to the limit")
-    aim = min(int(target), limit)
+        # No fixture to count against (Mode A's call site) — name the shape only.
+        return ("Spread the courses evenly across all "
+                f"{profile.semesters_to_plan} semesters instead of filling the early ones and "
+                "leaving the later ones empty")
+    aim = int(target)
     # THE NUMERATOR IS STATED TOO. The target is remaining/semesters, and giving only the
     # quotient leaves the model no way to notice it has dropped something: a plan missing one
     # 4-credit course still looks locally sensible in every term. Naming the total makes the
     # arithmetic checkable — sum the plan, compare, and an omission is visible instead of
     # invisible. It also states the finishing condition, which is the thing a plan is FOR.
     total = f"{remaining} credits still outstanding. " if remaining else ""
-    return (f"Credits: {total}Aim for {aim} per semester — the load to reach, not a ceiling. "
-            f"{limit} is the hard limit.")
+    return (f"Credits: {total}Aim for {aim} per semester, spread evenly across every semester "
+            f"available rather than front-loaded.")
 
 
 def major_load_line(profile: Profile) -> str:
@@ -566,19 +721,23 @@ def _course_context(profile: Profile, catalog: list[Course]) -> str:
 
 
 class PromptBuilder:
-    def __init__(self, fixture: Fixture, sample_plan: SamplePlan | None = None,
-                 database: MockDatabase | None = None):
+    def __init__(self, fixture: Fixture, database: CatalogDatabase | None = None):
         self.fixture = fixture
-        # Retained only so callers keep working; NO prompt reads it since the reference arm was
-        # replaced on 2026-07-30. The sample plan still loads, because `template_anchoring`
-        # scores every free-form plan against it as a base-rate diagnostic — how much of the
-        # published template a model reproduces from parametric memory alone.
-        self.sample_plan = sample_plan
         # MODE B'S CONTEXT IS THE DATABASE, not a prompt-authored catalog listing. Rendered once
-        # here: it is byte-stable and lands in the static hash, so a change to the mock database
-        # correctly stops old Mode B records being comparable.
+        # here: it is byte-stable and lands in the static hash, so a change to the underlying
+        # catalog correctly stops old Mode B records being comparable.
         self.database = database
-        self._database_block = render_context(database) if database is not None else None
+        # `source: fixture` pseudo-majors (school-core / gen-ed+world-language test cases) get
+        # the stripped requirement-groups-only render AND the matching system-prompt schema
+        # description — see `catalog_export.render_context_lean`, `PLAN_SYSTEM_LEAN`, and
+        # `real_db.real_db_base_from_fixture`'s docstrings for why. Every other fixture (the
+        # default `source: real_db`) is unchanged. Picked once here, not per call, so Mode B
+        # and Mode C (`_plan_static`/`plan_convergence`) can never disagree about which schema
+        # this fixture's database block actually is.
+        lean = fixture.source == "fixture"
+        self._plan_system = PLAN_SYSTEM_LEAN if lean else PLAN_SYSTEM
+        renderer = render_context_lean if lean else render_context
+        self._database_block = renderer(database) if database is not None else None
 
     # -- Mode A: revise-plan proposal (the app's real path) ---------------------------------
 
@@ -630,19 +789,19 @@ class PromptBuilder:
         return (static, self._plan_user(scenario),
                 _static_hash(f"{static}\n{SCHEMA_ENUM_POLICY}", PLAN_SCHEMA))
 
-    # -- Mode C: free-form plan of study, with the published sample plan ---------------------
+    # -- shared by Mode B and Mode C's free-form plan-of-study prompts -----------------------
 
     def _plan_static(self) -> str:
         if self._database_block is None:  # pragma: no cover — `run.py check` refuses this first
             raise RuntimeError(
-                "Mode B needs the mock database (paths.mock_db). Run "
-                "`python run.py build-mock-db`."
+                "Mode B needs a catalog database — pass one to PromptBuilder(database=...). "
+                "See harness/real_db.py."
             )
-        return f"{PLAN_SYSTEM}\n\n{self._database_block}"
+        return f"{self._plan_system}\n\n{self._database_block}"
 
     def _plan_user(self, scenario: Scenario) -> str:
         return (
-            f"{_profile_block(scenario.profile, self.fixture)}\n\n"
+            f"{_profile_block(scenario.profile, self.fixture, scenario, self.database)}\n\n"
             f"STUDENT'S REQUEST:\n{scenario.feedback}\n\n"
             f"Produce the plan of study."
         )
@@ -662,13 +821,13 @@ class PromptBuilder:
         the model is told between attempts, so if their static hashes diverged, the report
         would be comparing two conditions instead of one condition under two retry policies.
         """
-        static = f"{PLAN_SYSTEM}\n\n{PLAN_LOCKED_RULES}\n\n{self._database_block}"
+        static = f"{self._plan_system}\n\n{PLAN_LOCKED_RULES}\n\n{self._database_block}"
         if self._database_block is None:  # pragma: no cover — preflight refuses this first
             raise RuntimeError(
-                "Mode C needs the mock database (paths.mock_db). Run "
-                "`python run.py build-mock-db`."
+                "Mode C needs a catalog database — pass one to PromptBuilder(database=...). "
+                "See harness/real_db.py."
             )
-        parts = [_profile_block(scenario.profile, self.fixture), ""]
+        parts = [_profile_block(scenario.profile, self.fixture, scenario, self.database), ""]
         if locked:
             terms = _term_sequence(scenario.profile)
             # Grouped by semester once the set gets large: after a repair pass the "locked" set
@@ -687,10 +846,12 @@ class PromptBuilder:
                              + ", ".join(by_semester[index]))
             header = (
                 # The repair variant's second and later attempts. Saying these were CHECKED is
-                # the point: the model is not being asked to re-plan them, and a plan it is told
-                # is already verified is one it has no reason to rewrite.
+                # the point: the model is not being asked to re-plan them, only to COPY them —
+                # into the SAME semester, verbatim. See the closing instruction below for why
+                # "repeat, do not re-plan" replaced "omit entirely".
                 "ALREADY CONFIRMED — these placements have been checked and are correct. "
-                "Keep every one exactly as it is and do not repeat them elsewhere:"
+                "Repeat every one of them in the exact semester listed here. Do not move one "
+                "to a different semester, drop it, or add it again anywhere else:"
                 if confirmed else
                 "LOCKED SLOTS — keep these exactly where they are:"
             )
@@ -722,14 +883,23 @@ class PromptBuilder:
                 "",
             ]
         parts.append(
-            # ONLY THE ADDITIONS. The confirmed placements are re-inserted by the harness
-            # regardless of what comes back, so demanding the full plan bought nothing and cost
-            # a great deal: it made a two-course edit into a twenty-five-course transcription,
-            # and a 4B model spends its attention copying rather than planning. Asking for the
-            # delta makes the task the size it actually is.
-            "Return ONLY the semesters you are adding courses to, with just the courses you "
-            "are ADDING. The confirmed placements above are kept automatically — do not "
-            "repeat them."
+            # THE FULL PLAN, CONFIRMED COURSES REPEATED VERBATIM. Used to ask for only the
+            # ADDITIONS — the confirmed placements are re-inserted by the harness regardless of
+            # what comes back, so a delta reply was assumed to be pure savings. Live case,
+            # qwen3.6-27b / mi-light-load: told to omit the confirmed courses, it tried to
+            # reconstruct them from memory anyway ("do not repeat them elsewhere" read as "do
+            # not forget them"), reproduced the whole schedule shifted by a semester, and spent
+            # its entire reply on that — every real addition (PHYS 17200, SCLA 10100, the gen-ed
+            # selective) landed in "unplanned". A model too large to need delta's token savings
+            # is exactly the model with enough spare attention to hallucinate a state it was
+            # told to leave alone. Asking it to copy the confirmed block verbatim into its
+            # answer removes the ambiguity that "elsewhere" left open: there is no other place
+            # for a confirmed course to legally appear, so the model is never guessing at it.
+            "Return the FULL plan of study: every semester, in order, from semester 1 to the "
+            "last one. For each semester, repeat every ALREADY CONFIRMED course from that exact "
+            "semester above verbatim, then add whatever new courses belong alongside them. "
+            "Every confirmed course must appear in your reply, in its confirmed semester, and "
+            "nowhere else — do not move, drop, or re-add one elsewhere."
             if confirmed else "Produce the plan of study."
         )
         return (static, "\n".join(parts),

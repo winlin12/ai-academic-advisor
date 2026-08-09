@@ -31,16 +31,21 @@ import json
 import os
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 from . import plan_scorers, scorers
-from .fixtures import Fixture, SamplePlan, Scenario, load_fixture, load_sample_plan
+from .catalog_export import CatalogDatabase
+from .fixtures import Fixture, Scenario, load_fixture
 from .llamacpp_client import GenerationResult, LlamaCppClient, LlamaCppError
-from .mock_db import MockDatabase, load_mock_db
+from .real_db import (
+    REQUIREMENT_SCOPE_ALIASES, RealDatabaseBase, build_scenario_database, fetch_real_db_base,
+    real_db_base_from_fixture,
+)
+from .real_scoring import RealScore, score_against_real_db
 from .planner import (
     Plan, Profile, Proposal, apply_proposal, extract_credit_cap, generate_plan,
     set_planning_terms, severity,
@@ -62,17 +67,52 @@ class EvalContext:
     cfg: dict[str, Any]
     root: Path
     fixture: Fixture
+    # Mode A/QA/Explain's prompt builder. None of the three read `.database`'s content (see
+    # `prompts.PromptBuilder`), so this one, built from `real_db_base` with no scenario
+    # preference applied, is a safe shared default for them. Mode B/C must NOT use this one —
+    # see `database_for`/`prompts_for` below.
     prompts: PromptBuilder
     questions: list[dict[str, Any]]
     host: str
-    # The mock of the advisor's real databases — Mode B's entire context. Carried on the
-    # context so its hash can travel into meta_*.json alongside the fixture's.
-    database: MockDatabase
-    # The published sample plan. NO LONGER A PROMPT INPUT — the reference arm was replaced by
-    # the feedback arm on 2026-07-30. It is still loaded because `template_anchoring` scores
-    # every free-form plan against it as a base rate: how much of the published template a
-    # model reproduces from parametric memory alone. None simply omits that diagnostic.
-    sample_plan: SamplePlan | None = None
+    # The MAXIMAL real-catalog universe, read once from Postgres (see
+    # `harness/real_db.fetch_real_db_base`) — every course any scenario's own
+    # gen_ed_preference/world_language could select from, prerequisite-closed. Mode B/C never
+    # read this directly; they go through `database_for`, which turns it into the one, smaller
+    # database a given SCENARIO is actually shown.
+    real_db_base: RealDatabaseBase
+    budget_tokens: int
+    # Per-scenario database/prompt-builder cache — see `database_for`/`prompts_for`. Rebuilding
+    # is pure Python (no Postgres round trip), but a scenario's own token-budget fill loop is
+    # not free, and every scenario is visited once per model x replicate; memoizing keeps that
+    # cost paid once per run instead of once per (model, replicate, scenario) triple.
+    _scenario_databases: dict[str, CatalogDatabase] = field(default_factory=dict)
+    _scenario_prompts: dict[str, PromptBuilder] = field(default_factory=dict)
+
+    def database_for(self, scenario: Scenario) -> CatalogDatabase:
+        """The real catalog THIS scenario is shown for Mode B/C — `real_db_base` narrowed by
+        its own `gen_ed_preference`/`world_language`. Scoring (`score_against_real_db`,
+        `real_db.fixture_from_database`) must always be called against this, never against a
+        different scenario's database or against `real_db_base` directly — see
+        `harness/real_db.py`'s module docstring on why a plan has to be scored against exactly
+        what the model was shown.
+        """
+        cached = self._scenario_databases.get(scenario.id)
+        if cached is None:
+            cached = build_scenario_database(
+                self.real_db_base, gen_ed_preference=scenario.gen_ed_preference,
+                world_language=scenario.world_language, budget_tokens=self.budget_tokens,
+            )
+            self._scenario_databases[scenario.id] = cached
+        return cached
+
+    def prompts_for(self, scenario: Scenario) -> PromptBuilder:
+        """The `PromptBuilder` wrapping `database_for(scenario)` — what Mode B/C must build
+        `plan_freeform`/`plan_convergence` prompts from."""
+        cached = self._scenario_prompts.get(scenario.id)
+        if cached is None:
+            cached = PromptBuilder(self.fixture, self.database_for(scenario))
+            self._scenario_prompts[scenario.id] = cached
+        return cached
 
     @property
     def results_dir(self) -> Path:
@@ -157,13 +197,19 @@ def _score_detail(
 
     if score.semester_credits:
         terms = plan_scorers._terms(profile, len(score.semester_credits))
-        cap = profile.max_credits_per_semester
+        # BOTH credit numbers, because they mean different things and the table marks them
+        # differently: `asked` is what the student wants (over it is *heavy*, and shows up as a
+        # failed `max_credits_at_most` below), `ceiling` is what the registrar allows (over it
+        # is **OVER**, a hard violation). Printing only one of them is what made a 17-credit
+        # term read as the same kind of failure as a broken prereq chain.
+        asked = profile.max_credits_per_semester
+        ceiling = profile.hard_credit_cap
         soft = min(profile.preferred_major_courses_per_semester,
                    profile.max_major_courses_per_semester)
         hard = profile.max_major_courses_per_semester
         lines += [
-            f"### Semesters (credit cap {cap}, {profile.major_subject} cap {hard}, "
-            f"{soft} preferred)", "",
+            f"### Semesters (credits: {asked} asked, {ceiling} hard limit; "
+            f"{profile.major_subject} cap {hard}, {soft} preferred)", "",
             f"| # | term | credits | {profile.major_subject} | courses |",
             "|---|---|---|---|---|",
         ]
@@ -172,7 +218,8 @@ def _score_detail(
                      if i < len(score.major_courses_per_semester) else 0)
             term, year = terms[i] if i < len(terms) else ("?", "?")
             codes = ", ".join(semesters[i]) if i < len(semesters) else ""
-            over_cr = " **OVER**" if credits > cap else ""
+            over_cr = (" **OVER**" if credits > ceiling
+                       else (" *over ask*" if credits > asked else ""))
             over_mj = " **OVER**" if major > hard else (" *heavy*" if major > soft else "")
             lines.append(
                 f"| {i + 1} | {term} {year} | {credits}{over_cr} | {major}{over_mj} | {codes} |")
@@ -186,36 +233,127 @@ def _score_detail(
     return "\n".join(lines)
 
 
+def _real_score_detail(score: RealScore, program_name: str) -> str:
+    """The per-group breakdown behind `_score_detail`'s aggregate coverage fraction — same
+    `RealScore` object, the other half of the same verdict. Every requirement group gets its
+    own line, filled or not, rather than only the aggregate: a coverage NUMBER tells you a plan
+    is short, not which of the program's own requirements it is short on.
+    """
+    lines: list[str] = [f"## Requirement groups: {program_name}", ""]
+    lines.append(
+        f"**{score.groups_satisfied}/{score.groups_total} checkable requirement groups "
+        f"filled** ({score.coverage:.0%}) — {len(score.unresolved)} more the catalog states "
+        f"in prose and this scorer cannot check at all"
+    )
+    lines.append("")
+
+    if score.violations:
+        counts = ", ".join(f"{k} x{v}" for k, v in sorted(score.violation_counts.items()))
+        lines += [f"### Violations ({len(score.violations)}) — {counts}", ""]
+        lines += [f"- `{v}`" for v in score.violations]
+        lines.append("")
+    else:
+        lines += ["### Violations", "", "None — every hard rule held.", ""]
+
+    lines += ["### Every checkable requirement group", ""]
+    for group in score.groups:
+        mark = "✓" if group.satisfied else "✗"
+        kind = "choose from list" if group.selective else "take all"
+        lines.append(f"- {mark} **{group.name}** ({kind})")
+        if group.filled:
+            lines.append(f"    - filled: {', '.join(group.filled)}")
+        if group.missing_label:
+            lines.append(f"    - short: {group.missing_label}")
+    lines.append("")
+
+    if score.unresolved:
+        lines += [
+            f"### Cannot be checked at all ({len(score.unresolved)})",
+            "",
+            "Stated by the catalog in prose, never as a course list — not shown to the model, "
+            "not scored, not counted toward or against coverage above:",
+            "",
+        ]
+        lines += [f"- {u.name}" for u in score.unresolved]
+        lines.append("")
+
+    return "\n".join(lines)
+
+
 def load_context(root: Path) -> EvalContext:
     cfg = yaml.safe_load((root / "config.yaml").read_text())
+    # MODEL_EVAL_PLAN_FIXTURE / MODEL_EVAL_RESULTS_DIR — same override pattern as
+    # MODEL_EVAL_REAL_DB_PROGRAM_ID below, set once by `run.py` before dispatch. This is what
+    # lets `run.py run`'s multi-school loop point one process at a different fixture/results
+    # directory per school without editing config.yaml on disk — see `run.py`'s
+    # `resolve_major`/`discover_fixtures`.
+    fixture_rel = os.environ.get("MODEL_EVAL_PLAN_FIXTURE", cfg["paths"]["plan_fixture"])
+    results_dir_override = os.environ.get("MODEL_EVAL_RESULTS_DIR")
+    if results_dir_override:
+        cfg["paths"]["results_dir"] = results_dir_override
     # Do this BEFORE loading the fixture: the fixture's scenarios are planned with the
     # deterministic planner, which needs to already know whether summer is schedulable.
     set_planning_terms(cfg["run"]["planning_terms"])
-    fixture = load_fixture(root / cfg["paths"]["plan_fixture"])
+    fixture = load_fixture(root / fixture_rel)
     questions_path = root / cfg["paths"]["questions"]
     questions = yaml.safe_load(questions_path.read_text()) if questions_path.exists() else []
 
     # THE MODEL'S CONTEXT. Loaded before the prompts are built, because Mode B's static block is
-    # the rendered database — its bytes are in the static hash, so a stale mock db is a silently
-    # different experiment, which is what `run.py check`'s staleness guard exists to prevent.
-    database = load_mock_db(root / cfg["paths"]["mock_db"])
+    # the rendered database — its bytes are in the static hash, so a stale read is a silently
+    # different experiment.
+    #
+    # ALWAYS THE REAL catalog_ingestion/advisor Postgres DB — there is no JSON mock any more
+    # (removed 2026-08-04; see harness/real_db.py and harness/catalog_export.py's module
+    # docstrings for why, and for what does and doesn't survive reading real data straight from
+    # Postgres). `real_db.url`/`program_id`/`broaden_subjects` in config.yaml pick which
+    # program and how wide its elective pool is; the `MODEL_EVAL_REAL_DB_*` env vars override
+    # them for one-off runs without editing the file. Mode A/QA/Explain never touch the database
+    # at all (see prompts.py), so only Mode B/C are affected by any of this.
+    #
+    # ONE FETCH, MANY SCENARIOS. `fetch_real_db_base` is the (possibly slow) Postgres half; each
+    # scenario's own database is built from it lazily, per-scenario, via `EvalContext.database_for`
+    # — see `harness/real_db.py`'s module docstring for why the split exists (a real program's
+    # own gen-ed menus can be far too large to render whole, so what a scenario is actually shown
+    # depends on ITS `gen_ed_preference`/`world_language`, not just the program).
+    budget_tokens = cfg["run"]["num_ctx"] - cfg["run"]["max_plan_tokens"]
+    if fixture.source == "fixture":
+        # NO POSTGRES AT ALL for a `program.source: fixture` pseudo-major (school-core /
+        # gen-ed+world-language test cases) — this fixture's own courses/requirement_groups
+        # ARE the whole database. See `real_db.real_db_base_from_fixture`'s docstring.
+        real_db_base = real_db_base_from_fixture(fixture)
+        print(f"[real-db] fixture-sourced ({fixture.slug}), no Postgres round trip — "
+              f"{len(real_db_base.always_groups)} required + "
+              f"{len(real_db_base.elective_groups)} elective requirement group(s), "
+              f"{len(real_db_base.courses_by_code)} courses")
+    else:
+        real_db_cfg = cfg.get("real_db", {})
+        pg_url = os.environ.get("MODEL_EVAL_REAL_DB_URL", real_db_cfg["url"])
+        program_id = os.environ.get("MODEL_EVAL_REAL_DB_PROGRAM_ID", real_db_cfg["program_id"])
+        scope_filter = REQUIREMENT_SCOPE_ALIASES.get(fixture.requirement_scope)
+        real_db_base = fetch_real_db_base(
+            pg_url, program_id,
+            broaden_subjects=(tuple(real_db_cfg["broaden_subjects"])
+                             if real_db_cfg.get("broaden_subjects") else None),
+            force_selective_groups=tuple(real_db_cfg.get("force_selective_groups") or ()),
+            scope_filter=scope_filter,
+        )
+        print(f"[real-db] loaded program {program_id} from {pg_url} "
+              f"({len(real_db_base.always_groups)} required + {len(real_db_base.elective_groups)} "
+              f"elective requirement group(s), {len(real_db_base.courses_by_code)} courses in the "
+              f"maximal universe)"
+              + (f" [scope={fixture.requirement_scope}]" if scope_filter else ""))
 
-    sample_rel = cfg["paths"].get("sample_plan")
-    sample_plan = load_sample_plan(root / sample_rel) if sample_rel else None
-    if sample_rel and sample_plan is None:  # pragma: no cover — defensive
-        print(f"[WARN] paths.sample_plan is set to {sample_rel} but nothing loaded; "
-              "Mode C will be skipped.")
-
+    default_database = build_scenario_database(real_db_base, budget_tokens=budget_tokens)
     return EvalContext(
         cfg=cfg,
         root=root,
         fixture=fixture,
-        prompts=PromptBuilder(fixture, sample_plan, database),
+        prompts=PromptBuilder(fixture, default_database),
         questions=questions or [],
         host=resolve_host(cfg["llamacpp"].get("host", "auto"),
                           cfg["llamacpp"].get("server_exe")),
-        sample_plan=sample_plan,
-        database=database,
+        real_db_base=real_db_base,
+        budget_tokens=budget_tokens,
     )
 
 
@@ -448,7 +586,7 @@ def run_mode_a(
     if best_proposal is not None:
         rec.update(plan_scorers.score_proposal(best_proposal, profile, ctx.fixture))
         rec["rationale_flags"] = plan_scorers.rationale_flags(
-            str(best_proposal.get("rationale") or ""), planned_codes, ctx.fixture
+            str(best_proposal.get("rationale") or ""), planned_codes, ctx.fixture.by_code
         )
     out.write(json.dumps(rec, default=str) + "\n")
     ctx.write_transcript(
@@ -471,17 +609,43 @@ def run_mode_b(
     ctx: EvalContext, client: LlamaCppClient, model_cfg: dict,
     scenario: Scenario, run_idx: int, out, *, mitigate: bool,
 ) -> None:
-    """The model emits the whole schedule. Scored directly against the fixture's rules.
+    """The model emits the whole schedule. Scored against the real database it was shown
+    (`real_scoring.score_against_real_db`) — not the fixture; see that module's docstring.
 
     This is where models actually separate. A plan is viable only if it has ZERO hard
-    violations and covers every requirement — one prerequisite mistake anywhere in eight
-    semesters fails the whole plan, which is the correct standard: a student following it
+    violations and covers every CHECKABLE requirement — one prerequisite mistake anywhere in
+    eight semesters fails the whole plan, which is the correct standard: a student following it
     would be turned away at registration.
     """
     _run_freeform_plan(
         ctx, client, model_cfg, scenario, run_idx, out,
         mitigate=mitigate, stage="plan_mode_b",
-        prompt=ctx.prompts.plan_freeform(scenario),
+        prompt=ctx.prompts_for(scenario).plan_freeform(scenario),
+    )
+
+
+def run_mode_b_thinking(
+    ctx: EvalContext, client: LlamaCppClient, model_cfg: dict,
+    scenario: Scenario, run_idx: int, out, *, thinking_budget: int,
+) -> None:
+    """Mode B, but the model reasons BEFORE it commits to the plan, bounded to
+    `thinking_budget` tokens — see `run_thinking_experiment` for why this needs its own server
+    process and can never run inside the baseline's own `run_mode_b` pass.
+
+    This is a different mechanism from the removed post-hoc `rationale` field
+    (`prompts.PLAN_SCHEMA`'s own history note): that text was written AFTER `semesters` was
+    already fixed, so nothing in it could have changed the plan — pure narration, correctly
+    cut for the tokens it cost. Reasoning that happens before the grammar-constrained JSON
+    starts is structurally different: it is generated BEFORE any course is chosen, so it is at
+    least possible for it to change what gets picked. Whether it actually does, on THESE
+    models, is the open question this experiment measures — same prompt, same schema, same
+    scorer as `run_mode_b`, the only difference is reasoning on vs. off.
+    """
+    _run_freeform_plan(
+        ctx, client, model_cfg, scenario, run_idx, out,
+        mitigate=False, stage="plan_mode_b_thinking",
+        prompt=ctx.prompts_for(scenario).plan_freeform(scenario),
+        think_override=True, extra_max_tokens=thinking_budget,
     )
 
 
@@ -489,17 +653,37 @@ def _run_freeform_plan(
     ctx: EvalContext, client: LlamaCppClient, model_cfg: dict,
     scenario: Scenario, run_idx: int, out, *, mitigate: bool,
     stage: str, prompt: tuple[str, str, str],
+    think_override: bool | None = None, extra_max_tokens: int = 0,
 ) -> None:
+    """`think_override`/`extra_max_tokens` exist for exactly one caller, `run_mode_b_thinking`:
+    force reasoning ON for this call (independent of `model_cfg["think"]`, which stays the
+    baseline's own setting) and widen the token budget by the reasoning budget the server was
+    launched with, so a bounded pre-plan reasoning pass doesn't starve the JSON plan that has
+    to follow it out of `max_plan_tokens`. Both are no-ops (`None`/`0`) on every other call.
+    """
     system, user, static_hash = prompt
+    database = ctx.database_for(scenario)
     try:
         res = client.chat(
             system, user,
-            options=sampling_options(ctx.cfg, max_tokens=ctx.cfg["run"]["max_plan_tokens"]),
-            think=model_cfg.get("think"),
+            options=sampling_options(
+                ctx.cfg, max_tokens=ctx.cfg["run"]["max_plan_tokens"] + extra_max_tokens),
+            think=think_override if think_override is not None else model_cfg.get("think"),
+            # THE COURSE ENUM MUST COME FROM THIS SCENARIO'S OWN `database`, NOT
+            # `ctx.fixture.catalog` AND NOT ANOTHER SCENARIO'S DATABASE. This schema is what
+            # grammar-constrains the model's OUTPUT — get it wrong and the model is not merely
+            # scored against the wrong catalog, it is physically unable to emit any course
+            # outside whatever catalog built the enum, no matter what program or elective menu
+            # the PROMPT TEXT showed it. That was exactly backwards for a non-CS `--major`: the
+            # model was shown a real WGSS catalog and grammar-forced to answer only in CS
+            # Machine Intelligence course codes, which is why every course it could possibly
+            # write scored `hallucinated_course` against the real program — the grammar had
+            # already made a correct answer impossible before the model wrote a token. The same
+            # failure mode now applies PER SCENARIO, not just per program.
             response_format=json_response_format(
                 "PlanOfStudy", plan_schema(
                     ctx.cfg["run"]["planning_terms"],
-                    [c.code for c in ctx.fixture.catalog])),
+                    sorted(database.course_codes))),
         )
     except LlamaCppError as exc:
         out.write(json.dumps({
@@ -517,7 +701,7 @@ def _run_freeform_plan(
 
     if not parsed or not isinstance(parsed.get("semesters"), list):
         # Not a scoring edge case — a plan that cannot be parsed cannot be shown to a student.
-        rec.update(plan_scorers.PlanScore().as_record())
+        rec.update(RealScore().as_record())
         rec["structure_ok"] = False
         rec["parse_failure_reason"] = "no JSON object" if not parsed else "no semesters array"
         out.write(json.dumps(rec, default=str) + "\n")
@@ -526,40 +710,63 @@ def _run_freeform_plan(
                              verdict=f"UNPARSEABLE ({rec['parse_failure_reason']})")
         return
 
-    semesters = [
+    raw_semesters = [
         [str(c) for c in (s.get("courses") or [])]
         for s in parsed["semesters"] if isinstance(s, dict)
     ]
-    score = plan_scorers.score_plan(
-        ctx.fixture, scenario.profile, semesters, assertions=scenario.assertions
+    # Every real course maps to itself except the aliased subset, which maps to its primary —
+    # same shape as `fixture.canonical`, built from `database` instead.
+    alias_of = {row["course_code"]: row["alias_of"] for row in database.rows("course_aliases")}
+    real_canonical = {code: alias_of.get(code, code) for code in database.course_codes}
+    canon = lambda code: real_canonical.get(code, code)  # noqa: E731
+    completed = {canon(plan_scorers.normalize_code(c)) for c in scenario.profile.completed_courses}
+    # DEDUPE BEFORE SCORING, not after — see plan_scorers.dedupe_semesters's docstring. A
+    # repeated or already-completed course is deleted here so `score_against_real_db` never
+    # sees it and `plan_viable` is never held hostage by one trivially-fixable repeated line.
+    semesters, duplicates_removed = plan_scorers.dedupe_semesters(
+        raw_semesters, canon=canon, completed=completed
+    )
+    # SCORED AGAINST `database` — this SCENARIO's own real, live catalog, the one it was
+    # actually shown and grammar-constrained to — not the hand-authored fixture, and not any
+    # other scenario's database. See real_scoring.py's module docstring for the incidents (real
+    # courses flagged hallucinated, invented gen-ed groups counted as "missing") that made
+    # scoring Mode B against the fixture wrong rather than merely approximate; the same
+    # reasoning is why this must be `database`, not `ctx.database_for` of a different scenario.
+    real_score = score_against_real_db(
+        database, scenario.profile, semesters, assertions=scenario.assertions
     )
     planned_codes = {plan_scorers.normalize_code(c) for s in semesters for c in s}
-    rec.update(score.as_record())
+    rec.update(real_score.as_record())
     rec.update({
         "semesters": semesters,
         "semester_count": len(semesters),
         "over_horizon": len(semesters) > scenario.profile.semesters_to_plan,
+        "duplicates_removed": duplicates_removed,
         "declared_unplanned": parsed.get("unplanned") or [],
         "rationale": parsed.get("rationale"),
         "rationale_flags": plan_scorers.rationale_flags(
-            str(parsed.get("rationale") or ""), planned_codes, ctx.fixture
+            str(parsed.get("rationale") or ""), planned_codes, database.course_codes
         ),
         "term_labels_ok": _term_labels_ok(parsed["semesters"], scenario.profile),
+        # Empty on every call except `run_mode_b_thinking`'s (see that function and
+        # `_run_freeform_plan`'s own docstring) — reasoning stays off at launch everywhere
+        # else, so this channel never fires there.
+        "reasoning_chars": len(res.reasoning_text),
     })
-    # Anchoring is computed for BOTH modes whenever a sample plan is configured. Mode B never
-    # sees it, so Mode B's slot_match is the base rate a model reproduces from memory alone —
-    # without that baseline, Mode C's number is unreadable.
-    if ctx.sample_plan is not None:
-        rec.update(plan_scorers.template_anchoring(
-            ctx.sample_plan, semesters, score.hallucinated,
-            canonical=ctx.fixture.canonical))
     out.write(json.dumps(rec, default=str) + "\n")
+    program_rows = database.rows("programs")
+    program_name = program_rows[0]["name"] if program_rows else "(unknown program)"
+    transcript_text = res.text
+    if res.reasoning_text:
+        transcript_text = f"<think>\n{res.reasoning_text}\n</think>\n\n{res.text}"
     ctx.write_transcript(
-        model_cfg["name"], stage, scenario.id, run_idx, system, user, res.text,
-        verdict=f"viable={score.viable} coverage={score.requirement_coverage:.0%} "
-                f"violations={score.violation_counts or 'none'} "
-                f"slot_match={rec.get('template_slot_match')}",
-        detail=_score_detail(score, semesters, scenario.profile),
+        model_cfg["name"], stage, scenario.id, run_idx, system, user, transcript_text,
+        verdict=f"viable={real_score.viable} coverage={real_score.requirement_coverage:.0%} "
+                f"violations={real_score.violation_counts or 'none'} | "
+                f"{real_score.groups_satisfied}/{real_score.groups_total} checkable groups, "
+                f"{len(real_score.unresolved)} uncheckable (prose)",
+        detail=_score_detail(real_score, semesters, scenario.profile)
+              + "\n" + _real_score_detail(real_score, program_name),
     )
 
 
@@ -624,20 +831,17 @@ def run_explain(
     each model its own Mode B plan would confound explanation quality with planning quality."""
     plan = generate_plan(scenario.profile, ctx.fixture.catalog)
     # Shape this exactly like ``PlanResponse.model_dump_json()`` — the router hands the model
-    # ``PlannedCourse`` objects (code + title + credits + workload), NOT bare course codes.
-    # Sending codes alone was a harness-only bug with a measurable cost: with no title in the
-    # payload, models fill the gap from parametric memory and tell the student CS 35400 is
-    # "Theory of Computation" (it is Operating Systems). That failure mode is an artifact of
-    # the harness, not something production can produce, so scoring it was scoring a fiction.
+    # ``PlannedCourse`` objects (code + title + credits), NOT bare course codes. Sending codes
+    # alone was a harness-only bug with a measurable cost: with no title in the payload, models
+    # fill the gap from parametric memory and tell the student CS 35400 is "Theory of
+    # Computation" (it is Operating Systems). That failure mode is an artifact of the harness,
+    # not something production can produce, so scoring it was scoring a fiction.
     by_code = {c.code: c for c in ctx.fixture.catalog}
     def _planned_course(code: str) -> dict:
         course = by_code.get(code)
         if course is None:  # a plan can only hold catalog codes; be explicit if that breaks
-            return {"code": code, "title": "", "credits": 0, "workload_score": 0}
-        return {
-            "code": course.code, "title": course.title,
-            "credits": course.credits, "workload_score": course.workload_score,
-        }
+            return {"code": code, "title": "", "credits": 0}
+        return {"code": course.code, "title": course.title, "credits": course.credits}
 
     plan_json = json.dumps(
         {
@@ -683,6 +887,49 @@ def run_explain(
 # --- top level --------------------------------------------------------------------------------
 
 
+def _ensure_server_alive(
+    ctx: EvalContext, handle: ServerHandle, client: LlamaCppClient, model_cfg: dict,
+    vram_baseline: list[int] | None,
+) -> tuple[ServerHandle, LlamaCppClient, dict[str, Any] | None]:
+    """Cheap health check before every scenario; if the server died, restart it and warm it
+    back up so the REST of this model's scenarios still run instead of every one after the
+    crash failing identically. Real incident 2026-08-06: llama-server hit the same SIGABRT
+    (confirmed via `dmesg`, not a harness bug — the crash address was identical across three
+    occurrences over two full restarts) partway through a model's run, at a different scenario
+    each time, always with the GPU near its VRAM ceiling. Nothing before this checked the
+    server was still up, so every scenario after the crash failed with "connection refused"
+    and the rest of that model's data was simply lost. This does not fix the crash — it stops
+    one crash from costing more than the one request it happened on.
+
+    Returns `(handle, client, recovery_env_record)` — the THIRD element is `None` on the
+    common path (server was fine) and an `_env_record`-shaped dict (`stage:
+    "env_recovered"`) when a restart happened, for the caller to log. Raises `RuntimeError` if
+    the restart attempt itself fails (GPU wedged, model won't reload) — that is a real reason
+    to stop trying this model, not to retry silently.
+    """
+    try:
+        client.props()
+        return handle, client, None
+    except LlamaCppError:
+        pass
+    print(f"[recover] {model_cfg['name']}: server unresponsive — restarting")
+    try:
+        handle.stop(trim_log_lines=ctx.cfg["llamacpp"].get("keep_log_lines", 400))
+    except Exception:  # noqa: BLE001 — the old process is already gone; nothing to salvage
+        pass
+    time.sleep(ctx.cfg["llamacpp"].get("cooldown_s", 5))
+    try:
+        new_handle = start_server(ctx.cfg, model_cfg, ctx.log_dir, host=ctx.host)
+        new_client = LlamaCppClient(new_handle.base_url,
+                                    timeout_s=ctx.cfg["run"]["request_timeout_s"])
+        _warmup(ctx, new_client, model_cfg)
+    except (RuntimeError, TimeoutError) as exc:
+        raise RuntimeError(f"recovery restart failed: {exc}") from exc
+    env = _env_record(ctx, new_handle, new_client, model_cfg, vram_baseline)
+    env["stage"] = "env_recovered"
+    return new_handle, new_client, env
+
+
 def run_model(ctx: EvalContext, model_cfg: dict, out, *, tasks: set[str], mitigate: bool) -> None:
     name = model_cfg["name"]
     vram_baseline = gpu_memory_used_mb()
@@ -711,6 +958,18 @@ def run_model(ctx: EvalContext, model_cfg: dict, out, *, tasks: set[str], mitiga
         for run_idx in range(runs):
             # Plan first: the feature that matters most gets the data if a run is cut short.
             for scenario in ctx.fixture.scenarios:
+                try:
+                    handle, client, recovery = _ensure_server_alive(
+                        ctx, handle, client, model_cfg, vram_baseline)
+                except RuntimeError as exc:
+                    print(f"[SKIP] {name}: {exc} — abandoning remaining scenarios for this model")
+                    out.write(json.dumps({"model": name, "stage": "error", "error": str(exc)}) + "\n")
+                    out.flush()
+                    return
+                if recovery:
+                    out.write(json.dumps(recovery, default=str) + "\n")
+                    out.flush()
+                    print(f"[recover] {name}: back up, resuming at {scenario.id}")
                 if "plan_a" in tasks:
                     run_mode_a(ctx, client, model_cfg, scenario, run_idx, out, mitigate=mitigate)
                 if "plan_b" in tasks:
@@ -719,6 +978,18 @@ def run_model(ctx: EvalContext, model_cfg: dict, out, *, tasks: set[str], mitiga
                     run_explain(ctx, client, model_cfg, scenario, run_idx, out, mitigate=mitigate)
                 out.flush()
             if "qa" in tasks:
+                try:
+                    handle, client, recovery = _ensure_server_alive(
+                        ctx, handle, client, model_cfg, vram_baseline)
+                except RuntimeError as exc:
+                    print(f"[SKIP] {name}: {exc} — abandoning QA for this model")
+                    out.write(json.dumps({"model": name, "stage": "error", "error": str(exc)}) + "\n")
+                    out.flush()
+                    return
+                if recovery:
+                    out.write(json.dumps(recovery, default=str) + "\n")
+                    out.flush()
+                    print(f"[recover] {name}: back up, resuming QA")
                 for question in ctx.questions:
                     run_qa(ctx, client, model_cfg, question, run_idx, out, mitigate=mitigate)
                 out.flush()
@@ -800,6 +1071,98 @@ def run_eval(
     return out_path
 
 
+def run_model_thinking(
+    ctx: EvalContext, model_cfg: dict, out, *, thinking_budget: int,
+) -> None:
+    """One model, Mode B only, reasoning ON — the thinking-experiment analogue of `run_model`.
+
+    DELIBERATELY NARROWER than `run_model`: no plan_a/qa/explain (this experiment is about
+    Mode B specifically — see `run_mode_b_thinking`'s own docstring for why), and no
+    `_ensure_server_alive` recovery loop, since this pass is short enough (one task, one
+    scenario list) that a crash mid-run is better surfaced as a failure than silently patched
+    over with a fresh warmup — an experimental result should not quietly absorb a restart the
+    way a multi-hour baseline sweep has to.
+    """
+    name = model_cfg["name"]
+    vram_baseline = gpu_memory_used_mb()
+    try:
+        handle = start_server(ctx.cfg, model_cfg, ctx.log_dir, host=ctx.host,
+                              thinking_budget=thinking_budget)
+    except (RuntimeError, TimeoutError) as exc:
+        print(f"[SKIP] {name}: {exc}")
+        out.write(json.dumps({"model": name, "stage": "error", "error": str(exc)}) + "\n")
+        out.flush()
+        return
+
+    client = LlamaCppClient(handle.base_url, timeout_s=ctx.cfg["run"]["request_timeout_s"])
+    try:
+        _warmup(ctx, client, model_cfg)
+        env = _env_record(ctx, handle, client, model_cfg, vram_baseline)
+        env["thinking_budget"] = thinking_budget
+        out.write(json.dumps(env, default=str) + "\n")
+        out.flush()
+        print(f"[env] {name}: vram_delta={env['vram_delta_mb']} offload={env['offload']} "
+              f"n_ctx={env['server_n_ctx']} thinking_budget={thinking_budget}")
+
+        runs = ctx.cfg["run"]["runs_per_pair"]
+        for run_idx in range(runs):
+            for scenario in ctx.fixture.scenarios:
+                run_mode_b_thinking(ctx, client, model_cfg, scenario, run_idx, out,
+                                    thinking_budget=thinking_budget)
+                out.flush()
+            print(f"  [{name}] replicate {run_idx + 1}/{runs} done")
+    finally:
+        handle.stop(trim_log_lines=ctx.cfg["llamacpp"].get("keep_log_lines", 400))
+        time.sleep(ctx.cfg["llamacpp"].get("cooldown_s", 5))
+
+
+def run_thinking_experiment(
+    root: Path, *, models: list[str] | None = None, brackets: list[str] | None = None,
+) -> Path:
+    """Top level for the Mode B pre-plan-reasoning experiment (`--tasks plan_b_thinking`).
+
+    OWN SERVER, OWN RESULTS FILE (`runs_thinking.jsonl`), OWN LOCK — never `run_eval`'s
+    `runs_baseline.jsonl`. The baseline launches every model with `--reasoning off
+    --reasoning-budget 0`; this launches with reasoning ON and `thinking.budget_tokens` (see
+    config.yaml). Those are two different `argv`s for two different server processes, so
+    keeping the results apart is what makes "reasoning on vs. off, same prompt, same schema,
+    same scorer" a comparison that means something, rather than one file mixing two settings.
+
+    NOT in `run.default_tasks` — this only runs when asked for by name, exactly like
+    `converge` used to before it was folded into `--tasks`, except this one stays opt-in on
+    purpose: it is a genuine experiment (does reasoning change the plan?), not a mode the app
+    ships, and every sweep paying its cost by default would be measuring something nobody asked
+    for.
+    """
+    ctx = load_context(root)
+    thinking_cfg = ctx.cfg.get("thinking") or {}
+    if not thinking_cfg:
+        raise SystemExit(
+            "config.yaml has no `thinking:` block — add `thinking: {budget_tokens: N}` to use "
+            "--tasks plan_b_thinking."
+        )
+    budget = int(thinking_cfg.get("budget_tokens", 512))
+
+    selected = [
+        m for m in ctx.cfg["models"]
+        if (not models or m["name"] in models) and (not brackets or m.get("bracket") in brackets)
+    ]
+    if not selected:
+        raise SystemExit("No models matched the filter.")
+
+    out_path = ctx.results_dir / "runs_thinking.jsonl"
+    with _run_lock(ctx.results_dir, "thinking"):
+        write_meta(ctx, "thinking", selected, {"plan_b_thinking"})
+        mode = "a" if out_path.exists() else "w"
+        print(f"[run] {len(selected)} model(s), thinking_budget={budget} -> {out_path} "
+              f"(mode={mode})")
+        with out_path.open(mode) as out:
+            for model_cfg in selected:
+                print(f"\n=== {model_cfg['name']} (thinking, budget={budget}) ===")
+                run_model_thinking(ctx, model_cfg, out, thinking_budget=budget)
+    return out_path
+
+
 def write_meta(ctx: EvalContext, tag: str, selected: list[dict], tasks: set[str]) -> None:
     scenario = ctx.fixture.scenarios[0]
     meta = {
@@ -818,35 +1181,53 @@ def write_meta(ctx: EvalContext, tag: str, selected: list[dict], tasks: set[str]
             "courses": len(ctx.fixture.catalog),
             "requirement_groups": len(ctx.fixture.requirement_groups),
         },
-        # Mode B's whole context. Recorded per table, not just as one hash: when the export
-        # changes, "which table moved" is the first question, and a single digest cannot answer
-        # it. Its bytes are already inside plan_mode_b's static hash — this is the readable copy.
-        "mock_db": {
-            "path": ctx.database.path.name,
-            "hash": ctx.database.db_hash,
-            "tables": {t: {"rows": len(ctx.database.rows(t)), "hash": ctx.database.files[t]}
-                       for t in ctx.database.tables},
+        # Mode B's whole context — ONE PER SCENARIO now that each scenario's own
+        # gen_ed_preference/world_language narrows the real database differently (see
+        # `harness/real_db.py`'s module docstring). Recorded per table, not just as one hash:
+        # when an export changes, "which table moved" is the first question, and a single
+        # digest cannot answer it. Its bytes are already inside that scenario's plan_mode_b
+        # static hash below — this is the readable copy.
+        "database_by_scenario": {
+            s.id: {
+                "path": (db := ctx.database_for(s)).path.name,
+                "hash": db.db_hash,
+                "program_name": next((r.get("name") for r in db.rows("programs")), None),
+                "gen_ed_preference": s.gen_ed_preference,
+                "world_language": (list(s.world_language) if s.world_language else None),
+                # WHAT FRACTION OF THE FIXTURE'S OWN COURSE UNIVERSE this scenario was shown.
+                # Mode B is scored against its own `database_for(s)` now (`real_scoring.py`), so
+                # this is no longer a scorer-correctness signal — it is a "did
+                # `real_db.program_id`/`--major` point at the program the fixture's scenarios
+                # (student names, completed courses, credit targets) were actually written for"
+                # signal. `report._guards` reads it back and flags a run where they diverge as
+                # probably testing the wrong program, not as producing meaningless numbers.
+                "fixture_overlap": (
+                    round(len(db.course_codes & set(ctx.fixture.by_code))
+                          / len(ctx.fixture.by_code), 3)
+                    if ctx.fixture.by_code else None
+                ),
+                # Iterate `files`, not `tables`: `files` is keyed to exactly
+                # `catalog_export.TABLES` (every table `render_context` prints,
+                # `unresolved_requirement_groups` included), while `tables` could in principle
+                # hold something wider that never got hashed.
+                "tables": {t: {"rows": len(db.rows(t)), "hash": h} for t, h in db.files.items()},
+            }
+            for s in ctx.fixture.scenarios
         },
         "static_hashes": {
+            # Mode A/QA/Explain never read the database (see `PromptBuilder`), so one
+            # representative scenario's hash stands in for all of them here — their prompts
+            # still individually vary by scenario feedback/profile, exactly as before this
+            # refactor; only Mode B's hash is genuinely per-scenario now.
             "plan_mode_a": ctx.prompts.plan_proposal(scenario, generate_plan(
                 scenario.profile, ctx.fixture.catalog))[2],
-            "plan_mode_b": ctx.prompts.plan_freeform(scenario)[2],
+            "plan_mode_b_by_scenario": {
+                s.id: ctx.prompts_for(s).plan_freeform(s)[2] for s in ctx.fixture.scenarios
+            },
             "qa": ctx.prompts.grounded_qa("x", [])[2],
             "explain": ctx.prompts.explain_plan("x", "{}")[2],
         },
     }
-    if ctx.sample_plan is not None:
-        # Recorded separately from fixture_hash on purpose: the sample plan is prompt input,
-        # not scoring authority. It cannot change a Mode A/B score, and folding it into
-        # fixture_hash would invalidate those records for a change they never saw.
-        meta["sample_plan"] = {
-            "path": ctx.sample_plan.path.name,
-            "hash": ctx.sample_plan.plan_hash,
-            "url": ctx.sample_plan.source.get("url"),
-            "semesters": len(ctx.sample_plan.semesters),
-            "named_courses": len(ctx.sample_plan.slot_of),
-            "off_catalog_codes": sorted(ctx.sample_plan.off_catalog_codes),
-        }
     (ctx.results_dir / f"meta_{tag}.json").write_text(json.dumps(meta, indent=2))
     if not ctx.fixture.verified:
         print("[meta] NOTE: plan fixture is marked verified: false — rankings are usable, "

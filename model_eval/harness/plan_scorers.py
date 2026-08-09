@@ -17,17 +17,36 @@ WHAT IS MEASURED
     coreq_violation          a COREQUISITE is neither already complete nor scheduled in the
                              same term. Corequisites are the exception to the rule above:
                              taking them together is what the catalog actually permits
-    term_offering_violation  scheduled in a term the course is not offered
-    credit_cap_violation     semester credits exceed the profile's cap
-    duplicate_course         the same course twice, or a course already completed
-    major_overload_violation more than ``max_major_courses_per_semester`` courses from the
-                             major's own subject in one term (default: more than 3 CS courses)
+
+  NOT a hard violation, not even soft — REMOVED FROM SCORING ENTIRELY, 2026-08-07:
+  duplicate_course (the same course twice, or a course already completed). It stays a real,
+  registration-wall-shaped mistake — Banner will not enroll a student in a course twice or
+  re-enroll them in one already completed — but a plan that is otherwise flawless should not
+  be scored the same as one with a genuine, unfixable prerequisite error just because it
+  repeated one line. `dedupe_semesters()` below deletes every later occurrence (or the whole
+  occurrence if it duplicates a completed course) BEFORE scoring runs at all, the same way
+  Mode C's `repair` variant already deleted duplicates deterministically — this generalizes
+  that to every mode instead of just one variant. What is removed is tracked, not discarded:
+  every caller reports it back as `duplicates_removed`, so a model that keeps re-listing
+  courses is still visible in the record, just not folded into PLAN_VIABLE.
 
   Soft (recorded, NOT part of PLAN_VIABLE):
 
     soft_major_overloads     semesters holding more major-subject courses than
-                             ``preferred_major_courses_per_semester`` but within the hard cap
-                             (default: exactly 3 CS courses)
+                             ``preferred_major_courses_per_semester``. Was a hard
+                             `major_overload_violation` above ``max_major_courses_per_semester``
+                             until 2026-08-07 — a heavy major-course term is the student's own
+                             call to adjust, same as a heavy credit term, not a registration wall
+    soft_credit_overages     semesters over the student's stated ``max_credits_per_semester``.
+                             Was a hard `credit_cap_violation` above ``hard_credit_cap`` until
+                             2026-08-07 — removed entirely, not just softened, because the
+                             registrar's ceiling is as changeable as the student's own ask, and
+                             neither reflects something the student can't fix by asking
+
+  REMOVED ENTIRELY, 2026-08-07 (not even soft): term_offering_violation. Whether a given course
+  actually runs in a given future term is not knowable from this data — Purdue's published
+  offering pattern is a historical observation, not a guarantee — so scoring against it charged
+  models for a fact the harness itself could not verify.
 
   Completeness:
 
@@ -37,31 +56,25 @@ WHAT IS MEASURED
 
   PLAN_VIABLE = zero hard violations AND requirement_coverage == 1.0 within the horizon.
   That conjunction is the number to compare models on. ``violations`` is reported alongside
-  it so a near-miss (one bad term offering) is visibly different from a plan that invented
+  it so a near-miss (one missed prerequisite) is visibly different from a plan that invented
   six courses.
 
 DELIBERATELY NOT SCORED HERE: whether the plan is *pleasant* — workload balance, spreading
-theory courses, summer usage. Those are preferences, not correctness, and rolling them into
-the headline number would let a model trade a real prerequisite violation against a nicer
-credit distribution. They are recorded as diagnostics (``credit_spread``) and left out of
-PLAN_VIABLE on purpose.
-
-THE MAJOR-COURSE CAP IS THE ONE EXCEPTION, and it is deliberate. Four or five CS courses in a
-term is not a registration wall — the registrar will happily let a student sign up for it — so
-by the standard above it belongs with the preferences. It is scored anyway because a plan a
-student abandons in week six is not a plan, and because the models kept producing exactly that:
-the transcripts are full of 4- and 5-CS semesters, and so, until this landed, was the
-deterministic planner's own output. The soft/hard split is what keeps the trade honest: three
-CS courses is a bad term and is recorded as one, four is treated as the plan being wrong.
+theory courses, summer usage, a heavy major-course term. Those are preferences, not
+correctness, and rolling them into the headline number would let a model trade a real
+prerequisite violation against a nicer-looking schedule. They are recorded as diagnostics
+(``credit_spread``, ``soft_major_overloads``, ``soft_credit_overages``) and left out of
+PLAN_VIABLE on purpose — a student adjusts a heavy term by asking; a missed prerequisite
+is not adjustable after the fact.
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
-from .fixtures import Fixture, SamplePlan
+from .fixtures import Fixture
 from .planner import Plan, Profile, first_planning_term, is_major_course, next_term
 
 _COURSE_CODE_RE = re.compile(r"\b([A-Z]{2,5})\s?-?\s?(\d{3,5})\b")
@@ -81,6 +94,46 @@ def normalize_code(code: str) -> str:
     return compact
 
 
+def dedupe_semesters(
+    semesters: list[list[str]], *, canon: Callable[[str], str], completed: set[str],
+) -> tuple[list[list[str]], list[str]]:
+    """Delete every later occurrence of a repeated course, and every occurrence of a course
+    already completed, BEFORE any scoring runs. Keeps the FIRST placement of anything else.
+
+    Called once, by every mode, on the model's raw semesters — right after parsing (Mode B) or
+    right after `apply_locked_slots` (Mode C), before `score_plan`/`score_against_real_db` ever
+    see the plan. Neither scorer has to know this happened: cleaned input simply never contains
+    a duplicate to flag. ``canon`` must already fold approved substitutes to the same key the
+    caller's own scorer uses (``fixture.canonical`` for `plan_scorers`, the DB's `alias_of` map
+    for `real_scoring`) — two spellings of the same course are one course for this purpose.
+
+    Returns (cleaned_semesters, removed) where ``removed`` is a human-readable line per deleted
+    occurrence, in semester order — the record this drops the "duplicate_course" violation in
+    favour of, see this module's docstring.
+    """
+    seen: set[str] = set()
+    cleaned: list[list[str]] = []
+    removed: list[str] = []
+    for index, courses in enumerate(semesters):
+        kept: list[str] = []
+        for raw in courses:
+            code = normalize_code(raw)
+            key = canon(code)
+            if key in seen:
+                removed.append(f"{code} (semester {index + 1}) — duplicate, removed before scoring")
+                continue
+            if key in completed:
+                removed.append(
+                    f"{code} (semester {index + 1}) — already completed before the plan "
+                    f"starts, removed before scoring"
+                )
+                continue
+            seen.add(key)
+            kept.append(raw)
+        cleaned.append(kept)
+    return cleaned, removed
+
+
 @dataclass
 class PlanScore:
     structure_ok: bool = False          # did we get a parseable plan at all?
@@ -97,6 +150,7 @@ class PlanScore:
     semesters_available: int = 0
     major_courses_per_semester: list[int] = field(default_factory=list)
     soft_major_overloads: int = 0       # semesters over the preferred cap but within the hard one
+    soft_credit_overages: int = 0       # semesters over the STUDENT's cap but within the registrar's
     hallucinated: list[str] = field(default_factory=list)
     assertions_passed: dict[str, bool] = field(default_factory=dict)
 
@@ -116,6 +170,7 @@ class PlanScore:
             "semesters_available": self.semesters_available,
             "major_courses_per_semester": self.major_courses_per_semester,
             "soft_major_overloads": self.soft_major_overloads,
+            "soft_credit_overages": self.soft_credit_overages,
             "hallucinated_courses": self.hallucinated,
             "assertions_passed": self.assertions_passed,
         }
@@ -230,22 +285,17 @@ def score_plan(
                 flag("hallucinated_course", f"{code} (semester {index + 1}) is not in the catalog")
                 continue
             key = canon(code)
-            alias = f" (counts as {key})" if key != code else ""
-            if key in seen:
-                flag("duplicate_course", f"{code}{alias} appears more than once")
-            elif key in completed:
-                flag("duplicate_course",
-                     f"{code}{alias} was already completed before the plan starts")
+            if key in seen or key in completed:
+                # Every real caller runs `dedupe_semesters` before scoring, so this should
+                # never fire in practice — kept as a defensive SKIP, not a violation, so a
+                # caller that forgot to dedupe still cannot fail a plan over a duplicate the
+                # way it would over a genuine one. See this module's docstring.
+                continue
             seen.add(key)
 
             credits += course.credits
             if is_major_course(code, profile.major_subject):
                 major_courses += 1
-            if course.offered_terms and term not in course.offered_terms:
-                flag(
-                    "term_offering_violation",
-                    f"{code} in {term} {year}; offered {'/'.join(course.offered_terms)}",
-                )
             missing = [p for p in course.prereqs if canon(normalize_code(p)) not in available]
             if missing:
                 flag(
@@ -270,24 +320,18 @@ def score_plan(
 
         score.semester_credits.append(credits)
         score.major_courses_per_semester.append(major_courses)
+        # SOFT ONLY, never gates PLAN_VIABLE — a heavy semester is the student's own call and
+        # can change from one advising conversation to the next; it is not a registration wall
+        # the way a missed prerequisite is. It IS still scored — via the `max_credits_at_most`
+        # assertion, which is where a term the student did not ask for belongs.
         if credits > profile.max_credits_per_semester:
-            flag(
-                "credit_cap_violation",
-                f"semester {index + 1} has {credits} credits, cap is "
-                f"{profile.max_credits_per_semester}",
-            )
-        subject = profile.major_subject
-        if major_courses > profile.max_major_courses_per_semester:
-            flag(
-                "major_overload_violation",
-                f"semester {index + 1} has {major_courses} {subject} courses, the limit is "
-                f"{profile.max_major_courses_per_semester}",
-            )
-        elif major_courses > soft_major_cap:
-            # SOFT: recorded, never flagged. It stays out of `counts` so it cannot change
-            # PLAN_VIABLE — a term the student would find heavy is not a term that stops them
-            # registering, and conflating the two would let a model trade a prereq violation
-            # against a nicer workload.
+            score.soft_credit_overages += 1
+        # SOFT ONLY, same call as the credit cap above and for the same reason: a heavy major
+        # course load is the student's own call to adjust, not a registration wall, so it no
+        # longer gates PLAN_VIABLE. `max_major_courses_per_semester` stays the higher of the
+        # two thresholds this counts against; `preferred_major_courses_per_semester` no longer
+        # needs its own separate min() cap now that neither one is a hard violation.
+        if major_courses > soft_major_cap:
             score.soft_major_overloads += 1
         completed |= {canon(c) for c in codes if c in by_code}
 
@@ -435,16 +479,23 @@ def score_proposal(
     }
 
 
-def rationale_flags(rationale: str, planned_codes: set[str], fixture: Fixture) -> list[str]:
+def rationale_flags(
+    rationale: str, planned_codes: set[str], known_codes: "set[str] | dict[str, Any]"
+) -> list[str]:
     """Course codes the rationale claims about that aren't in the plan or the catalog.
 
     Same triage-only status as ``scorers.faithfulness_flags``: it catches entity invention,
     not "CS 38100 will be easier in the spring"-style relational fiction.
+
+    ``known_codes`` takes a plain membership container rather than a ``Fixture`` — Mode A
+    passes ``ctx.fixture.by_code`` (its course universe is genuinely the fixture's), Mode B
+    passes ``ctx.database.course_codes`` (the real database it was actually shown). Only ``in``
+    is ever called on it, so either shape works.
     """
     flags: list[str] = []
     for subject, number in _COURSE_CODE_RE.findall(rationale.upper()):
         code = normalize_code(f"{subject} {number}")
-        if code not in fixture.by_code:
+        if code not in known_codes:
             flags.append(f"rationale cites unknown course: {code}")
         elif code not in planned_codes:
             flags.append(f"rationale cites course not in the plan: {code}")
@@ -453,54 +504,3 @@ def rationale_flags(rationale: str, planned_codes: set[str], fixture: Fixture) -
 
 def plan_to_semesters(plan: Plan) -> list[list[str]]:
     return [semester.courses for semester in plan.semesters]
-
-
-# --- Mode C: did the published sample plan get used, or copied? ------------------------------
-
-
-def template_anchoring(
-    sample: SamplePlan, semesters: list[list[str]], hallucinated: list[str],
-    canonical: dict[str, str] | None = None,
-) -> dict[str, Any]:
-    """How closely a plan tracks the published sample plan. DIAGNOSTIC — never scored.
-
-    Mode C's risk is not that a model ignores the reference; it is that the model reproduces it
-    for a student it does not describe. Seven of the eight scenarios differ from the sample
-    plan's assumed student (spring start, 12-credit cap, courses already completed, four
-    semesters left), so on those the *right* answer looks LESS like the template, not more.
-    A rise in ``slot_match`` next to a rise in term-offering or credit-cap violations is the
-    signature of anchoring, and no other column in the harness shows it.
-
-    Computed for Mode B as well as Mode C. Mode B never sees the sample plan, so its slot_match
-    is the base rate — how much of the template a model reproduces from parametric memory alone
-    — and the Mode C minus Mode B delta is what the reference material actually bought.
-
-    ``off_catalog_from_reference`` splits hallucinations by origin: a code the sample plan
-    dangled but the catalog does not have, versus one the model invented freehand. Only the
-    first is a cost the reference material created. NOTE: with the current fixture this is
-    zero by construction — every code the plan cites was adopted into the catalog on
-    2026-07-27 — so it reads as a guard against a future major's plan, not a live signal.
-
-    Substitutes are collapsed onto their primary first, so a model that schedules MA 16500 in
-    the slot the plan gives MA 16100 is correctly counted as having followed the template.
-    """
-    canon = (lambda c: (canonical or {}).get(c, c))
-    slot_of = {canon(k): v for k, v in sample.slot_of.items()}
-    matched = placed = 0
-    for index, codes in enumerate(semesters):
-        for raw in codes:
-            code = canon(normalize_code(raw))
-            if code not in slot_of:
-                continue
-            placed += 1
-            matched += slot_of[code] == index
-
-    off_catalog = {normalize_code(c) for c in sample.off_catalog_codes}
-    from_reference = sorted({normalize_code(c) for c in hallucinated} & off_catalog)
-    return {
-        "template_slot_match": round(matched / placed, 4) if placed else None,
-        "template_courses_placed": placed,
-        "template_courses_available": len(slot_of),
-        "off_catalog_from_reference": from_reference,
-        "sample_plan_hash": sample.plan_hash,
-    }

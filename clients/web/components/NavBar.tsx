@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import ModelPicker from "./ModelPicker";
 
 const links = [
   { href: "/", label: "Planner" },
@@ -42,6 +43,9 @@ export default function NavBar() {
                 </Link>
               );
             })}
+            <div className="ml-1 border-l border-[var(--stroke)] pl-2 md:ml-2 md:pl-3">
+              <ModelPicker />
+            </div>
           </div>
         </div>
       </nav>

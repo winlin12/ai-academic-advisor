@@ -1,0 +1,43 @@
+# =============================================================================
+# LOCKED SLOTS — Mode C (retry-to-convergence) only.
+#
+# See `cs_machine_intelligence.locked_slots.yaml`'s header for the full rationale (why this is
+# a separate file, not folded into `fixture_hash`, and why every slot below is lifted from the
+# deterministic planner's own output rather than hand-invented). Nothing here differs in kind —
+# only in program.
+#
+# CHOICE OF SLOTS: one shallow anchor (a zero-prereq course, semester 0) and one DEEP anchor —
+# `BCHM 30700` (Biochemistry), pinned per scenario at the deterministic planner's own
+# placement — it sits behind the CHM 12901/12902 -> CHM 25600 organic chemistry
+# sequence, this fixture's longest prerequisite chain, the same role ME 46300 plays in
+# `mechanical_engineering.yaml`.
+# Every scenario opens with a zero-prereq ANSC course at semester 0.
+#
+# `run.py run --tasks converge --preflight` re-verifies every lock below is legal where pinned
+# before spending any GPU time on this fixture.
+# =============================================================================
+
+source:
+  derived_from: "harness/planner.generate_plan, 2026-08-09"
+  fixture: "agriculture_animal_sciences.yaml"
+  note: >-
+    Slots are positions in the planning horizon, 0-based: semester_index 0 is
+    the student's start term. They are NOT catalog facts and are not scored
+    against the catalog; they are the student's stated intent.
+
+scenarios:
+  prevet-fresh-start:
+    - {semester_index: 0, course: "ANSC 10200"}
+    - {semester_index: 4, course: "BCHM 30700"}
+
+  prevet-sophomore-catchup:
+    - {semester_index: 0, course: "ANSC 12100"}
+    - {semester_index: 4, course: "BCHM 30700"}
+
+  prevet-light-load:
+    - {semester_index: 0, course: "ANSC 10200"}
+    - {semester_index: 4, course: "BCHM 30700"}
+
+  prevet-spring-start:
+    - {semester_index: 0, course: "ANSC 10200"}
+    - {semester_index: 4, course: "BCHM 30700"}

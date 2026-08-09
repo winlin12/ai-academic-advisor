@@ -3,13 +3,29 @@
 
   python run.py doctor                      diagnose local llama-server reachability
   python run.py check                       validate fixture, prompts, GPU, model files
+  python run.py check --major "nursing"        same, but against a different school's plan
+                                             fixture — matches plan_fixtures/*.yaml by slug,
+                                             filename, or program name (also works on `run`)
   python run.py serve <model>               launch llama-server for one model and hold it
+  python run.py run                         EVERY SCHOOL in plan_fixtures/, one after another,
+                                             each into its own results/results_<slug>/ — see
+                                             run.default_tasks for the task set each one runs
+  python run.py run --major cs              just one school (see `check --major` above)
   python run.py run [--models a,b] [--brackets 8gb,coder] [--tasks plan_a,plan_b,qa]
   python run.py run --mitigate --models X   mitigation pass (multi-iteration revise loop)
-  python run.py converge --preflight        MODE C: validate locked slots, spend no GPU time
-  python run.py converge [--variants blind,feedback] [--models a,b] [--scenarios id]
-  python run.py converge-report             results/convergence_report.md
-  python run.py report                      plan tables + validity guards + review queue
+  python run.py run --major cs --tasks converge --preflight   MODE C only: validate locked
+                                             slots, spend no GPU time (needs --major: only
+                                             schools with a *.locked_slots.yaml sibling support it)
+  python run.py run --major cs --tasks converge [--variants blind,feedback] [--scenarios id]
+  python run.py run --major cs --tasks plan_b_thinking   Mode B with reasoning ON, budget-
+                                             capped at config.yaml's thinking.budget_tokens —
+                                             own server, own results/runs_thinking.jsonl,
+                                             never mixed with the --reasoning off baseline
+  python run.py report                      results/report.md for the CURRENTLY CONFIGURED
+                                             fixture: plan tables, Mode C, validity guards,
+                                             review queue — one file, every mode
+  python run.py report --all                results/summary.md aggregating every
+                                             results/results_<slug>/ the multi-school run wrote
   python run.py parity                      check the vendored planner against the app's
   python run.py fixture-check               diff the plan fixture against the catalog DB
 
@@ -22,6 +38,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import signal
 import socket
 import sys
 from pathlib import Path
@@ -29,45 +47,95 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 
 
+def _install_sigterm_handler() -> None:
+    """Make an external SIGTERM unwind exactly like Ctrl-C, instead of killing the process
+    outright.
+
+    Python installs a handler for SIGINT (Ctrl-C) that raises KeyboardInterrupt, which is why
+    `run.py serve`'s `except KeyboardInterrupt: handle.stop()` and `run_eval`'s
+    `try/finally: handle.stop()` / `_run_lock`'s `try/finally: lock.unlink()` all work under
+    Ctrl-C. SIGTERM gets no such treatment by default — the process dies immediately, the
+    finally blocks never run, and the llama-server subprocess (holding several GB of VRAM) and
+    the `.{tag}.lock` file are both left behind. `timeout <n> run.py ...` and a plain
+    `kill <pid>` both send SIGTERM, not SIGINT, and the harness's own launch pattern (nohup +
+    disown, run in the background) means there is no terminal for Ctrl-C to reach even when a
+    human wants to stop it cleanly. Installing this at the very top of `main()`, before any
+    subcommand runs, is what makes every one of those paths — `run`, `converge`, `serve` —
+    release the GPU on the way out instead of only doing so when asked nicely.
+    """
+    def _raise_keyboard_interrupt(signum: int, frame: object) -> None:
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
+
+
 def main() -> None:
+    _install_sigterm_handler()
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("doctor", help="diagnose local llama-server setup")
-    sub.add_parser("check", help="validate fixture, prompts, GPU, and model files")
-    sub.add_parser("report", help="generate results/report.md")
+    checkp = sub.add_parser("check", help="validate fixture, prompts, GPU, and model files")
+    checkp.add_argument(
+        "--major", help="match plan_fixtures/*.yaml by slug, filename, or program name "
+                        "(substring, case-insensitive) and use that school for every mode — "
+                        "errors (does not prompt) if more than one fixture matches")
+    reportp = sub.add_parser("report", help="generate results/report.md")
+    reportp.add_argument("--all", action="store_true",
+                         help="aggregate every results/results_<slug>/ into results/summary.md "
+                              "instead of reporting on the single currently-configured fixture")
     sub.add_parser("parity", help="check the vendored planner against the app's")
     sub.add_parser("fixture-check", help="diff the plan fixture against the catalog DB")
     sub.add_parser("refresh-offerings",
                    help="rewrite the fixture's offered_terms from observed PurdueIO offerings")
-    sub.add_parser("build-mock-db",
-                   help="regenerate mock_db/ from the plan fixture (run after editing it)")
-
     servep = sub.add_parser("serve", help="launch llama-server for one model and hold it")
     servep.add_argument("model", help="model name from config.yaml")
 
-    convp = sub.add_parser(
-        "converge", help="MODE C: retry-to-convergence (attempts + wall clock, censored)")
-    convp.add_argument("--models", help="comma-separated model names (default: all)")
-    convp.add_argument("--brackets", help="comma-separated brackets: 8gb,coder,server,reference")
-    convp.add_argument("--variants", help="comma-separated: blind,feedback (default: both)")
-    convp.add_argument("--scenarios", help="comma-separated scenario ids (default: all)")
-    convp.add_argument("--preflight", action="store_true",
-                       help="validate locked slots and print the prereq-risk note, then stop")
-
-    sub.add_parser("converge-report", help="results/convergence_report.md")
-
-    runp = sub.add_parser("run", help="execute the evaluation")
+    runp = sub.add_parser(
+        "run", help="every school by default (results/results_<slug>/ each); --major for one")
     runp.add_argument("--models", help="comma-separated model names (default: all)")
     runp.add_argument("--brackets", help="comma-separated brackets: 8gb,coder,server,reference")
-    runp.add_argument("--tasks", help="comma-separated: plan_a,plan_b,qa,explain")
+    runp.add_argument(
+        "--tasks", help="comma-separated: plan_a,plan_b,qa,explain,converge,plan_b_thinking "
+                        "(default: config.yaml's run.default_tasks, which does NOT include "
+                        "plan_b_thinking — opt in explicitly; converge is dropped "
+                        "automatically for any school with no matching *.locked_slots.yaml)")
     runp.add_argument("--mitigate", action="store_true",
                       help="mitigation mode: multi-iteration revise loop; writes "
-                           "runs_mitigated.jsonl")
+                           "runs_mitigated.jsonl (plan_a/plan_b/qa/explain only)")
+    runp.add_argument("--major", help="run just one school instead of every school — see "
+                                      "`check --major`")
+    # converge-only knobs. No-ops unless "converge" is in --tasks.
+    runp.add_argument("--variants", help="converge only: comma-separated blind,feedback "
+                                         "(default: config.yaml's convergence.enabled_variants)")
+    runp.add_argument("--scenarios", help="converge only: comma-separated scenario ids "
+                                          "(default: all)")
+    runp.add_argument("--preflight", action="store_true",
+                      help="converge only: validate locked slots and print the prereq-risk "
+                           "note, then stop — spends no GPU time and runs no other task")
 
     args = ap.parse_args()
+
+    # RESOLVED ONCE, BEFORE DISPATCH, for every subcommand that touches a fixture/database
+    # (check and run both eventually call `harness.runner.load_context`, which prefers
+    # MODEL_EVAL_PLAN_FIXTURE / MODEL_EVAL_REAL_DB_PROGRAM_ID over config.yaml's own paths).
+    # Setting both env vars here, once, is what lets a single `--major` flag reach every
+    # downstream caller without threading new parameters through `load_context`'s signature.
+    #
+    # `--major` selects a PLAN FIXTURE (see `resolve_major`), not a live database search any
+    # more (that was `harness.real_db.resolve_major_interactive`, still there and still used by
+    # `harness/real_db.py` internally — this only changed how `run.py` picks a program_id).
+    # Mode A's fixture and Mode B/C's real-db program now always move together, read off the
+    # SAME fixture's own `program.real_db_program_id`.
+    if getattr(args, "major", None):
+        fixture_path = resolve_major(args.major)
+        slug, program_id, name = _fixture_meta(fixture_path)
+        os.environ["MODEL_EVAL_PLAN_FIXTURE"] = str(fixture_path.relative_to(ROOT))
+        if program_id:
+            os.environ["MODEL_EVAL_REAL_DB_PROGRAM_ID"] = program_id
+        print(f"[major] {args.major!r} -> {slug} ({name})")
 
     if args.cmd == "doctor":
         doctor()
@@ -76,39 +144,225 @@ def main() -> None:
     elif args.cmd == "serve":
         serve(args.model)
     elif args.cmd == "run":
-        from harness.runner import ConcurrentRunError, run_eval
-        try:
-            _run(args, run_eval)
-        except ConcurrentRunError as exc:
-            # A guard, not a crash — print the reason and the fix, not a traceback.
-            print(f"refusing to start: {exc}")
-            sys.exit(1)
-    elif args.cmd == "converge":
-        converge(args)
-    elif args.cmd == "converge-report":
-        from harness.convergence_report import generate_report as convergence_report
-        print(f"wrote {convergence_report(ROOT)}")
+        _run(args)
     elif args.cmd == "report":
-        from harness.report import generate_report
-        generate_report(ROOT)
+        if getattr(args, "all", False):
+            from harness.report import generate_summary
+            generate_summary(ROOT)
+        else:
+            from harness.report import generate_report
+            generate_report(ROOT)
     elif args.cmd == "parity":
         parity()
     elif args.cmd == "fixture-check":
         fixture_check()
     elif args.cmd == "refresh-offerings":
         refresh_offerings()
-    elif args.cmd == "build-mock-db":
-        build_mock_db()
 
 
-def _run(args, run_eval) -> None:
-    run_eval(
-        ROOT,
-        models=args.models.split(",") if args.models else None,
-        brackets=args.brackets.split(",") if args.brackets else None,
-        tasks=args.tasks.split(",") if args.tasks else None,
-        mitigate=args.mitigate,
+# --- plan-fixture selection (multi-school) ------------------------------------------------------
+#
+# `--major` USED TO mean "search the live catalog_ingestion `programs` table and point Mode B/C
+# at whatever matches" (`harness.real_db.resolve_major_interactive`) while Mode A stayed on
+# whatever fixture config.yaml happened to name — the two could (and did) silently describe
+# different programs. As of 2026-08-08, a plan fixture is the unit of selection for every mode:
+# each `plan_fixtures/*.yaml` names its own `real_db_program_id`, so picking a fixture picks
+# Mode A *and* Mode B/C's program together. `harness/real_db.py` itself is untouched — it still
+# does every Postgres round trip exactly as before; only WHICH program_id reaches it changed.
+
+
+def discover_fixtures() -> list[Path]:
+    """Every plan fixture available for `--major`/the multi-school default loop, sorted for
+    stable output. `*.locked_slots.yaml` sidecars are not fixtures themselves."""
+    return sorted(
+        p for p in (ROOT / "plan_fixtures").glob("*.yaml")
+        if not p.name.endswith(".locked_slots.yaml")
     )
+
+
+def _fixture_meta(path: Path) -> tuple[str, str, str]:
+    """(slug, real_db_program_id, program_name) read straight off the YAML — cheaper than a
+    full `load_fixture` (no course/scenario parsing) for listing/matching."""
+    import yaml
+    data = yaml.safe_load(path.read_text())
+    program = data.get("program") or {}
+    return (str(program.get("slug") or path.stem),
+            str(program.get("real_db_program_id") or ""),
+            str(program.get("name") or path.stem))
+
+
+def resolve_major(search_text: str) -> Path:
+    """Match `--major` against the plan_fixtures list (slug, filename stem, or program name,
+    case-insensitive substring) and return exactly one fixture path. No stdin prompt on an
+    ambiguous match — unlike a live database's hundreds of programs, the fixture list is short
+    enough to just print the candidates and ask for a more specific string, which also keeps
+    this safe to call from a non-interactive/background run.
+    """
+    search = search_text.strip().lower()
+    all_fixtures = [(p, *_fixture_meta(p)) for p in discover_fixtures()]
+    # EXACT SLUG MATCH WINS OUTRIGHT, before falling back to substring matching — a short slug
+    # like "me" or "ag" is otherwise a substring of unrelated program names ("Ele-ME-ntary",
+    # pre-veterinary "Medi-ci-ne"), which made the intended, unique, cheap-to-type identifier
+    # report a false ambiguity against schools that merely happen to contain those letters.
+    exact = [(p, slug, name) for p, slug, pid, name in all_fixtures if slug.lower() == search]
+    if len(exact) == 1:
+        return exact[0][0]
+    matches = [(p, slug, name) for p, slug, pid, name in all_fixtures
+               if search in slug.lower() or search in p.stem.lower() or search in name.lower()]
+    if not matches:
+        listing = "\n".join(f"  - {slug} ({p.name}): {name}" for p, slug, pid, name in all_fixtures)
+        raise SystemExit(f"--major {search_text!r} matched none of the available schools:\n{listing}")
+    if len(matches) > 1:
+        listing = "\n".join(f"  - {slug} ({p.name}): {name}" for p, slug, name in matches)
+        raise SystemExit(
+            f"--major {search_text!r} matched {len(matches)} schools — be more specific:\n{listing}")
+    return matches[0][0]
+
+
+# --- run -----------------------------------------------------------------------------------------
+
+
+def _run(args) -> None:
+    """One entry point for every mode, Mode C (`converge`) included — `--tasks` picks which.
+
+    `--major` given: run that one school (see `resolve_major`), same as always. `--major`
+    omitted: run EVERY school in `plan_fixtures/`, one after another, each into its own
+    `results/results_<slug>/` — see `_run_all_schools`. This is a real behavior change
+    (2026-08-08): the bare `run.py run` used to mean "the one fixture config.yaml currently
+    names," and now means "everything" — a single school is now the thing you have to ask for.
+    """
+    if getattr(args, "major", None):
+        _run_single(args)
+    else:
+        _run_all_schools(args)
+
+
+def _run_single(args, *, results_dir_override: str | None = None) -> None:
+    """One school, one process. `results_dir_override`, when given, points this run's output
+    at `results/results_<slug>/` instead of config.yaml's own `paths.results_dir` — set by
+    `_run_all_schools`, left alone (so a plain `--major` run keeps writing to the normal
+    `results/`) for a single-school invocation.
+
+    USED TO BE TWO COMMANDS (`run` and `converge`), because Mode C has its own results file,
+    own lock, own per-model server-then-loop-variants shape instead of run_eval's
+    per-model-then-per-task shape. That is still true underneath — `run_convergence` is a
+    separate function with a separate schema, unchanged — but there is no reason a caller
+    should have to know that split exists. `--tasks converge` (or the default, which includes
+    it) runs it right after the other tasks, same process, same `--models`/`--brackets` filter.
+    """
+    cfg = _cfg()
+    task_set = {t.strip() for t in args.tasks.split(",")} if args.tasks \
+        else set(cfg["run"]["default_tasks"])
+    if not task_set:
+        raise SystemExit("No tasks left to run.")
+
+    do_converge = "converge" in task_set
+    # `plan_b_thinking` — the pre-plan-reasoning experiment (see `harness.runner.
+    # run_thinking_experiment`). Same special-casing as `converge`: it needs its own server
+    # launch (reasoning ON, budget-capped) and own results file, so it cannot go through
+    # `run_eval`'s normal per-model loop, which launches every model with the baseline's
+    # `--reasoning off`. Deliberately absent from `run.default_tasks` — see that function's
+    # own docstring for why it must stay opt-in.
+    do_thinking = "plan_b_thinking" in task_set
+    eval_tasks = task_set - {"converge", "plan_b_thinking"}
+
+    if args.preflight:
+        # Spends no GPU time, by contract — never falls through to `run_eval` even if other
+        # tasks were also requested.
+        if not do_converge:
+            raise SystemExit("--preflight only means something for the converge task; "
+                             "add it with --tasks converge.")
+        _converge_preflight()
+        return
+
+    if results_dir_override is not None:
+        os.environ["MODEL_EVAL_RESULTS_DIR"] = results_dir_override
+
+    from harness.runner import ConcurrentRunError, run_eval, run_thinking_experiment
+    try:
+        if eval_tasks:
+            run_eval(
+                ROOT,
+                models=args.models.split(",") if args.models else None,
+                brackets=args.brackets.split(",") if args.brackets else None,
+                tasks=list(eval_tasks),
+                mitigate=args.mitigate,
+            )
+        if do_converge:
+            _converge_run(args)
+        if do_thinking:
+            run_thinking_experiment(
+                ROOT,
+                models=args.models.split(",") if args.models else None,
+                brackets=args.brackets.split(",") if args.brackets else None,
+            )
+    except ConcurrentRunError as exc:
+        # A guard, not a crash — print the reason and the fix, not a traceback.
+        print(f"refusing to start: {exc}")
+        sys.exit(1)
+
+
+def _run_all_schools(args) -> None:
+    """`run.py run` with no `--major`: every plan fixture, one after another, each writing to
+    its own `results/results_<slug>/`.
+
+    Mode C is dropped from a school's OWN task set (not the whole sweep's) when that fixture has
+    no `<stem>.locked_slots.yaml` sibling — most schools don't have one (see
+    `harness/convergence.locked_slots_path_for`), and erroring the entire sweep over a task only
+    a couple of sixteen fixtures currently support would be worse than skipping it there and
+    saying so.
+
+    One school's failure (bad fixture, a crash mid-run, a concurrent-run lock) is caught and
+    reported, not raised — a broken school should not cost every other school its results. This
+    is the same shape a hand-written shell loop over `run.py run --major <x>` would have; the
+    difference is it is now what the bare command does.
+    """
+    import copy
+
+    fixtures = discover_fixtures()
+    if not fixtures:
+        raise SystemExit("plan_fixtures/ has no fixtures to run.")
+
+    requested_tasks = {t.strip() for t in args.tasks.split(",")} if args.tasks else None
+    default_tasks = set(_cfg()["run"]["default_tasks"])
+    failed: list[str] = []
+
+    for path in fixtures:
+        slug, program_id, name = _fixture_meta(path)
+        print(f"\n{'=' * 70}\nSCHOOL: {slug} — {name} ({path.name})\n{'=' * 70}")
+
+        os.environ["MODEL_EVAL_PLAN_FIXTURE"] = str(path.relative_to(ROOT))
+        if program_id:
+            os.environ["MODEL_EVAL_REAL_DB_PROGRAM_ID"] = program_id
+        else:
+            print(f"  [WARN] {slug}: no real_db_program_id set on this fixture — Mode B/C "
+                  f"will read whatever program config.yaml's real_db.program_id last pointed "
+                  f"at, almost certainly the wrong one for this school.")
+
+        task_set = set(requested_tasks) if requested_tasks is not None else set(default_tasks)
+        if "converge" in task_set:
+            from harness.convergence import locked_slots_path_for
+            from harness.fixtures import load_fixture
+            if locked_slots_path_for(load_fixture(path)) is None:
+                print(f"  [skip] {slug}: no locked-slots file — dropping `converge` for this "
+                      f"school only.")
+                task_set.discard("converge")
+
+        school_args = copy.copy(args)
+        school_args.tasks = ",".join(sorted(task_set)) if task_set else ""
+        try:
+            _run_single(school_args, results_dir_override=f"results/results_{slug}")
+        except SystemExit as exc:
+            print(f"  [FAILED] {slug}: {exc}")
+            failed.append(slug)
+        except Exception as exc:  # one bad school must not sink the sweep
+            print(f"  [FAILED] {slug}: {type(exc).__name__}: {exc}")
+            failed.append(slug)
+
+    print(f"\n{'=' * 70}")
+    print(f"ALL SCHOOLS DONE — failures: {', '.join(failed)}" if failed
+          else "ALL SCHOOLS DONE — no failures")
+    print(f"{'=' * 70}")
 
 
 def _cfg() -> dict:
@@ -119,85 +373,50 @@ def _cfg() -> dict:
 # --- converge (MODE C) --------------------------------------------------------------------------
 
 
-def converge(args) -> None:
-    """Mode C. ``--preflight`` spends no GPU time; it is what you run after editing locks."""
-    from harness.convergence import (
-        load_locked_slots, preflight, prereq_risk_note, run_convergence,
-    )
-    from harness.runner import ConcurrentRunError
+def _converge_preflight() -> None:
+    """``run --tasks converge --preflight``: spends no GPU time. Run this after editing locks."""
+    from harness.convergence import load_locked_slots, locked_slots_path_for, preflight, prereq_risk_note
+    from harness.runner import load_context
 
-    split = lambda v: v.split(",") if v else None
-
-    if args.preflight:
-        from harness.runner import load_context
-        ctx = load_context(ROOT)
-        conv_cfg = ctx.cfg.get("convergence") or {}
-        if not conv_cfg:
-            print("config.yaml has no `convergence:` block.")
-            sys.exit(1)
-        locked = load_locked_slots(ROOT / conv_cfg["locked_slots"])
-        print(prereq_risk_note(ctx.fixture, conv_cfg))
-        print(f"\nlocked slots: {locked.path.name} (hash {locked.slots_hash})")
-        for scenario in ctx.fixture.scenarios:
-            slots = locked.for_scenario(scenario.id)
-            pins = ", ".join(f"{s.course}@{s.semester_index + 1}" for s in slots) or "none"
-            print(f"  {scenario.id:24s} {pins}")
-        problems = preflight(ctx, locked, conv_cfg)
-        if problems:
-            print(f"\n❌ {len(problems)} problem(s):")
-            for problem in problems:
-                print(f"  - {problem}")
-            sys.exit(1)
-        print("\n✅ preflight passed: every locked slot is legal where it is pinned.")
-        return
-
-    try:
-        run_convergence(
-            ROOT,
-            models=split(args.models),
-            brackets=split(args.brackets),
-            variants=split(args.variants),
-            scenarios=split(args.scenarios),
-        )
-    except ConcurrentRunError as exc:
-        print(f"refusing to start: {exc}")
+    ctx = load_context(ROOT)
+    conv_cfg = ctx.cfg.get("convergence") or {}
+    if not conv_cfg:
+        print("config.yaml has no `convergence:` block.")
         sys.exit(1)
-
-
-# --- build-mock-db -----------------------------------------------------------------------------
-
-
-def build_mock_db() -> None:
-    """Regenerate mock_db/ from the plan fixture.
-
-    The mock database is what the model is shown; the fixture is what the model is scored
-    against. Generating one from the other is what keeps those two the same set of facts —
-    hand-maintaining both is how a model ends up penalised for a prerequisite it was never
-    given. `run.py check` fails if this has not been run since the fixture last changed.
-    """
-    from harness.fixtures import load_fixture
-    from harness.mock_db import load_mock_db, integrity_problems, render_context
-    from harness.mock_db_build import write_mock_db
-    from harness.server import approx_tokens
-
-    cfg = _cfg()
-    fixture = load_fixture(ROOT / cfg["paths"]["plan_fixture"])
-    out_dir = ROOT / cfg["paths"]["mock_db"]
-    written = write_mock_db(fixture, out_dir)
-    print(f"wrote {len(written)} table(s) to {out_dir}")
-
-    db = load_mock_db(out_dir)
-    for table in db.tables:
-        print(f"  {table:28s} {len(db.rows(table)):4d} rows   (sha {db.files[table]})")
-    problems = integrity_problems(db)
+    slots_path = locked_slots_path_for(ctx.fixture)
+    if slots_path is None:
+        print(f"no locked-slots file for {ctx.fixture.path.name} — Mode C isn't supported for "
+              f"this fixture (needs {ctx.fixture.path.with_suffix('').name}.locked_slots.yaml).")
+        sys.exit(1)
+    locked = load_locked_slots(slots_path)
+    print(prereq_risk_note(ctx.fixture, conv_cfg))
+    print(f"\nlocked slots: {locked.path.name} (hash {locked.slots_hash})")
+    for scenario in ctx.fixture.scenarios:
+        slots = locked.for_scenario(scenario.id)
+        pins = ", ".join(f"{s.course}@{s.semester_index + 1}" for s in slots) or "none"
+        print(f"  {scenario.id:24s} {pins}")
+    problems = preflight(ctx, locked, conv_cfg)
     if problems:
-        print(f"\n❌ {len(problems)} integrity problem(s) in the generated database:")
+        print(f"\n❌ {len(problems)} problem(s):")
         for problem in problems:
             print(f"  - {problem}")
         sys.exit(1)
-    export = render_context(db)
-    print(f"\ndb_hash {db.db_hash} | export {len(export)} chars "
-          f"(~{approx_tokens(export)} tokens)")
+    print("\n✅ preflight passed: every locked slot is legal where it is pinned.")
+
+
+def _converge_run(args) -> None:
+    """Mode C proper. Raises `ConcurrentRunError` up to `_run`'s shared try/except — same
+    handling as every other task, since it is now one more thing `run` can be asked to do."""
+    from harness.convergence import run_convergence
+
+    split = lambda v: v.split(",") if v else None
+    run_convergence(
+        ROOT,
+        models=split(args.models),
+        brackets=split(args.brackets),
+        variants=split(args.variants),
+        scenarios=split(args.scenarios),
+    )
 
 
 # --- doctor ------------------------------------------------------------------------------------
@@ -256,21 +475,44 @@ def _port_open(host: str, port: int, timeout: float = 2.0) -> bool:
 
 def check() -> None:
     """Everything verifiable without spending a single generation."""
-    from harness.fixtures import load_fixture, load_sample_plan
-    from harness.mock_db import integrity_problems, load_mock_db
-    from harness.mock_db_build import stale_tables
+    from harness.catalog_export import integrity_problems
+    from harness.fixtures import load_fixture
     from harness.planner import generate_plan
     from harness.plan_scorers import score_plan, plan_to_semesters
     from harness.prompts import PromptBuilder
+    from harness.real_db import (
+        REQUIREMENT_SCOPE_ALIASES, build_scenario_database, load_real_db,
+        real_db_base_from_fixture,
+    )
     from harness.server import gpu_memory_used_mb
 
     cfg = _cfg()
-    fixture = load_fixture(ROOT / cfg["paths"]["plan_fixture"])
-    sample_rel = cfg["paths"].get("sample_plan")
-    sample_plan = load_sample_plan(ROOT / sample_rel) if sample_rel else None
-    mock_dir = ROOT / cfg["paths"]["mock_db"]
-    database = load_mock_db(mock_dir)
-    prompts = PromptBuilder(fixture, sample_plan, database)
+    fixture_rel = os.environ.get("MODEL_EVAL_PLAN_FIXTURE", cfg["paths"]["plan_fixture"])
+    fixture = load_fixture(ROOT / fixture_rel)
+    budget_tokens = cfg["run"]["num_ctx"] - cfg["run"]["max_plan_tokens"]
+    if fixture.source == "fixture":
+        # No Postgres for a `program.source: fixture` pseudo-major — see
+        # `harness.runner.load_context`'s identical branch and
+        # `real_db.real_db_base_from_fixture`'s docstring.
+        program_id = f"fixture:{fixture.slug}"
+        database = build_scenario_database(
+            real_db_base_from_fixture(fixture), budget_tokens=budget_tokens
+        )
+    else:
+        # MODEL_EVAL_REAL_DB_URL / _PROGRAM_ID override config.yaml's real_db.* — set by
+        # `--major` (see main()) or by hand for a one-off check against a specific program.
+        real_db_cfg = cfg["real_db"]
+        pg_url = os.environ.get("MODEL_EVAL_REAL_DB_URL", real_db_cfg["url"])
+        program_id = os.environ.get("MODEL_EVAL_REAL_DB_PROGRAM_ID", real_db_cfg["program_id"])
+        database = load_real_db(
+            pg_url, program_id,
+            broaden_subjects=(tuple(real_db_cfg["broaden_subjects"])
+                             if real_db_cfg.get("broaden_subjects") else None),
+            force_selective_groups=tuple(real_db_cfg.get("force_selective_groups") or ()),
+            budget_tokens=budget_tokens,
+            scope_filter=REQUIREMENT_SCOPE_ALIASES.get(fixture.requirement_scope),
+        )
+    prompts = PromptBuilder(fixture, database)
 
     print(f"fixture: {fixture.name}")
     print(f"  hash {fixture.fixture_hash} | {len(fixture.catalog)} courses | "
@@ -331,50 +573,6 @@ def check() -> None:
             if code not in known:
                 problems.append(f"scenario {scenario.id} completed unknown course {code}")
 
-    # The Mode C reference plan. It scores nothing, so a mistake in it cannot make a plan
-    # wrongly viable — but a `code:` that the catalog does not have would silently drop out of
-    # the anchoring slot map, quietly shrinking the denominator of the one number this arm
-    # turns on. That is worth a hard failure; an `also_cites` code NOT in the catalog is the
-    # normal case and is exactly what makes the copied-hallucination diagnostic work.
-    if sample_plan is not None:
-        print(f"\nSample plan (anchoring diagnostic only, no longer a prompt input): "
-              f"{sample_plan.path.name} (hash {sample_plan.plan_hash})")
-        rows = sum(len(s.entries) for s in sample_plan.semesters)
-        named = sample_plan.slot_of
-        print(f"  {len(sample_plan.semesters)} semesters | {rows} rows | "
-              f"{len(named)} name a catalog course | {rows - len(named)} placeholders")
-        print(f"  off-catalog codes it cites (alternatives/suggestions, kept on purpose): "
-              f"{', '.join(sorted(sample_plan.off_catalog_codes)) or 'none'}")
-        for semester in sample_plan.semesters:
-            for entry in semester.entries:
-                if entry.code and entry.code not in known:
-                    problems.append(
-                        f"sample plan row {entry.code!r} ({semester.label}) sets `code:` to a "
-                        f"course the scoring fixture does not have — move it to `also_cites` "
-                        f"or add the course, or it silently drops out of the anchoring metric."
-                    )
-                for cited in entry.also_cites:
-                    if cited in known:
-                        problems.append(
-                            f"sample plan row cites {cited} under `also_cites` but the fixture "
-                            f"DOES have it — a model scheduling it would be scored legal while "
-                            f"the diagnostic calls it an off-catalog copy."
-                        )
-        # Not fatal: the published plan genuinely omits courses the fixture requires (CS 38100),
-        # and that gap is part of what Mode C tests. Printing it stops it being read as a bug.
-        required = {c for g in fixture.requirement_groups if g.get("kind") == "all"
-                    for c in g.get("courses", [])}
-        uncovered = sorted(required - set(named))
-        if uncovered:
-            print(f"  NOTE: required courses the sample plan never names: "
-                  f"{', '.join(uncovered)} — following it literally does not complete the "
-                  f"degree, which the model is expected to notice.")
-    elif sample_rel:
-        problems.append(f"paths.sample_plan points at {sample_rel} but it could not be loaded.")
-    else:
-        print("\nSample plan: not configured (paths.sample_plan unset) — the template-anchoring "
-              "diagnostic will be absent. Mode C does not need it.")
-
     # THE check that matters: is a viable plan even reachable? If the deterministic planner —
     # which cannot make a mistake — can't produce a viable plan for a scenario, then every
     # model scores 0 on it for reasons that have nothing to do with the model.
@@ -401,22 +599,25 @@ def check() -> None:
                 f"reporting of what doesn't fit."
             )
 
-    # THE MOCK DATABASE — what Mode B is actually shown. Two failures are checked, and both are
-    # silent otherwise: rows that reference something that does not exist (a model scored
-    # against a requirement whose course it never saw), and a database that no longer matches
-    # the fixture it was generated from (a model shown one catalog and scored against another).
-    print(f"\nmock database: {mock_dir.name} (hash {database.db_hash})")
+    # THE REAL DATABASE — what Mode B is actually shown, read live from Postgres (see
+    # harness/real_db.py). Checked for referential integrity the same way the old JSON mock
+    # was — a dangling reference here would mean a real_db.py bug, not bad source data.
+    #
+    # SCORED AGAINST THIS, NOT THE FIXTURE (see harness/real_scoring.py) — so unlike before
+    # 2026-08-04, a `real_db.program_id`/`--major` that names a different program than the
+    # fixture no longer corrupts Mode B's coverage/hallucination numbers; they honestly
+    # describe whatever program this is. What CAN still be wrong: the fixture's own
+    # scenarios (student names, completed courses, credit targets — Mode A/C context) were
+    # written for one specific program, so a mismatch here means Mode B is being tested
+    # against a program those scenarios don't describe, not that its numbers are meaningless.
+    print(f"\ndatabase: program {program_id} (hash {database.db_hash})")
     print("  " + " | ".join(f"{t} {len(database.rows(t))}" for t in database.tables))
-    problems += [f"mock db: {p}" for p in integrity_problems(database)]
-    stale = stale_tables(fixture, mock_dir)
-    if stale:
-        problems.append(
-            f"mock database is STALE — {', '.join(stale)} would be regenerated differently from "
-            f"the current fixture. The model would be shown one catalog and scored against "
-            f"another. Run `python run.py build-mock-db`."
-        )
-    else:
-        print("  in sync with the fixture ✓")
+    problems += [f"database: {p}" for p in integrity_problems(database)]
+    program_name = next((r.get("name") for r in database.rows("programs")), None)
+    if program_name and program_name != fixture.name:
+        print(f"  ⚠️  database program ({program_name!r}) is not the fixture's own program "
+              f"({fixture.name!r}) — Mode B's numbers are honest about {program_name!r}, but "
+              f"the scenarios were written for {fixture.name!r}.")
 
     questions = _load_questions(cfg)
     behaviors = {}
@@ -566,7 +767,6 @@ def parity() -> None:
             code=c.code, title=c.title, credits=c.credits, prereqs=list(c.prereqs),
             coreqs=list(c.coreqs),
             offered_terms=list(c.offered_terms), requirement_tags=list(c.requirement_tags),
-            workload_score=c.workload_score,
         )
         for c in fixture.catalog
     ]

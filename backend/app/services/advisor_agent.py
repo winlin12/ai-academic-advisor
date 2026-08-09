@@ -90,10 +90,10 @@ _SYSTEM_PROMPT = (
 _CREDIT_CAP_PATTERNS = [
     # "cap me at 12 credits", "keep me at/under 12 credits", "limit ... to 12 credits"
     re.compile(r"(?:cap|keep|limit|hold|stay|max(?:imum)?|no more than|at most|under|below)"
-               r"[^.\n]{0,40}?(\b\d{1,2}\b)\s*(?:cr\b|credits?\b|credit hours?\b)", re.I),
+               r"[^.\n]{0,40}?(\b\d{1,2}\b)\s*(?:cr\b|credits?\b|credit hours?\b)", re.IGNORECASE),
     # "12 credits a semester" / "12 credit semesters" with no leading verb
     re.compile(r"\b(\d{1,2})\s*(?:cr\b|credits?\b|credit hours?\b)"
-               r"[^.\n]{0,20}?(?:a|per|each|every)\s+(?:semester|term)", re.I),
+               r"[^.\n]{0,20}?(?:a|per|each|every)\s+(?:semester|term)", re.IGNORECASE),
 ]
 
 
@@ -183,7 +183,7 @@ def _user_prompt(
     prior_warnings: list[str],
 ) -> str:
     parts = [
-        f"STUDENT: {profile.name} — {profile.degree_program}",
+        f"DEGREE PROGRAM: {profile.degree_program}",
         # Major load first, credit cap second: the credit cap is the only line here the model
         # has to act on, so nothing sits between it and the feedback that could read as
         # "somebody else handles the caps". See _SYSTEM_PROMPT's closing paragraph.
@@ -257,6 +257,54 @@ def _severity(plan: PlanResponse) -> int:
     return len(plan.unplanned_courses)
 
 
+async def propose_edit(
+    profile: StudentProfile,
+    catalog: list[Course],
+    plan: PlanResponse,
+    feedback: str,
+    *,
+    client: LlamaCppClient,
+    seed: int | None = None,
+) -> PlanEditProposal:
+    """MODE A, on its own: turn free-text feedback into a structured, grounded proposal.
+
+    Split out of ``revise_plan`` so the AI-planner path can reuse it. This is the part of Mode A
+    that has to understand the student; who then BUILDS the schedule from the proposal — the
+    greedy planner (``revise_plan`` below) or Mode B (``ai_revise_plan``) — is a separate
+    decision, and the eval measured this step in isolation for exactly that reason.
+    """
+    prompt = _user_prompt(profile, plan, catalog, feedback, [])
+    proposal = await client.propose(
+        _SYSTEM_PROMPT, prompt, PlanEditProposal,
+        schema=_proposal_schema(profile, catalog), seed=seed,
+    )
+    return _with_credit_cap_backstop(proposal, feedback)
+
+
+def _with_credit_cap_backstop(proposal: PlanEditProposal, feedback: str) -> PlanEditProposal:
+    """DETERMINISTIC BACKSTOP for the one field the model must set itself.
+
+    If the student named a per-semester load and the model left the field null, take the number
+    from the text — a regex is right every time here, and the alternative is silently ignoring
+    an explicit request. The model's own value always wins when it set one.
+    """
+    if proposal.max_credits_per_semester is not None:
+        return proposal
+    asked = extract_credit_cap(feedback)
+    if asked is None:
+        return proposal
+    logger.info("revise-plan: model left the credit cap null; using %d from the student's own "
+                "wording", asked)
+    return proposal.model_copy(update={"max_credits_per_semester": asked})
+
+
+def apply_proposal(
+    profile: StudentProfile, proposal: PlanEditProposal, catalog: list[Course]
+) -> StudentProfile:
+    """Public name for ``_apply_proposal`` — the AI-planner path folds proposals in too."""
+    return _apply_proposal(profile, proposal, catalog)
+
+
 async def revise_plan(
     profile: StudentProfile,
     catalog: list[Course],
@@ -264,6 +312,7 @@ async def revise_plan(
     *,
     client: LlamaCppClient,
     max_iterations: int = DEFAULT_MAX_ITERATIONS,
+    seed: int | None = None,
 ) -> RevisePlanResponse:
     """Run the propose → apply → re-plan → re-validate loop and return the best plan found."""
     baseline = generate_plan(profile, catalog)
@@ -280,6 +329,7 @@ async def revise_plan(
             proposal = await client.propose(
                 _SYSTEM_PROMPT, prompt, PlanEditProposal,
                 schema=_proposal_schema(profile, catalog),
+                seed=None if seed is None else seed + iteration,
             )
         except (ModelResponseError, ValidationError) as exc:
             # Refusal, truncation, or a value outside the client-side constraints (e.g. a
@@ -287,16 +337,7 @@ async def revise_plan(
             logger.warning("revise-plan: unusable proposal on iteration %d: %s", iteration, exc)
             break
 
-        # DETERMINISTIC BACKSTOP for the one field the model must set itself. If the student
-        # named a per-semester load and the model left the field null, take the number from the
-        # text — a regex is right every time here, and the alternative is silently ignoring an
-        # explicit request. The model's own value always wins when it set one.
-        if proposal.max_credits_per_semester is None:
-            asked = extract_credit_cap(feedback)
-            if asked is not None:
-                logger.info("revise-plan: model left the credit cap null; using %d from the "
-                            "student's own wording", asked)
-                proposal = proposal.model_copy(update={"max_credits_per_semester": asked})
+        proposal = _with_credit_cap_backstop(proposal, feedback)
 
         revised_plan = generate_plan(_apply_proposal(profile, proposal, catalog), catalog)
         best_plan, best_proposal, accepted_iteration = revised_plan, proposal, iteration
@@ -311,4 +352,90 @@ async def revise_plan(
         rationale=best_proposal.rationale,
         proposal=best_proposal,
         iterations=accepted_iteration,
+        planner="deterministic",
     )
+
+
+async def ai_revise_plan(
+    profile: StudentProfile,
+    program_catalog,
+    feedback: str,
+    current_plan: PlanResponse | None,
+    *,
+    client: LlamaCppClient,
+    seed: int | None = None,
+) -> RevisePlanResponse:
+    """MODE A proposes, MODE B rebuilds. The chat's revise path when the plan came from the AI.
+
+    WHY NOT JUST HAND THE FEEDBACK TO MODE B. Because Mode A is the part that was measured on
+    understanding the student, and it is grammar-constrained to say something actionable: an
+    enum of the student's own remaining courses for reorder/defer, an enum of real tags for
+    avoid_tags, and an integer field for the credit cap that a regex backstops when the model
+    leaves it null. Free text into a planner has none of those guarantees — the eval found 16%
+    of unconstrained proposals naming things that do not exist, every one of which the app
+    silently degrades to a no-op, so the student's request disappears with no error anywhere.
+
+    WHY NOT LET THE DETERMINISTIC PLANNER REBUILD, as ``revise_plan`` does. Because the student
+    is looking at a plan Mode B wrote, and handing back a greedy-planner layout in response to
+    "move CS 38100 earlier" changes every semester on the screen to answer a question about one
+    course. Rebuilding with the same planner that drew the original keeps the diff the size of
+    the request.
+
+    The proposal is applied twice over, deliberately: to the PROFILE (so the reordered
+    ``remaining_courses`` and any new credit cap reach both the prompt and the repair step) and
+    to the PROSE the model reads, so a preference the grammar cannot express — "less
+    theory-heavy" — still lands.
+    """
+    from app.services.ai_planner import generate_ai_plan  # circular at module scope
+
+    catalog = program_catalog.courses
+    baseline = current_plan or generate_plan(profile, catalog)
+
+    try:
+        proposal = await propose_edit(
+            profile, catalog, baseline, feedback, client=client, seed=seed
+        )
+    except (ModelResponseError, ValidationError) as exc:
+        # The student still gets an answer: Mode B alone can act on the raw feedback, it just
+        # cannot be held to the structured guarantees above.
+        logger.warning("revise-plan: unusable proposal (%s); replanning from the raw request",
+                       exc)
+        proposal = PlanEditProposal(rationale="")
+
+    revised_profile = _apply_proposal(profile, proposal, catalog)
+    result = await generate_ai_plan(
+        revised_profile, program_catalog, client=client,
+        request=_revision_request(feedback, proposal), seed=seed,
+    )
+    return RevisePlanResponse(
+        plan=result.plan,
+        rationale=proposal.rationale or result.rationale,
+        proposal=proposal,
+        iterations=1,
+        planner="ai" if result.used_model else "deterministic",
+        layout=result.layout,
+        removed=result.removed,
+        backfilled=result.backfilled,
+        requirement_coverage=result.requirement_coverage,
+        missing_requirements=result.missing_requirements,
+    )
+
+
+def _revision_request(feedback: str, proposal: PlanEditProposal) -> str:
+    """The student's words, plus the structured reading of them, for Mode B's variable tail.
+
+    Both halves matter. The raw feedback carries intent the proposal fields cannot hold; the
+    structured reading is what the grammar already validated, and repeating it as an explicit
+    instruction is what stops a model from reading a long message and acting on the first
+    sentence only.
+    """
+    parts = [feedback.strip()]
+    if proposal.reorder:
+        parts.append(f"Schedule these EARLIER than before: {', '.join(proposal.reorder)}.")
+    if proposal.defer:
+        parts.append(f"Push these to LATER semesters: {', '.join(proposal.defer)}.")
+    if proposal.avoid_tags:
+        parts.append(f"Prefer courses that are not tagged: {', '.join(proposal.avoid_tags)}.")
+    if proposal.max_credits_per_semester:
+        parts.append(f"Hard limit of {proposal.max_credits_per_semester} credits per semester.")
+    return "\n".join(parts)

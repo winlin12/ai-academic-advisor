@@ -12,6 +12,11 @@ This parser:
 3. Captures the credit total from headings like "(12 credits)" / "78-79 credits".
 4. Always preserves the block's raw text — narrative/policy blocks with no courses are
    kept as groups so requirement text is never silently discarded.
+5. Records any ``preview_program.php?catoid=&poid=`` links a block contains
+   (``RequirementGroupData.linked_refs``) — some requirements (university core,
+   world-language, college core) render as prose pointing at a SEPARATE Acalog program
+   page rather than listing courses inline. This module does not follow them; see
+   ``resolve_requirement_links`` for that.
 """
 
 from __future__ import annotations
@@ -43,6 +48,13 @@ MIN_GRADE_RE = re.compile(r"Minimum\s+Grade(?:\s+of)?\s*([A-D][+-]?)", re.IGNORE
 SELECTIVE_MARKERS = re.compile(
     r"\bchoose\b|\bselect\b|\bone of\b|\bany of\b|\belective", re.IGNORECASE
 )
+# A requirement block that names no courses of its own sometimes links out to another
+# Acalog PROGRAM page that does — e.g. "College of Science Core Requirements" links to
+# preview_program.php?catoid=19&poid=35114 ("Composition and Presentation"), which is a
+# real course list rendered with the exact same div.acalog-core/li.acalog-course structure.
+# (catoid, poid) is captured here and resolved by `resolve_requirement_links`, NOT here —
+# this module only extracts what is already on the page.
+PROGRAM_LINK_RE = re.compile(r"preview_program\.php\?catoid=(\d+)&poid=(\d+)")
 
 # Heading keyword → requirement_type. Order matters (first match wins).
 REQUIREMENT_TYPE_RULES: tuple[tuple[str, str], ...] = (
@@ -107,6 +119,12 @@ class RequirementGroupData:
     options: list[RequirementOptionData] = field(default_factory=list)
     children: list["RequirementGroupData"] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # (catoid, poid) pairs found in THIS block's own text (not a nested child's), pointing at
+    # another Acalog program page that may enumerate this requirement's real course list.
+    # Populated by `_parse_core_block`; consumed by `resolve_requirement_links`. Empty for the
+    # overwhelming majority of blocks, which either have their own options/children already or
+    # are pure narrative with nothing to resolve.
+    linked_refs: list[tuple[int, int]] = field(default_factory=list)
 
 
 def parse_requirement_sections(html: str) -> list[RequirementGroupData]:
@@ -171,6 +189,7 @@ def _parse_core_block(core, display_order: int) -> tuple[RequirementGroupData, i
     selective_group = bool(SELECTIVE_MARKERS.search(name))
 
     options = _parse_course_options(core, selective_group)
+    linked_refs = _extract_linked_refs(core)
 
     return (
         RequirementGroupData(
@@ -181,9 +200,33 @@ def _parse_core_block(core, display_order: int) -> tuple[RequirementGroupData, i
             raw_text=raw_text,
             display_order=display_order,
             options=options,
+            linked_refs=linked_refs,
         ),
         level,
     )
+
+
+def _extract_linked_refs(core) -> list[tuple[int, int]]:
+    """(catoid, poid) pairs from ``<a href>``s directly inside this block.
+
+    Same "exclude nested acalog-core" scoping as `_direct_text`/`_parse_course_options` — a
+    link inside a CHILD block belongs to that child, not this one. Order-preserving,
+    duplicates within one block collapsed (a block can link the same page more than once,
+    e.g. once in a table-of-contents-style bullet and again inline).
+    """
+    seen: set[tuple[int, int]] = set()
+    refs: list[tuple[int, int]] = []
+    for a in core.find_all("a", href=True):
+        if a.find_parent("div", class_="acalog-core") is not core:
+            continue
+        m = PROGRAM_LINK_RE.search(a["href"])
+        if not m:
+            continue
+        ref = (int(m.group(1)), int(m.group(2)))
+        if ref not in seen:
+            seen.add(ref)
+            refs.append(ref)
+    return refs
 
 
 def _first_heading(core):
@@ -296,3 +339,93 @@ def _to_float(value: str | None) -> float | None:
         return float(value)
     except ValueError:
         return None
+
+
+# Only these categories are worth following a linked page for. Restricting to the same
+# types `REQUIREMENT_TYPE_RULES` already classifies as university/college/core/world-language
+# keeps this from chasing unrelated in-page links — e.g. "About the Program" (type
+# ``overview``) on a real program page links to that program's own CODO (change-of-major)
+# requirements page, which renders with the identical div.acalog-core structure and would
+# otherwise look exactly like a resolvable requirement list.
+LINK_RESOLVABLE_TYPES = {"university", "core", "world_language", "college"}
+
+
+def _collect_resolvable(
+    groups: list[RequirementGroupData], tree_depth: int
+) -> list[tuple[int, RequirementGroupData]]:
+    """Every (tree_depth, group) pair in ``groups`` that has no options/children of its own,
+    is a category link resolution should even consider, and has a link to try — found
+    anywhere in the tree, not just at the top level."""
+    out: list[tuple[int, RequirementGroupData]] = []
+    for group in groups:
+        if group.options or group.children:
+            out.extend(_collect_resolvable(group.children, tree_depth + 1))
+            continue
+        if group.requirement_type in LINK_RESOLVABLE_TYPES and group.linked_refs:
+            out.append((tree_depth, group))
+    return out
+
+
+def resolve_requirement_links(
+    groups: list[RequirementGroupData],
+    *,
+    fetcher,
+    catoid: int,
+    seen_poids: set[int] | None = None,
+    depth: int = 0,
+    max_depth: int = 1,
+) -> None:
+    """Follow same-catalog-year links to fill in requirement groups that have neither options
+    nor children of their own — mutates ``groups`` in place, attaching resolved content as
+    ``children``.
+
+    DEEPEST GROUPS ARE RESOLVED FIRST, and that ordering is load-bearing, not cosmetic. The
+    same linked page is routinely referenced from more than one place on a real program page:
+    this program's own "Curriculum and Degree Requirements for College of Science" — a
+    table-of-contents-style paragraph, at the TOP of the page — links to the exact same ten
+    sub-category pages that "College of Science Additional Requirements" links to
+    individually and much more specifically through its own named children ("Laboratory
+    Science (6-8 credits)", "Computing (3-4 credits)", ...), further down. Resolving whichever
+    is encountered first in plain document order would attach every real course list to the
+    generic paragraph and leave the specifically-named requirement sections empty — technically
+    fine for a scorer that reads every group by id regardless of its parent, but the kind of
+    "properly formed" a human reading the database would not call properly formed. Sorting
+    every resolvable group by its depth in the tree (deepest first) before resolving means the
+    specific child wins the shared poid, and the generic ancestor — encountered later in this
+    sort, sees the poid already in ``seen_poids``, and is left with nothing left to resolve.
+    Only among groups at the SAME depth does plain document order still decide it, which is a
+    narrower, harder-to-hit case than the one this fixes.
+
+    ``max_depth`` bounds recursion into a JUST-resolved page's own links (default 1: resolve
+    top-level unresolved groups, do not chase links found inside what was just fetched). Only
+    same-domain, same-``catoid`` links are ever followed — off-domain links (Purdue's own
+    University Senate pages, a different site entirely) are a different HTML shape this
+    function does not understand, and are left as unresolved prose on purpose.
+    """
+    if seen_poids is None:
+        seen_poids = set()
+
+    resolvable = sorted(_collect_resolvable(groups, 0), key=lambda pair: -pair[0])
+
+    for _, group in resolvable:
+        resolved_children: list[RequirementGroupData] = []
+        for ref_catoid, poid in group.linked_refs:
+            if ref_catoid != catoid or poid in seen_poids:
+                continue
+            seen_poids.add(poid)
+            url = f"https://catalog.purdue.edu/preview_program.php?catoid={catoid}&poid={poid}"
+            try:
+                page = fetcher.fetch(url)
+            except Exception:
+                logger.warning("Could not fetch linked requirement page %s", url, exc_info=True)
+                continue
+            linked_groups = parse_requirement_sections(page.html)
+            if depth < max_depth:
+                resolve_requirement_links(
+                    linked_groups, fetcher=fetcher, catoid=catoid,
+                    seen_poids=seen_poids, depth=depth + 1, max_depth=max_depth,
+                )
+            resolved_children.extend(linked_groups)
+
+        if resolved_children:
+            group.children = resolved_children

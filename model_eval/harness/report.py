@@ -23,6 +23,8 @@ from typing import Any
 
 import yaml
 
+from .convergence_report import mode_c_cross_school_lines, mode_c_lines
+
 
 def _load(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
@@ -140,8 +142,8 @@ def _plan_section(records: list[dict], mode: str, title: str, note: str) -> list
     if note:
         lines += [note, ""]
     lines += [
-        "| Model | PLAN_VIABLE | Structure OK | Req. coverage | Ask honoured | Violations/plan | Idle cr | Heavy CS terms | Sem used | Cr spread | Consistency | Median s |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "| Model | PLAN_VIABLE | Structure OK | Req. coverage | Ask honoured | Violations/plan | Idle cr | Heavy major terms | Over-ask terms | Sem used | Cr spread | Consistency | Median s |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     rows: list[tuple[float, str]] = []
     for model, all_recs in groups.items():
@@ -158,12 +160,22 @@ def _plan_section(records: list[dict], mode: str, title: str, note: str) -> list
         # Read Idle cr NEXT TO Violations/plan, never on its own. A model that schedules almost
         # nothing wins the violations column by default; this is the column that shows the bill.
         idle = [r["idle_credits"] for r in recs if r.get("idle_credits") is not None]
-        # SOFT breaches only — the hard ones are already in Violations/plan and in the
-        # breakdown below. This column is the term a student would call a bad semester but
-        # would still be allowed to register for: exactly at the hard cap, over the preferred
-        # one. Per plan, so it is readable next to Violations/plan.
+        # SOFT ONLY — never in Violations/plan (see `plan_scorers.py`'s module docstring: a
+        # heavy major-course term stopped gating PLAN_VIABLE 2026-08-07, same call as the
+        # credit cap below). This is the term a student would call a bad semester but the
+        # registrar would still let them register for. Per plan, so it is readable next to
+        # Violations/plan.
         soft = [r["soft_major_overloads"] for r in recs
                 if r.get("soft_major_overloads") is not None]
+        # The credit half of the same idea, added 2026-08-02 when the hard `credit_cap_violation`
+        # threshold moved from the student's number to the registrar's 18. Without this column a
+        # term over what the student asked for would vanish from the report entirely for the six
+        # scenarios that carry no `max_credits_at_most` assertion — it would be under the hard
+        # cap (so not in Violations/plan) and unasserted (so not in Ask honoured). It is a
+        # preference breach, not a legality one, which is exactly why it needs its own column
+        # instead of being folded back into either of those.
+        over_ask = [r["soft_credit_overages"] for r in recs
+                    if r.get("soft_credit_overages") is not None]
         # Distribution, the pair the credit TARGET was added to move. "Sem used" is
         # semesters-with-courses over semesters-available; "Cr spread" is max-min across
         # non-empty terms. Both diagnostic — a plan that finishes early is not illegal — but
@@ -177,6 +189,7 @@ def _plan_section(records: list[dict], mode: str, title: str, note: str) -> list
         vio_cell = f"{(sum(violations) / len(violations)):.1f}" if violations else "—"
         idle_cell = f"{(sum(idle) / len(idle)):.0f}" if idle else "—"
         soft_cell = f"{(sum(soft) / len(soft)):.1f}" if soft else "—"
+        over_ask_cell = f"{(sum(over_ask) / len(over_ask)):.1f}" if over_ask else "—"
         used_cell = (f"{sum(used) / len(used):.1f}/{sum(avail) / len(avail):.1f}"
                      if used and avail else "—")
         spread_cell = f"{(sum(spread) / len(spread)):.1f}" if spread else "—"
@@ -185,7 +198,7 @@ def _plan_section(records: list[dict], mode: str, title: str, note: str) -> list
             f"| `{model}` | {_rate_with_range(viable)} | "
             f"{_rate([bool(r.get('structure_ok')) for r in recs])} | {cov_cell} | "
             f"{_rate(asserts)} | {vio_cell} | "
-            f"{idle_cell} | {soft_cell} | {used_cell} | {spread_cell} | "
+            f"{idle_cell} | {soft_cell} | {over_ask_cell} | {used_cell} | {spread_cell} | "
             f"{_consistency(recs, 'scenario', 'plan_viable')} | "
             f"{_median([r.get('total_s') for r in recs])} |",
         ))
@@ -194,24 +207,26 @@ def _plan_section(records: list[dict], mode: str, title: str, note: str) -> list
     # WHY plans fail is more actionable than how often.
     lines += ["", "**Where plans break** (violation counts across ALL runs, including the "
               "unsatisfiable scenario — a violation is a violation regardless of whether full "
-              "coverage was reachable). `CS overload` is the only column here the registrar "
-              "would let a student through: it counts terms holding MORE than the hard "
-              "major-course limit, which is a plan the student abandons rather than one they "
-              "cannot enrol in:", "",
-              "| Model | prereq | coreq | term offering | credit cap | CS overload | hallucinated | duplicate |",
-              "|---|---|---|---|---|---|---|---|"]
+              "coverage was reachable). The first three columns are genuine registration walls: "
+              "term-offering, credit-cap, and major-overload breaches are gone from this table "
+              "entirely, not just softened — see `plan_scorers.py`'s module docstring for why. "
+              "`duplicates removed` is NOT in that count and does not touch PLAN_VIABLE above — "
+              "see the same docstring's 2026-08-07 note: a repeated or already-completed course "
+              "is deleted before scoring ever runs, tracked here so it stays visible instead of "
+              "silently vanishing:",
+              "", "| Model | prereq | coreq | hallucinated | duplicates removed |",
+              "|---|---|---|---|---|"]
     for model, recs in groups.items():
         counts: Counter = Counter()
+        duplicates = 0
         for rec in recs:
             counts.update(rec.get("violation_counts") or {})
+            duplicates += len(rec.get("duplicates_removed") or [])
         lines.append(
             f"| `{model}` | {counts.get('prereq_violation', 0)} "
             f"| {counts.get('coreq_violation', 0)} "
-            f"| {counts.get('term_offering_violation', 0)} "
-            f"| {counts.get('credit_cap_violation', 0)} "
-            f"| {counts.get('major_overload_violation', 0)} "
             f"| {counts.get('hallucinated_course', 0)} "
-            f"| {counts.get('duplicate_course', 0)} |"
+            f"| {duplicates} |"
         )
     return lines + [""]
 
@@ -363,9 +378,6 @@ def _unsatisfiable_section(records: list[dict]) -> list[str]:
     make the numbers work is the single most damaging behaviour on a real advising site,
     because it looks like a complete plan.
 
-    Split by mode, because Mode C has a specific way to fail it: the sample plan describes
-    eight semesters and this student has one, so a model that anchors on the template has a
-    ready-made reason to overrun the horizon.
     """
     stages = [
         s for s in ("plan_mode_b",)
@@ -475,7 +487,7 @@ def _errors_section(records: list[dict]) -> list[str]:
     return lines + [""]
 
 
-def _guards(records: list[dict], cfg: dict, fixture_meta: dict) -> list[str]:
+def _guards(records: list[dict], cfg: dict, fixture_meta: dict, database_meta: dict) -> list[str]:
     lines: list[str] = []
     ok = True
 
@@ -495,13 +507,6 @@ def _guards(records: list[dict], cfg: dict, fixture_meta: dict) -> list[str]:
             lines.append(f"- ⚠️ **mixed static-prompt hashes in `{stage}`** ({sorted(hashes)}) — "
                          "these records came from different prompts and MUST NOT be compared. "
                          "Re-run, or split the file by hash.")
-
-    sample_hashes = {r.get("sample_plan_hash") for r in records if r.get("sample_plan_hash")}
-    if len(sample_hashes) > 1:
-        ok = False
-        lines.append(f"- ⚠️ **mixed sample-plan hashes** ({sorted(sample_hashes)}) — the "
-                     "reference plan Mode C was given changed partway through, so the Mode C − "
-                     "Mode B delta is measuring two different reference plans.")
 
     fixture_hashes = {r.get("fixture_hash") for r in records if r.get("fixture_hash")}
     if len(fixture_hashes) > 1:
@@ -523,6 +528,26 @@ def _guards(records: list[dict], cfg: dict, fixture_meta: dict) -> list[str]:
         ok = False
         lines.append(f"- ⚠️ **context-size mismatch**: {', '.join(mismatched)} ran at a context "
                      "size the config did not ask for and are not comparable to the rest.")
+
+    # Mode B is scored against `ctx.database` (see `real_scoring.py`), so a program mismatch no
+    # longer corrupts its numbers the way it used to — they honestly describe whichever program
+    # was actually shown. What this guard still catches: `real_db.program_id`/`--major` naming
+    # a DIFFERENT program than the one the fixture's scenarios were written to describe (student
+    # names, "Already completed" lists, credit targets — Mode A/C context). A low overlap means
+    # every Mode B number in this report is honest about a program nobody meant to test. See
+    # `runner.write_meta`'s `fixture_overlap`.
+    overlap = database_meta.get("fixture_overlap")
+    if overlap is not None and overlap < 0.5:
+        ok = False
+        program_name = database_meta.get("program_name") or "the configured program"
+        lines.append(
+            f"- ⚠️ **Mode B was shown a different program than intended**: "
+            f"`{program_name}`'s catalog overlaps only {overlap:.0%} with the plan fixture's "
+            f"course universe, and the fixture's own scenarios (student names, completed "
+            f"courses, credit targets) were written for a different program. Mode B's numbers "
+            f"are honest about `{program_name}` — they are just probably not the program you "
+            f"meant to point `real_db.program_id`/`--major` at."
+        )
 
     n = len(fixture_meta.get("scenarios") or [])
     floor = cfg.get("decision", {}).get("min_plan_scenarios", 8)
@@ -602,10 +627,21 @@ def generate_report(root: Path) -> Path:
     results.mkdir(exist_ok=True)
     baseline = _load(results / "runs_baseline.jsonl")
     mitigated = _load(results / "runs_mitigated.jsonl")
+    thinking = _load(results / "runs_thinking.jsonl")
     meta_path = results / "meta_baseline.json"
     meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
     fixture_meta = meta.get("fixture", {})
     run_meta = meta.get("run", {})
+    # ONE PER SCENARIO now (`runner.write_meta`'s `database_by_scenario`) — each scenario's own
+    # gen_ed_preference/world_language narrows the real database differently. The guard below
+    # only cares whether SOME scenario was shown the wrong program, so the worst (lowest
+    # overlap) one is the representative sample, not an arbitrary first entry.
+    database_by_scenario = meta.get("database_by_scenario", {})
+    database_meta = (
+        min(database_by_scenario.values(),
+            key=lambda d: d.get("fixture_overlap") if d.get("fixture_overlap") is not None else 1.0)
+        if database_by_scenario else meta.get("database", {})
+    )
 
     lines = [
         "# Model evaluation — BoilerAdvisor",
@@ -613,10 +649,6 @@ def generate_report(root: Path) -> Path:
         f"Fixture `{fixture_meta.get('path', '?')}` (hash `{fixture_meta.get('hash', '?')}`, "
         f"{fixture_meta.get('courses', '?')} courses, "
         f"{fixture_meta.get('requirement_groups', '?')} requirement groups)  ",
-        *([f"Sample plan `{meta['sample_plan'].get('path')}` (anchoring diagnostic only) "
-           f"(hash `{meta['sample_plan'].get('hash')}`, "
-           f"{meta['sample_plan'].get('named_courses')} named courses) — prompt input only, "
-           f"it decides no score  "] if meta.get("sample_plan") else []),
         f"Run {meta.get('timestamp', '?')} · tasks {meta.get('tasks', '?')} · "
         f"num_ctx {run_meta.get('num_ctx', '?')} · temp {run_meta.get('temperature', '?')} · "
         f"seed {run_meta.get('seed', '?')} · "
@@ -640,6 +672,25 @@ def generate_report(root: Path) -> Path:
         "Read it as *what would we gain, or risk, by trusting the model with sequencing?*",
     )
     lines += _scenario_breakdown(baseline, "plan_mode_b")
+    if thinking:
+        thinking_budget = (cfg.get("thinking") or {}).get("budget_tokens", "?")
+        lines += _plan_section(
+            thinking, "plan_mode_b_thinking",
+            "Mode B — thinking variant (`--tasks plan_b_thinking`)",
+            "Same prompt, same schema, same scorer as Mode B above — the only difference is "
+            f"reasoning ON and budget-capped at {thinking_budget} tokens before the plan, "
+            "launched on its own server (see config.yaml's `thinking:` block). Compare this "
+            "table's PLAN_VIABLE/coverage directly against Mode B's own table above — that "
+            "delta is the answer to \"does pre-plan reasoning change anything.\" Not the "
+            "removed post-hoc `rationale` field: that was written after the plan was already "
+            "fixed and could never have changed it.",
+        )
+        avg_chars = _mean([r.get("reasoning_chars") for r in thinking
+                           if r.get("stage") == "plan_mode_b_thinking"])
+        if avg_chars:
+            lines += [f"Average reasoning length: {avg_chars:.0f} characters. Full reasoning "
+                      "text is in each run's transcript (`transcripts/<model>/"
+                      "plan_mode_b_thinking/`), inside the `<think>` block.", ""]
     lines += _plan_section(
         baseline, "plan_mode_a", "Mode A — the app's real revise-plan path",
         "This is `advisor_agent.revise_plan` as shipped: the model emits a `PlanEditProposal` "
@@ -664,13 +715,17 @@ def generate_report(root: Path) -> Path:
         lines += _mode_a_extra(mitigated)
         section += 1
 
+    lines += [f"## {section}. Mode C — retry to convergence", ""]
+    lines += mode_c_lines(results)
+    section += 1
+
     lines += [f"## {section}. Environment and failures", ""]
     lines += _env_section(baseline)
     lines += _errors_section(baseline)
 
     section += 1
     lines += [f"## {section}. Validity guards", ""]
-    lines += _guards(baseline + mitigated, cfg, fixture_meta)
+    lines += _guards(baseline + mitigated, cfg, fixture_meta, database_meta)
 
     queue_path = results / "review_queue.jsonl"
     count = _review_queue(baseline + mitigated, queue_path)
@@ -691,3 +746,135 @@ def generate_report(root: Path) -> Path:
     report_path.write_text("\n".join(lines))
     print(f"Wrote {report_path} ({count} items in the review queue)")
     return report_path
+
+
+# --- cross-school summary (multi-school `run.py run`) ---------------------------------------
+
+
+def _discover_school_dirs(root: Path) -> list[tuple[str, Path]]:
+    """(slug, dir) for every `results/results_<slug>/` the multi-school loop wrote — see
+    `run.py`'s `_run_all_schools`. Sorted by slug for stable output."""
+    base = root / "results"
+    if not base.is_dir():
+        return []
+    out = []
+    for d in sorted(base.iterdir()):
+        if d.is_dir() and d.name.startswith("results_"):
+            out.append((d.name[len("results_"):], d))
+    return out
+
+
+def generate_summary(root: Path) -> Path:
+    """`results/summary.md` — one file answering "which model, across every school" instead of
+    per-school `report.md`'s "which model, for this one school". Two views:
+
+      1. OVERALL: every school's `runs_baseline.jsonl` records pooled into one corpus and run
+         through the SAME `_plan_section` table `report.md` uses — a model that only looks
+         good on CS/ME (the two schools with the most authoring care) should not look good
+         here if it falls apart on the other fourteen.
+      2. PER SCHOOL: a compact PLAN_VIABLE/coverage grid, school x model, so a specific bad row
+         (one school, one model) is visible even though the overall table averages it away.
+
+    Schools that never ran (no `results/results_<slug>/runs_baseline.jsonl`) are silently
+    absent from both views — this reports what exists, it does not claim the sweep was
+    complete. Cross-reference against `plan_fixtures/*.yaml` if you need to know what's
+    missing.
+    """
+    school_dirs = _discover_school_dirs(root)
+    if not school_dirs:
+        raise SystemExit(
+            "no results/results_<slug>/ directories found — run `python run.py run` (no "
+            "--major) first, or pass --major for a single-school `python run.py report`."
+        )
+
+    pooled: list[dict[str, Any]] = []
+    per_school: dict[str, list[dict[str, Any]]] = {}
+    fixture_names: dict[str, str] = {}
+    for slug, d in school_dirs:
+        recs = _load(d / "runs_baseline.jsonl")
+        if not recs:
+            continue
+        for rec in recs:
+            rec = dict(rec)
+            rec["_school"] = slug
+        per_school[slug] = recs
+        pooled.extend(recs)
+        meta_path = d / "meta_baseline.json"
+        fixture_rel = None
+        if meta_path.exists():
+            meta = json.loads(meta_path.read_text())
+            fixture_rel = meta.get("fixture", {}).get("path")
+        # `meta.fixture` only carries `path`/`hash`/etc, not the program's own display name (see
+        # `runner.write_meta`) — read it straight off the fixture YAML `path` points at.
+        fixture_names[slug] = slug
+        if fixture_rel:
+            fixture_path = root / "plan_fixtures" / fixture_rel
+            if fixture_path.exists():
+                program = (yaml.safe_load(fixture_path.read_text()) or {}).get("program") or {}
+                fixture_names[slug] = program.get("name", slug)
+
+    if not pooled:
+        raise SystemExit(
+            f"found {len(school_dirs)} results/results_<slug>/ dir(s) but none have a "
+            f"runs_baseline.jsonl yet — did `python run.py run` finish any school?"
+        )
+
+    lines = [
+        "# Cross-school summary — every plan fixture, one report",
+        "",
+        f"{len(per_school)} school(s) with data: "
+        + ", ".join(f"`{slug}`" for slug in sorted(per_school)),
+        "",
+        "No composite score here either — same discipline as `report.md`. This pools every "
+        "school's records into one corpus for the OVERALL tables below, then breaks "
+        "PLAN_VIABLE back out by school so one bad school can't hide inside a good average.",
+        "",
+        "## 1. Overall — every school pooled",
+        "",
+    ]
+    lines += _plan_section(
+        pooled, "plan_mode_b", "Mode B — the model builds the whole schedule",
+        "Pooled across every school's scenarios. A model whose free-form planning only works "
+        "for the one or two most heavily-authored fixtures will show up here as worse than its "
+        "own single-school report suggests — that gap IS the finding.",
+    )
+    lines += _plan_section(
+        pooled, "plan_mode_a", "Mode A — the app's real revise-plan path",
+        "Should be ~100% PLAN_VIABLE for every model, every school, by construction. A school "
+        "that drags this down has a deterministic-planner bug in ITS fixture, not a model "
+        "problem — see that school's own `results/results_<slug>/report.md`.",
+    )
+
+    lines += ["## 2. Per school — PLAN_VIABLE and requirement coverage", "", ]
+    for mode, label in (("plan_mode_a", "Mode A"), ("plan_mode_b", "Mode B")):
+        lines += [f"### {label}", "",
+                  "| School | Program | " + " | ".join(
+                      f"`{m}` viable / coverage" for m in
+                      sorted({r["model"] for r in pooled if r.get("stage") == mode})
+                  ) + " |"]
+        models = sorted({r["model"] for r in pooled if r.get("stage") == mode})
+        lines += ["|---|---|" + "---|" * len(models)]
+        for slug, recs in sorted(per_school.items()):
+            cells = []
+            for model in models:
+                model_recs = _satisfiable(
+                    [r for r in recs if r.get("stage") == mode and r.get("model") == model
+                     and not r.get("error")]
+                )
+                viable = _by_run(model_recs, "plan_viable")
+                coverage = [r["requirement_coverage"] for r in model_recs
+                            if r.get("requirement_coverage") is not None]
+                cov_cell = f"{(sum(coverage) / len(coverage)):.0%}" if coverage else "—"
+                cells.append(f"{_rate_with_range(viable)} / {cov_cell}")
+            program = fixture_names.get(slug, slug)
+            lines.append(f"| `{slug}` | {program} | " + " | ".join(cells) + " |")
+        lines.append("")
+
+    lines += ["## 3. Mode C — retry to convergence, across schools", ""]
+    lines += mode_c_cross_school_lines(school_dirs)
+
+    summary_path = root / "results" / "summary.md"
+    summary_path.parent.mkdir(exist_ok=True)
+    summary_path.write_text("\n".join(lines))
+    print(f"Wrote {summary_path} ({len(per_school)} school(s), {len(pooled)} pooled records)")
+    return summary_path

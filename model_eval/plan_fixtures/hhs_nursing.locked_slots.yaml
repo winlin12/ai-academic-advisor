@@ -1,0 +1,44 @@
+# =============================================================================
+# LOCKED SLOTS — Mode C (retry-to-convergence) only.
+#
+# See `cs_machine_intelligence.locked_slots.yaml`'s header for the full rationale (why this is
+# a separate file, not folded into `fixture_hash`, and why every slot below is lifted from the
+# deterministic planner's own output rather than hand-invented). Nothing here differs in kind —
+# only in program.
+#
+# CHOICE OF SLOTS: one shallow anchor (a zero-prereq course, semester 0) and one DEEP anchor —
+# `NUR 42001` (Transition To Professional Nursing Practice) — the capstone, gated behind
+# NUR 41401/41501/41701, this fixture's longest prerequisite chain by construction (7
+# hops deep through the clinical sequence).
+# `nurs-spring-start` opens with `HDFS 21000` instead of `NUR 10800` — NUR 10800 is not
+# offered in spring, so no zero-prereq NUR course is eligible at semester 0 for a spring
+# start; every other scenario opens with `NUR 10800`.
+#
+# `run.py run --tasks converge --preflight` re-verifies every lock below is legal where pinned
+# before spending any GPU time on this fixture.
+# =============================================================================
+
+source:
+  derived_from: "harness/planner.generate_plan, 2026-08-09"
+  fixture: "hhs_nursing.yaml"
+  note: >-
+    Slots are positions in the planning horizon, 0-based: semester_index 0 is
+    the student's start term. They are NOT catalog facts and are not scored
+    against the catalog; they are the student's stated intent.
+
+scenarios:
+  nurs-fresh-start:
+    - {semester_index: 0, course: "NUR 10800"}
+    - {semester_index: 7, course: "NUR 42001"}
+
+  nurs-sophomore-catchup:
+    - {semester_index: 0, course: "NUR 10800"}
+    - {semester_index: 7, course: "NUR 42001"}
+
+  nurs-light-load:
+    - {semester_index: 0, course: "NUR 10800"}
+    - {semester_index: 8, course: "NUR 42001"}
+
+  nurs-spring-start:
+    - {semester_index: 0, course: "HDFS 21000"}
+    - {semester_index: 8, course: "NUR 42001"}

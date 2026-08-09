@@ -5,7 +5,11 @@ still produced or re-validated by the deterministic planner."""
 import psycopg
 from fastapi import APIRouter, HTTPException
 
-from app.api.deps import academic_db_unavailable, resolve_for_planning
+from app.api.deps import (
+    academic_db_unavailable,
+    resolve_for_ai_planning,
+    resolve_for_planning,
+)
 from app.models.schemas import (
     AdvisorAskRequest,
     AdvisorAskResponse,
@@ -15,7 +19,7 @@ from app.models.schemas import (
     RevisePlanRequest,
     RevisePlanResponse,
 )
-from app.services.advisor_agent import revise_plan
+from app.services.advisor_agent import ai_revise_plan, revise_plan
 from app.services.llamacpp_client import (
     LlamaCppClient,
     LlamaCppConnectionError,
@@ -66,7 +70,9 @@ Explain the plan clearly. Focus on prerequisites, semester sequencing, warnings,
 """.strip()
 
     try:
-        answer = await client.generate(system_prompt=system_prompt, user_prompt=user_prompt)
+        answer = await client.generate(
+            system_prompt=system_prompt, user_prompt=user_prompt, seed=req.seed
+        )
     except (LlamaCppConnectionError, ModelResponseError) as exc:
         raise _llm_http_error(exc) from exc
 
@@ -75,17 +81,35 @@ Explain the plan clearly. Focus on prerequisites, semester sequencing, warnings,
 
 @router.post("/revise-plan", response_model=RevisePlanResponse)
 async def revise_plan_route(req: RevisePlanRequest):
-    """Revise a plan from free-text feedback via the structured-output agent.
+    """Revise a plan from free-text feedback via the structured-output agent (MODE A).
 
     The model proposes edits (reorder/defer/avoid-tags/credit-cap) as a schema-enforced
-    PlanEditProposal and the deterministic planner re-validates them, so the returned plan
-    is always legal. Error ladder: 503 (llama-server down), 502 (bad output).
+    PlanEditProposal, so a hallucinated proposal degrades to a no-op instead of an illegal
+    plan. What happens next depends on ``planner``:
+
+      "ai"            re-runs Mode B with the proposal folded in, so the revision looks like
+                      the plan it revised. Requires a ``program_id``.
+      "deterministic" hands the proposal to the greedy planner — no GPU, milliseconds.
+
+    A profile with no program falls back to "deterministic" regardless of what was asked for,
+    since Mode B has no catalog to plan from without one. Error ladder: 503 (llama-server
+    down), 502 (bad output).
     """
     client = LlamaCppClient()
 
+    if req.planner == "ai" and req.profile.program_id:
+        profile, program_catalog = resolve_for_ai_planning(req.profile)
+        try:
+            return await ai_revise_plan(
+                profile, program_catalog, req.feedback, req.current_plan,
+                client=client, seed=req.seed,
+            )
+        except (LlamaCppConnectionError, ModelResponseError) as exc:
+            raise _llm_http_error(exc) from exc
+
     profile, catalog = resolve_for_planning(req.profile)
     try:
-        return await revise_plan(profile, catalog, req.feedback, client=client)
+        return await revise_plan(profile, catalog, req.feedback, client=client, seed=req.seed)
     except (LlamaCppConnectionError, ModelResponseError) as exc:
         raise _llm_http_error(exc) from exc
 
@@ -107,7 +131,7 @@ async def advisor_ask(req: AdvisorAskRequest):
     client = LlamaCppClient()
 
     try:
-        result = await answer_question(req.question, client=client)
+        result = await answer_question(req.question, client=client, seed=req.seed)
     except EmbeddingError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     except psycopg.Error as exc:

@@ -8,9 +8,9 @@
 import psycopg
 import pytest
 
-from app.models.schemas import StudentProfile
+from app.models.schemas import Course, StudentProfile
 from app.services import planner_catalog
-from app.services.planner import generate_plan
+from app.services.planner import TERM_ORDER, generate_plan
 from app.services.planner_catalog import (
     ProgramNotFoundError,
     _course_from_row,
@@ -19,6 +19,7 @@ from app.services.planner_catalog import (
     resolve_profile_and_catalog,
     select_remaining_courses,
 )
+from app.services.planner_db import ProgramCatalog, RequirementGroup
 
 
 def test_normalize_course_code_variants():
@@ -37,8 +38,12 @@ def test_course_from_row_maps_catalog_gaps_to_permissive_defaults():
     assert course.title == "Problem Solving"
     assert course.credits == 4
     # The catalog publishes neither prereqs nor term offerings; the planner must not block.
+    # `TERM_ORDER` is the terms the planner may schedule INTO, which excludes summer by policy
+    # (PLANNER_INCLUDE_SUMMER) — so "offered every term we plan into" is the permissive default
+    # here, not "offered in all three seasons".
     assert course.prereqs == []
-    assert set(course.offered_terms) == {"fall", "spring", "summer"}
+    assert set(course.offered_terms) == set(TERM_ORDER)
+    assert "summer" not in course.offered_terms
 
 
 def test_course_from_row_handles_null_credits():
@@ -162,16 +167,29 @@ def test_resolve_falls_back_to_fixture_when_no_codes_match(monkeypatch):
 
 
 def test_resolve_with_program_id_derives_remaining(monkeypatch):
-    monkeypatch.setattr(
-        planner_catalog,
-        "derive_remaining_courses",
-        lambda program_id, completed: ["CS 18200", "STAT 35000"],
+    """A chosen major decides the courses; whatever the client listed is ignored.
+
+    Patched at ``load_program_catalog`` rather than at the old ``derive_remaining_courses``:
+    the program path now goes through ``planner_db``, which returns requirement groups and a
+    catalog carrying real prereq edges and offerings, not a bare list of codes.
+    """
+    catalog_stub = ProgramCatalog(
+        program_id="4d1f34a2-0000-0000-0000-000000000000",
+        name="BS Computer Science",
+        catalog_year="2026-2027",
+        groups=[
+            RequirementGroup(id="core", name="Core", selective=False, credits_min=9.0,
+                             options=[["CS 18000"], ["CS 18200"], ["STAT 35000"]]),
+        ],
+        courses=[
+            Course(code="CS 18000", title="Problem Solving", credits=4),
+            Course(code="CS 18200", title="Discrete", credits=3),
+            Course(code="STAT 35000", title="Statistics", credits=3),
+        ],
     )
-    monkeypatch.setattr(
-        planner_catalog,
-        "fetch_courses_by_codes",
-        _fake_catalog_fetch({"CS 18200": ("Discrete", 3.0), "STAT 35000": ("Statistics", 3.0)}),
-    )
+    monkeypatch.setattr(planner_catalog, "load_program_catalog",
+                        lambda program_id, extra_codes=None, profile=None: catalog_stub)
+
     profile = StudentProfile(
         program_id="4d1f34a2-0000-0000-0000-000000000000",
         completed_courses=["CS 18000"],
@@ -180,4 +198,6 @@ def test_resolve_with_program_id_derives_remaining(monkeypatch):
     resolved, catalog = resolve_profile_and_catalog(profile)
 
     assert resolved.remaining_courses == ["CS 18200", "STAT 35000"]
-    assert {course.code for course in catalog} == {"CS 18200", "STAT 35000"}
+    assert {course.code for course in catalog} == {"CS 18000", "CS 18200", "STAT 35000"}
+    # The major subject is derived from the program's own required courses, never asked for.
+    assert resolved.major_subject == "CS"

@@ -143,7 +143,6 @@ def apply_plan_edit(
                 code=course.code,
                 title=course.title,
                 credits=course.credits,
-                workload_score=course.workload_score,
             )
         )
         unplanned = [code for code in unplanned if normalize_course_code(code) != wanted]
@@ -187,7 +186,6 @@ def _revalidate_layout(
                     code=planned.code,
                     title=course.title,
                     credits=course.credits,
-                    workload_score=course.workload_score,
                 )
                 normalized = course.model_copy(
                     update={"prereqs": [normalize_course_code(p) for p in course.prereqs]}
@@ -238,11 +236,6 @@ def _revalidate_layout(
                 year=original.year,
                 courses=courses,
                 total_credits=total_credits,
-                average_workload=(
-                    round(sum(course.workload_score for course in courses) / len(courses), 2)
-                    if courses
-                    else 0.0
-                ),
                 warnings=warnings,
             )
         )
@@ -254,7 +247,7 @@ def _revalidate_layout(
         )
 
     return PlanResponse(
-        student_name=plan.student_name,
+        profile_label=plan.profile_label,
         degree_program=plan.degree_program,
         semesters=rebuilt,
         unplanned_courses=unplanned,

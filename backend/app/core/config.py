@@ -18,11 +18,19 @@ class Settings(BaseSettings):
     # hit this in local testing with Ollama. A literal IP sidesteps dual-stack resolution
     # entirely. Port 8080 is llama-server's default.
     llamacpp_base_url: str = "http://127.0.0.1:8080"
-    # model_eval/'s verdict for the 2060 Super's 8GB: best quality among 8GB-class models
-    # tried, code-tuned pretraining measurably helped this app's SQL-shaped tasks. Must be
-    # the exact gguf filename llama-server was launched with (`llama-server -m <this>`) —
-    # unlike Ollama there is no tag/pull; the model is whatever file the process loaded.
-    llamacpp_model: str = "Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf"
+    # GEMMA 4 26B A4B, 2026-08-03, replacing Qwen2.5-Coder-7B. The 7B was chosen for an 8GB
+    # budget back when the model only summarised retrieved chunks; the app now asks it to
+    # EMIT THE SCHEDULE (Mode B — services/ai_planner.py), which is the task model_eval exists
+    # to measure and the only one on which models separate sharply. This box has two cards
+    # (RTX 3060 12GB + RTX 2060 Super 8GB = 20GB), which is what makes a 26B A4B MoE at Q4_K_M
+    # affordable: ~16GB of weights across both cards, ~4B active parameters per token, so it
+    # generates at small-model speed.
+    #
+    # Must be the exact gguf filename llama-server was launched with (`llama-server -m <this>`)
+    # — unlike Ollama there is no tag/pull; the model is whatever file the process loaded, and
+    # health() flags a mismatch rather than silently answering from the wrong one. See the
+    # README's llama-server invocation for the matching --tensor-split and --ctx-size.
+    llamacpp_model: str = "gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"
     # Refuses to start against a non-local/non-private base URL unless explicitly
     # lifted — a misconfiguration guard (accidentally pointing at a random public
     # endpoint), not a real security boundary.
@@ -52,6 +60,46 @@ class Settings(BaseSettings):
     # explain_plan, which is free text with no schema and has never exceeded ~1400 tokens.
     # Mirrors model_eval/config.yaml's run.max_output_tokens — change one, change the other.
     llamacpp_max_tokens: int = 4096
+
+    # The context llama-server was LAUNCHED with (`--ctx-size`). It cannot be changed per
+    # request, so nothing here can recover from getting it wrong — the two budgets below are
+    # sized against it and an overflowing prompt is a failed request, not a slow one.
+    # Mirrors model_eval/config.yaml's run.num_ctx.
+    llamacpp_context_tokens: int = 16384
+    # Mode B's own output ceiling, separate from `llamacpp_max_tokens` because the two tasks
+    # have nothing in common: a plan of study is ~470-550 tokens of `semesters` at the median
+    # and never exceeded ~1200 anywhere in model_eval's corpus, while free-text explain answers
+    # run longer. Mirrors model_eval/config.yaml's run.max_plan_tokens.
+    llamacpp_plan_max_tokens: int = 2048
+    # Ceiling on the catalog export handed to Mode B (services/plan_context.py), in the token
+    # estimate that module computes. The 16384-token window has to hold ALL of: this export,
+    # the ~1600-token rules prose, the ~200-token student block, the chat template's own
+    # wrapping, and llamacpp_plan_max_tokens of generated plan. 16384 - 2048 - 1900 ≈ 12400, so
+    # 11500 leaves a little over 900 tokens of slack for a long completed-courses list.
+    #
+    # A prompt that overflows does not degrade gracefully — the plan is truncated mid-JSON and
+    # fails to parse, which surfaces as "the AI planner was unavailable". Raise BOTH this and
+    # llamacpp_context_tokens together, never one alone.
+    plan_context_token_budget: int = 11500
+    # A 26B MoE reading an 11k-token export spends most of a minute on prompt processing alone
+    # the first time; the eval measured 32-65 s medians per plan and allowed 600 s. The old
+    # hard-coded 120 s in llamacpp_client was written for a 7B answering from three retrieved
+    # chunks and would time out a perfectly healthy plan request.
+    llamacpp_timeout_s: float = 600.0
+
+    # PROCESS OWNERSHIP — added 2026-08-04 alongside model_manager.py. Before this, llama-server
+    # was always started by hand outside the app; `llamacpp_base_url` only ever pointed at
+    # whatever was already running. Now the backend launches it itself at startup and can stop
+    # and relaunch it with a different gguf when the user picks a different model from the UI
+    # (see services/model_manager.py, api/routers/models.py) — same port every time
+    # (`llamacpp_base_url` never changes), so nothing else in the app needs to know a switch
+    # happened.
+    llamacpp_server_exe: str = "/home/wylin/ai-academic-advisor/llama.cpp/build/bin/llama-server"
+    llamacpp_models_root: str = "/home/wylin/ai-academic-advisor/models"
+    # How long a switch waits for the new process to answer /health before giving up and
+    # reporting the switch failed. Generous: a 26-35B gguf's weights alone can take a while to
+    # read off disk before CUDA init even starts, independent of GPU speed.
+    llamacpp_startup_timeout_s: float = 180.0
 
     # Anthropic API — kept as an optional swappable backend (services/anthropic_client.py),
     # not the active path. Requires ANTHROPIC_API_KEY (read by the SDK from the process

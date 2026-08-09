@@ -11,13 +11,6 @@ Two jobs:
 
 The fixture's raw bytes are hashed into every plan record: edit the fixture and old records
 stop being comparable, exactly like the prompt-hash rule.
-
-A THIRD, SEPARATE THING lives here too: :func:`load_sample_plan`, which reads the department's
-published sample four-year plan for MODE C. It is loaded from its own file and is NOT folded
-into ``fixture_hash``, because it is prompt input rather than scoring authority — it cannot
-change how any plan is scored, so adding it must not invalidate the Mode A/B records already
-on disk. It travels in Mode C's STATIC PROMPT hash instead, which is where a change to it
-genuinely does invalidate comparisons.
 """
 
 from __future__ import annotations
@@ -46,6 +39,21 @@ class Scenario:
     # and the report scores the row on violations and honest "unplanned" reporting rather
     # than on PLAN_VIABLE (which is 0% for everyone by construction).
     expect_unsatisfiable: bool = False
+    # MODE B/C ONLY — never read by the deterministic planner (Mode A), which is why these
+    # live on `Scenario` rather than `Profile`: `Profile` mirrors the production app's own
+    # student-state type, and neither field has a production counterpart to mirror. See
+    # `harness/real_db.build_scenario_database` for how each is applied.
+    #
+    # Free text ranked against `real_db._GEN_ED_THEMES`, or one of a handful of "no real
+    # preference" phrases (also in real_db.py) that resolve to a hand-picked default list —
+    # there being no enrollment data anywhere in either crawled database to rank "popular" by.
+    # None behaves exactly like "whatever works".
+    gen_ed_preference: str | None = None
+    # (subject prefix, level) — e.g. ("SPAN", 3). Narrows every world-language menu to that
+    # subject's next three courses in sequence and drops every OTHER language's options
+    # entirely; see `real_db._language_window`. None leaves language menus in the general
+    # gen_ed_preference ranking, same as any other elective group.
+    world_language: tuple[str, int] | None = None
 
 
 @dataclass
@@ -57,6 +65,28 @@ class Fixture:
     catalog: list[Course]
     requirement_groups: list[dict[str, Any]]
     scenarios: list[Scenario]
+    # Multi-school support (added 2026-08-08 for the school-sweep feature — see `run.py`'s
+    # `discover_fixtures`/`resolve_major`). `slug` is the short name `run.py run`'s default
+    # "every school" loop uses for `results/results_<slug>/`; `real_db_program_id` is the real,
+    # crawled Postgres program this fixture's scenarios were written against, so Mode B/C read
+    # the SAME program Mode A is scored against instead of whatever config.yaml happened to have
+    # configured last. Both empty ("") for a fixture that hasn't opted in yet — `run.py` treats
+    # an empty `real_db_program_id` as "skip Mode B/C for this fixture" rather than silently
+    # falling back to a different program's data.
+    slug: str = ""
+    real_db_program_id: str = ""
+    # "real_db" (default) — Mode B/C's database is fetched live from Postgres via
+    # `real_db_program_id`, exactly as every fixture worked before this field existed.
+    # "fixture" — Mode B/C's database is built from THIS fixture's own `courses`/
+    # `requirement_groups` instead (`real_db.real_db_base_from_fixture`), no Postgres round
+    # trip at all. For the school-core/gen-ed+world-language pseudo-major fixtures, whose
+    # content has no live-DB equivalent to fetch — see those fixtures' own provenance headers.
+    source: str = "real_db"
+    # ""/absent (default) = unchanged: every requirement group Postgres returns for this
+    # program. "major"/"college"/"university" narrows Mode B/C to just that
+    # `real_db._scope_for` tier — see `real_db.fetch_real_db_base`'s `scope_filter` param. A
+    # no-op for a `source: fixture` fixture (there is no live DB to filter).
+    requirement_scope: str = ""
 
     @property
     def by_code(self) -> dict[str, Course]:
@@ -90,88 +120,6 @@ class Fixture:
         return out
 
 
-@dataclass
-class SamplePlanEntry:
-    """One row of the published sample plan, as the catalog prints it."""
-
-    text: str
-    # The scoring fixture's course this row places, if any. Placeholder rows
-    # ("Elective", "Science Core Selection") have none — the catalog does not resolve them.
-    code: str | None = None
-    # Codes the row names that are NOT in the scoring fixture's catalog: "or MA 16500",
-    # "(CS 19300 suggested)". Kept so a copied-from-the-template hallucination is
-    # distinguishable from a free-hand one.
-    also_cites: tuple[str, ...] = ()
-
-
-@dataclass
-class SamplePlanSemester:
-    label: str
-    term: str
-    credits: str
-    entries: list[SamplePlanEntry]
-
-    @property
-    def codes(self) -> list[str]:
-        return [e.code for e in self.entries if e.code]
-
-
-@dataclass
-class SamplePlan:
-    """The department's published sample four-year plan. MODE C's extra input.
-
-    ``plan_hash`` is over the file's raw bytes and goes into Mode C's static prompt hash, so
-    editing the sample plan invalidates Mode C comparisons exactly the way editing a system
-    prompt does — and leaves Mode A/B alone, which is correct, since they never saw it.
-    """
-
-    path: Path
-    plan_hash: str
-    source: dict[str, Any]
-    semesters: list[SamplePlanSemester]
-
-    @property
-    def slot_of(self) -> dict[str, int]:
-        """code -> the 0-based semester index the sample plan puts it in (first wins)."""
-        out: dict[str, int] = {}
-        for index, semester in enumerate(self.semesters):
-            for code in semester.codes:
-                out.setdefault(code, index)
-        return out
-
-    @property
-    def off_catalog_codes(self) -> set[str]:
-        """Every code the plan names that the scoring fixture's catalog does not contain."""
-        return {c for s in self.semesters for e in s.entries for c in e.also_cites}
-
-
-def load_sample_plan(path: Path) -> SamplePlan:
-    raw = Path(path).read_bytes()
-    data = yaml.safe_load(raw.decode("utf-8"))
-    semesters = [
-        SamplePlanSemester(
-            label=str(row.get("label", f"Semester {i + 1}")),
-            term=str(row.get("term", "")).lower(),
-            credits=str(row.get("credits", "")),
-            entries=[
-                SamplePlanEntry(
-                    text=str(entry["text"]),
-                    code=entry.get("code"),
-                    also_cites=tuple(entry.get("also_cites") or ()),
-                )
-                for entry in row.get("entries") or []
-            ],
-        )
-        for i, row in enumerate(data.get("semesters") or [])
-    ]
-    return SamplePlan(
-        path=Path(path),
-        plan_hash=hashlib.sha256(raw).hexdigest()[:16],
-        source=data.get("source") or {},
-        semesters=semesters,
-    )
-
-
 def _course(row: dict[str, Any]) -> Course:
     return Course(
         code=row["code"],
@@ -181,7 +129,6 @@ def _course(row: dict[str, Any]) -> Course:
         coreqs=tuple(row.get("coreqs") or ()),
         offered_terms=tuple(row.get("offered_terms") or ()),
         requirement_tags=tuple(row.get("requirement_tags") or ()),
-        workload_score=int(row.get("workload_score", 3)),
         equivalent_to=str(row.get("equivalent_to") or ""),
     )
 
@@ -252,6 +199,11 @@ def load_fixture(path: Path) -> Fixture:
     # None/absent is meaningful here and must NOT be coerced to an int: it is what tells the
     # planner to derive the target per term rather than pin it.
     default_target = program.get("target_credits_per_semester")
+    # The registrar's ceiling, program-level for the same reason the major cap is: it is a rule
+    # about the university, not about any one student, so no scenario should be able to drift
+    # off it by accident. A scenario may still override it (a student on academic probation has
+    # a genuinely lower one), but none does today.
+    default_hard_credits = int(program.get("hard_credit_cap", 18))
 
     scenarios: list[Scenario] = []
     for row in data.get("scenarios", []):
@@ -271,6 +223,7 @@ def load_fixture(path: Path) -> Fixture:
                     start_year=int(p.get("start_year", 2026)),
                     semesters_to_plan=int(p.get("semesters_to_plan", 8)),
                     max_credits_per_semester=int(p.get("max_credits_per_semester", 16)),
+                    hard_credit_cap=int(p.get("hard_credit_cap", default_hard_credits)),
                     target_credits_per_semester=(
                         int(t) if (t := p.get("target_credits_per_semester",
                                               default_target)) is not None else None),
@@ -283,6 +236,12 @@ def load_fixture(path: Path) -> Fixture:
                 feedback=(row.get("feedback") or "").strip(),
                 assertions=list(row.get("assertions") or []),
                 expect_unsatisfiable=bool(row.get("expect_unsatisfiable", False)),
+                gen_ed_preference=row.get("gen_ed_preference"),
+                world_language=(
+                    (str(row["world_language"]["subject"]).upper(),
+                     int(row["world_language"]["level"]))
+                    if row.get("world_language") else None
+                ),
             )
         )
 
@@ -294,4 +253,8 @@ def load_fixture(path: Path) -> Fixture:
         catalog=catalog,
         requirement_groups=groups,
         scenarios=scenarios,
+        slug=str(program.get("slug") or Path(path).stem),
+        real_db_program_id=str(program.get("real_db_program_id") or ""),
+        source=str(program.get("source") or "real_db"),
+        requirement_scope=str(program.get("requirement_scope") or ""),
     )

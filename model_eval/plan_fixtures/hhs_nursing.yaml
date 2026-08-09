@@ -1,0 +1,430 @@
+# =============================================================================
+# PLAN-OF-STUDY GROUND TRUTH — Nursing, BSN (College of Health And Human Sciences)
+#
+#   verified: false     <-- READ THIS BEFORE QUOTING ANY NUMBER FROM A RUN
+#
+# PROVENANCE — REAL, from the crawled catalog Postgres, same source and
+# method as the other rewritten fixtures in this directory. Queried from
+# program 9f93a1d6-762f-47bd-aed2-48c94daaf554 ("Nursing, BSN" — the standard
+# 4-year track, not "Accelerated Nursing" which is a separate 59-credit
+# second-degree program also in this crawl), catalog year
+# 6f29fb29-07a2-426c-8b94-543c353843bf. Same caveats as every fixture in this
+# directory: prereqs are hand-written (Acalog publishes none — the LEVEL I ->
+# II -> III gating below is a reasonable real-world inference from how the
+# crawl itself groups these courses, not a crawled prerequisite edge), and
+# offered_terms are hand-written guesses, not run through `refresh-offerings`.
+#
+# WHAT MAKES THIS PROGRAM'S REQUIREMENT SHAPE DIFFERENT FROM CS/ME: the
+# crawl itself organizes the 66-credit nursing core into three named,
+# sequential blocks — "Nursing Courses Level I/II/III" — which is a much
+# stricter, cohort-style lockstep than any elective-driven CS/ME sequencing:
+# a real BSN student cannot get ahead by "front-loading" Level II courses the
+# way a CS student can front-load AI electives once CS 25100 clears, because
+# every Level II course gates on Level I as a block, not course-by-course.
+# This fixture models that as each level's anchor courses requiring the
+# level below's own anchor courses — an approximation, not a crawled edge,
+# same status as every other prereq in this file.
+#
+# The health-sciences chemistry sequence (CHM 11100/11200) is also its own,
+# different track from Ag/ME's CHM 11510/11610 or CS's none at all — real,
+# from this program's own crawled "Science Courses" group.
+# =============================================================================
+
+program:
+  name: "Nursing, BSN"
+  slug: "hhs"
+  # Real, crawled Postgres program this fixture's scenarios were written against —
+  # Mode B/C read this program's live catalog via `harness/real_db.py`, same source
+  # `mechanical_engineering.yaml`'s own header describes. Selected by `run.py`'s
+  # `--major`/multi-school loop, not a live DB text search — see `run.py resolve_major`.
+  real_db_program_id: "9f93a1d6-762f-47bd-aed2-48c94daaf554"
+  # SCOPE, added 2026-08-09 — Mode B/C now measure ONLY this program's own major-scope
+  # requirement groups (real_db._scope_for == "program"); college/university-scoped groups
+  # (gen-ed, First-Year Engineering, ...) are dropped from what the model is shown and
+  # scored against, tested standalone instead by their own pseudo-major fixture — see
+  # engineering_core.yaml / agriculture_core.yaml / gen_ed_world_language.yaml and
+  # real_db.fetch_real_db_base's `scope_filter` docstring. "" (absent) = unfiltered, the
+  # old/default behaviour every fixture had before this field existed.
+  requirement_scope: "major"
+  catalog_year: "2026-2027"
+  campus: "West Lafayette"
+  total_credits_min: 120
+  verified: false
+  major_subject: "NUR"
+  # 3/5, not CS MI's 2/3 default — raised after `run.py check`-equivalent reachability testing
+  # showed the 19-course, three-level NUR sequence spilling a 9th semester past the fixture's
+  # 8-semester horizon at a tighter cap: the last Level III wave (NUR 31901/41001/41401/41501/
+  # 41701, all five eligible the same term once Level II's anchors clear) kept losing the last
+  # cap slot to earlier courses and pushing the capstone off the end of the horizon. NUR
+  # courses are credit-heavy but modest per-course (1-6cr), so 5 in one term is a genuinely
+  # heavy but real nursing-heavy semester, not a loophole — max_credits_per_semester still caps
+  # the total.
+  preferred_major_courses_per_semester: 3
+  max_major_courses_per_semester: 5
+  target_credits_per_semester: 15
+  hard_credit_cap: 18
+
+courses:
+  # ---- Nursing Courses Level I (REAL, 23 credits exactly) ----
+  - code: "NUR 10800"
+    title: "Introduction To Nursing"
+    credits: 1
+    prereqs: []
+    offered_terms: [fall]                   # NOT observed — hand-written, unverified
+    requirement_tags: [required, nursing-level-1]
+  - code: "NUR 10900"
+    title: "Introduction To Nursing II"
+    credits: 1
+    prereqs: ["NUR 10800"]
+    offered_terms: [spring]                 # NOT observed — hand-written, unverified
+    requirement_tags: [required, nursing-level-1]
+  - code: "NUR 21801"
+    title: "Health Assessment And Essentials Of Nursing Practice I"
+    credits: 5
+    prereqs: ["NUR 10900"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, nursing-level-1, nursing-clinical]
+  - code: "NUR 21901"
+    title: "Pathopharmacology I"
+    credits: 3
+    prereqs: ["NUR 10900", "BIOL 20300"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, nursing-level-1]
+  - code: "NUR 22001"
+    title: "Essentials Of Nursing Practice II"
+    credits: 5
+    prereqs: ["NUR 21801", "NUR 21901"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, nursing-level-1, nursing-clinical]
+  - code: "NUR 22101"
+    title: "Pathopharmocology II"
+    credits: 3
+    prereqs: ["NUR 21901"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, nursing-level-1]
+  - code: "NUR 22201"
+    title: "Population Health"
+    credits: 2
+    prereqs: ["NUR 21801"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, nursing-level-1]
+  - code: "NUR 22301"
+    title: "Foundations Of Research And Evidence-Based Practice"
+    credits: 3
+    prereqs: ["NUR 21801"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, nursing-level-1]
+
+  # ---- Nursing Courses Level II (REAL, 24 credits exactly — gates on Level I as a block) ----
+  - code: "NUR 31401"
+    title: "Health Alterations In Adults I"
+    credits: 6
+    prereqs: ["NUR 22001", "NUR 22101"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, nursing-level-2, nursing-clinical]
+  - code: "NUR 31501"
+    title: "Nursing Of Childbearing Families"
+    credits: 5
+    prereqs: ["NUR 22001", "NUR 22101"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, nursing-level-2, nursing-clinical]
+  - code: "NUR 31601"
+    title: "Integration Seminar I"
+    credits: 1
+    prereqs: ["NUR 22001"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, nursing-level-2]
+  - code: "NUR 31701"
+    title: "Health Alterations In Adults II"
+    credits: 6
+    prereqs: ["NUR 31401"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, nursing-level-2, nursing-clinical]
+  - code: "NUR 31801"
+    title: "Psychiatric And Mental Health Nursing"
+    credits: 5
+    prereqs: ["NUR 31401"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, nursing-level-2, nursing-clinical]
+  - code: "NUR 31901"
+    title: "Integration Seminar II"
+    credits: 1
+    prereqs: ["NUR 31701"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, nursing-level-2]
+
+  # ---- Nursing Courses Level III (REAL, 19 credits exactly — gates on Level II as a block) ----
+  - code: "NUR 41001"
+    title: "Issues In Professional Nursing"
+    credits: 2
+    prereqs: ["NUR 31701", "NUR 31801"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, nursing-level-3]
+  - code: "NUR 41401"
+    title: "Pediatric Nursing"
+    credits: 5
+    prereqs: ["NUR 31701", "NUR 31801"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, nursing-level-3, nursing-clinical]
+  - code: "NUR 41501"
+    title: "Public Health Nursing"
+    credits: 5
+    prereqs: ["NUR 31701", "NUR 31801"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, nursing-level-3, nursing-clinical]
+  - code: "NUR 41701"
+    title: "Leadership In Nursing"
+    credits: 3
+    prereqs: ["NUR 31701", "NUR 31801"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, nursing-level-3]
+  - code: "NUR 42001"
+    title: "Transition To Professional Nursing Practice"
+    credits: 4
+    # CAPSTONE — the pre-licensure clinical immersion. Deepest prereq chain in this fixture.
+    prereqs: ["NUR 41401", "NUR 41501", "NUR 41701"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, nursing-level-3, nursing-clinical, project-heavy]
+
+  # ---- General Courses (REAL, from "Other Departmental" group) ----
+  - code: "HDFS 21000"
+    title: "Introduction To Human Development"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [required, nursing-support]
+  - code: "NUTR 30300"
+    title: "Essentials Of Nutrition"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [required, nursing-support, science]
+  - code: "PSY 12000"
+    title: "Elementary Psychology"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [required, nursing-support, gen-ed, social-science]
+  - code: "PSY 35000"
+    title: "Abnormal Psychology"
+    credits: 3
+    prereqs: ["PSY 12000"]
+    offered_terms: [fall, spring]           # NOT observed — hand-written, unverified
+    requirement_tags: [required, nursing-support]
+
+  # ---- Science Courses (REAL, from "Other Departmental" group — this program's own
+  # chemistry/A&P track, distinct from Ag's or ME's) ----
+  - code: "BIOL 20300"
+    title: "Human Anatomy And Physiology"
+    credits: 4
+    prereqs: ["CHM 11100"]
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [required, science]
+  - code: "BIOL 20400"
+    title: "Human Anatomy And Physiology"
+    credits: 4
+    prereqs: ["BIOL 20300"]
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [required, science]
+  - code: "BIOL 22100"
+    title: "Introduction To Microbiology"
+    credits: 4
+    prereqs: ["BIOL 20300"]
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [required, science]
+  - code: "CHM 11100"
+    title: "General Chemistry"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [required, science, chemistry]
+  - code: "CHM 11200"
+    title: "General Chemistry"
+    credits: 3
+    prereqs: ["CHM 11100"]
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [required, science, chemistry]
+
+  # ---- gen-ed core ----
+  - code: "ENGL 10600"
+    title: "First-Year Composition With Conferences"
+    credits: 4
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [required, gen-ed, writing]
+  - code: "COM 11400"
+    title: "Fundamentals Of Speech Communication"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [required, gen-ed, oral-communication]
+
+  # ---- gen-ed selective pool (reused from `cs_machine_intelligence.yaml`, same
+  # simplification as the other rewritten fixtures — see their headers) ----
+  - code: "HIST 10300"
+    title: "Introduction To The Modern World"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [gen-ed, humanities]
+  - code: "PHIL 15000"
+    title: "Principles Of Logic"
+    credits: 3
+    prereqs: []
+    offered_terms: [fall, spring, summer]   # NOT observed — hand-written, unverified
+    requirement_tags: [gen-ed, humanities]
+
+# --- degree requirements -----------------------------------------------------
+requirement_groups:
+  - id: nursing-level-1
+    name: "Nursing Courses Level I"
+    kind: all
+    courses: ["NUR 10800", "NUR 10900", "NUR 21801", "NUR 21901", "NUR 22001",
+              "NUR 22101", "NUR 22201", "NUR 22301"]
+
+  - id: nursing-level-2
+    name: "Nursing Courses Level II"
+    kind: all
+    courses: ["NUR 31401", "NUR 31501", "NUR 31601", "NUR 31701", "NUR 31801", "NUR 31901"]
+
+  - id: nursing-level-3
+    name: "Nursing Courses Level III"
+    kind: all
+    courses: ["NUR 41001", "NUR 41401", "NUR 41501", "NUR 41701", "NUR 42001"]
+
+  - id: nursing-support
+    name: "General Courses (human development, nutrition, psychology)"
+    kind: all
+    courses: ["HDFS 21000", "NUTR 30300", "PSY 12000", "PSY 35000"]
+
+  - id: science
+    name: "Science Courses (anatomy, physiology, microbiology, chemistry)"
+    kind: all
+    courses: ["BIOL 20300", "BIOL 20400", "BIOL 22100", "CHM 11100", "CHM 11200"]
+
+  - id: gen-ed-core
+    name: "University Core — written and oral communication"
+    kind: all
+    courses: ["ENGL 10600", "COM 11400"]
+
+  - id: gen-ed-selective
+    name: "University Core — additional selectives"
+    kind: choose
+    choose_credits: 6
+    courses: ["HIST 10300", "PHIL 15000"]
+
+# --- scenarios ---------------------------------------------------------------
+scenarios:
+  - id: nurs-fresh-start
+    label: "Incoming Nursing major, nothing completed"
+    profile:
+      name: "Avery"
+      degree_program: "Nursing, BSN"
+      completed_courses: []
+      start_term: fall
+      start_year: 2026
+      semesters_to_plan: 8
+      max_credits_per_semester: 17
+    feedback: >-
+      I'm starting from scratch in nursing and I want to get into the actual
+      clinical courses as early as the prerequisites allow, not just the
+      science prerequisites the whole time.
+    assertions:
+      - kind: scheduled_before
+        course: "NUR 21801"
+        semester_index: 4
+        why: "NUR 21801 is the gateway into Level I clinical coursework; deferring it past the midpoint stalls the entire nursing sequence, which is a strict three-level lockstep."
+      - kind: max_credits_at_most
+        value: 17
+    world_language:
+      subject: SPAN
+      level: 1
+
+  - id: nurs-sophomore-catchup
+    label: "Second-year student who just declared Nursing"
+    profile:
+      name: "Jordan"
+      degree_program: "Nursing, BSN"
+      completed_courses: ["CHM 11100", "CHM 11200", "ENGL 10600", "COM 11400", "PSY 12000"]
+      start_term: fall
+      start_year: 2026
+      semesters_to_plan: 8
+      max_credits_per_semester: 16
+    feedback: >-
+      I just declared nursing after a year of pre-health exploratory studies.
+      I know the Level I/II/III clinical sequence is a strict three-year
+      lockstep no matter what else I've finished, so I want anatomy and
+      physiology on track since it gates entry into Level I, and please
+      don't stack two clinical courses with their own separate clinical-hour
+      placements in the same semester if you can avoid it.
+    assertions:
+      - kind: scheduled_before
+        course: "BIOL 20300"
+        semester_index: 2
+        why: "BIOL 20300 gates NUR 21801, the entry point into the whole Level I->II->III sequence; a late start cascades through all three levels."
+      - kind: max_credits_at_most
+        value: 16
+    world_language:
+      subject: GER
+      level: 2
+
+  - id: nurs-light-load
+    label: "Nursing student who needs a reduced credit load"
+    profile:
+      name: "Sam"
+      degree_program: "Nursing, BSN"
+      completed_courses: ["CHM 11100", "ENGL 10600"]
+      start_term: fall
+      start_year: 2026
+      # 9, not 8 — reachability testing showed the credit-heavy Level III tail (16 credits
+      # of NUR courses eligible the same term) cannot fit under this scenario's own 15cr/term
+      # ceiling within 8 semesters. A lighter load genuinely taking longer to finish is the
+      # realistic outcome here, not a fixture bug — see `mi-light-load`'s own 8-of-8 baseline
+      # for contrast with a lighter-weight major where the same request doesn't cost a term.
+      semesters_to_plan: 9
+      max_credits_per_semester: 15
+    feedback: >-
+      I'm caring for a family member part time this year, so please cap me
+      at 12 credits a semester where the clinical sequence allows it.
+    assertions:
+      - kind: max_credits_at_most
+        value: 12
+        why: "The student named an explicit cap; honouring it is the whole ask."
+      - kind: proposal_sets_credit_cap
+        value: 12
+    world_language:
+      subject: FR
+      level: 1
+
+  - id: nurs-spring-start
+    label: "Spring-start transfer student"
+    profile:
+      name: "Devin"
+      degree_program: "Nursing, BSN"
+      completed_courses: ["CHM 11100", "CHM 11200", "ENGL 10600", "COM 11400",
+                          "PSY 12000", "PHIL 15000"]
+      start_term: spring
+      start_year: 2027
+      # 9, not 8 — a spring start means the Level I entry course (NUR 10800, fall-only in
+      # this fixture) isn't reachable until the student's SECOND term, which pushes the whole
+      # nine-wave Level I->II->III chain (see the program-level comment on
+      # `max_major_courses_per_semester` above) one term later than a fall start gets.
+      semesters_to_plan: 9
+      max_credits_per_semester: 16
+    feedback: >-
+      I transferred in with my chemistry and gen-ed credits done and I'm
+      starting in the spring. Get me through anatomy and physiology and into
+      the Level I nursing courses.
+    notes: >-
+      A spring start shifts sequencing built around a fall cohort entry.
+      Models that assume every clinical course lines up the same way
+      regardless of start term collect prerequisite violations here.
+    assertions:
+      - kind: scheduled_before
+        course: "BIOL 20300"
+        semester_index: 2
+      - kind: max_credits_at_most
+        value: 16
+    world_language:
+      subject: JPNS
+      level: 3

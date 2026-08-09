@@ -177,19 +177,40 @@ def fetch_by_course_codes(codes: list[str]) -> list[dict[str, Any]]:
             return cur.fetchall()
 
 
-def search(embedding: list[float], top_k: int) -> list[dict[str, Any]]:
+def search(
+    embedding: list[float], top_k: int, *, metadata_type: str | None = None,
+) -> list[dict[str, Any]]:
     """The DB half of Step 3: cosine nearest-neighbour lookup.
 
     ``<=>`` is pgvector's *cosine distance* (0 = identical direction, 2 = opposite), so we
     ORDER BY it ascending to get the closest chunks and report ``1 - distance`` as an
     easy-to-read similarity in [-1, 1] (≈1 = very relevant). Returns [] if the table has not
     been created yet, so a fresh DB degrades gracefully instead of raising.
+
+    ``metadata_type`` filters BEFORE ranking (via the GIN index on ``metadata``), not after.
+    That distinction matters: the index holds one chunk per course AND one per requirement
+    block, and requirement text about the same policy is near-duplicated across every program
+    that states it — "University Core Requirements" is close to identical in ~295 programs'
+    chunks. A caller wanting only courses back who post-filtered a plain top-k would find
+    those ~295 near-duplicates crowding out every course chunk before ranking ever reached
+    one — see ``plan_suggestions.py``, which hit exactly that.
+
+    A second, sharper version of the same trap survives even with the filter IN the query:
+    pgvector's HNSW index answers ``ORDER BY <=>`` by walking the graph and examining only
+    ``hnsw.ef_search`` neighbours (40 by default) BEFORE the WHERE filter is applied. For that
+    "295 near-identical chunks" case the entire 40-neighbour neighbourhood the graph walk finds
+    can be non-course rows, so the filter has nothing to let through — zero rows back, not an
+    error, just quietly wrong. Widening ``ef_search`` for a filtered call is what fixes it; on
+    this table's size (~18k rows) Postgres typically answers by falling back to a plain
+    sequential scan, which is correct and, filtered or not, still well under 50ms.
     """
     with _connect() as conn:
         if not _table_ready(conn):
             logger.warning("academic_rules does not exist yet; run ensure_schema() and ingest.")
             return []
         with conn.cursor() as cur:
+            if metadata_type is not None:
+                cur.execute("SET LOCAL hnsw.ef_search = 1000")
             cur.execute(
                 """
                 SELECT id,
@@ -197,9 +218,10 @@ def search(embedding: list[float], top_k: int) -> list[dict[str, Any]]:
                        metadata,
                        1 - (embedding <=> %(q)s::vector) AS similarity
                 FROM academic_rules
+                WHERE %(mtype)s::text IS NULL OR metadata @> jsonb_build_object('type', %(mtype)s)
                 ORDER BY embedding <=> %(q)s::vector
                 LIMIT %(k)s
                 """,
-                {"q": _vector_literal(embedding), "k": top_k},
+                {"q": _vector_literal(embedding), "k": top_k, "mtype": metadata_type},
             )
             return cur.fetchall()
