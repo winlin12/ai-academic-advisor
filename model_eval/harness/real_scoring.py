@@ -85,6 +85,20 @@ class RealScore:
     requirement_coverage: float = 0.0
     missing_requirements: list[str] = field(default_factory=list)
     planned_credits: int = 0
+    # CREDITS TOWARD THE DEGREE, counted once per distinct course no matter how many
+    # requirement lists that course satisfies — see the block that computes these in
+    # `score_against_real_db`. `total_credits` = completed + planned; a plan can satisfy every
+    # requirement group and still fail `meets_graduation_credits`, which is exactly the case
+    # unlimited double-counting would otherwise hide.
+    completed_credits: int = 0
+    total_credits: int = 0
+    graduation_credits_required: float = 120.0
+    meets_graduation_credits: bool = False
+    # Purdue's Upper Level Requirement: >= 32 credits of junior-level-or-above coursework,
+    # counted over distinct courses exactly like `total_credits`. See the block computing it.
+    upper_level_credits: int = 0
+    upper_level_required: float = 32.0
+    meets_upper_level: bool = False
     semester_credits: list[int] = field(default_factory=list)
     credit_spread: int = 0
     idle_credits: int = 0
@@ -128,6 +142,15 @@ class RealScore:
             "requirement_coverage": round(self.requirement_coverage, 4),
             "missing_requirements": self.missing_requirements,
             "planned_credits": self.planned_credits,
+            # Distinct-course credits: a course pays into this once however many requirement
+            # lists it satisfies. See the fields' own comment on `RealScore`.
+            "completed_credits": self.completed_credits,
+            "total_credits": self.total_credits,
+            "graduation_credits_required": self.graduation_credits_required,
+            "meets_graduation_credits": self.meets_graduation_credits,
+            "upper_level_credits": self.upper_level_credits,
+            "upper_level_required": self.upper_level_required,
+            "meets_upper_level": self.meets_upper_level,
             "semester_credits": self.semester_credits,
             "credit_spread": self.credit_spread,
             "idle_credits": self.idle_credits,
@@ -151,6 +174,19 @@ class RealScore:
                 for u in self.unresolved
             ],
         }
+
+
+def _is_upper_level(code: str) -> bool:
+    """Is this a junior-level-or-above course — the Upper Level Requirement's own test?
+
+    THE FIRST DIGIT OF THE COURSE NUMBER, deliberately, rather than a `>= 30000` comparison:
+    Purdue writes five digits today (CS 30700) but the same course is CS 307 in older records,
+    and both are junior level. Comparing numerically would count the five-digit form and silently
+    fail the three-digit one. A code with no trailing number is not upper level (and not a course
+    this scorer can price anyway).
+    """
+    digits = "".join(ch for ch in code.split(" ")[-1] if ch.isdigit())
+    return bool(digits) and digits[0] >= "3"
 
 
 def _terms(profile: Profile, count: int) -> list[tuple[str, int]]:
@@ -278,6 +314,66 @@ def score_against_real_db(
     nonempty = [c for c in score.semester_credits if c > 0]
     score.credit_spread = (max(nonempty) - min(nonempty)) if nonempty else 0
 
+    # --- CREDITS TOWARD GRADUATION ------------------------------------------------------------
+    #
+    # DISTINCT COURSES ONLY, and that is the whole point of computing it separately from
+    # requirement coverage. A course may satisfy any number of requirement lists at once — the
+    # major's math requirement and the college's and UCC: QR all at the same time — and this
+    # harness deliberately allows that without limit (see `prompts.py`'s statement of the rule).
+    # What it must NOT do is let one course pay its credits three times toward the 120: a plan
+    # that satisfies every list but only carries 90 credits of actual coursework does not
+    # graduate anybody. So requirements are counted per list, credits are counted per course.
+    #
+    # `completed` and the planned semesters are disjoint by construction — `dedupe_semesters`
+    # strips every already-completed course from the plan before scoring — so summing the two is
+    # already a distinct-course sum, with no set arithmetic needed here.
+    # `all_credits` FIRST, `by_code` second. `by_code` is the budget-trimmed course table the
+    # model was shown; a completed gen-ed frequently does not survive that trim, and reading
+    # credits only from it silently valued those courses at zero — mi-ai-early lost 12 real
+    # credits (ENGL 10600, COM 11400, PHIL 11000, HIST 10300) and was then reported short of the
+    # graduation minimum it had actually met. What the student HOLDS is not a function of what
+    # fits in a prompt.
+    def _credits_of(code: str) -> int:
+        if database.all_credits.get(code):
+            return int(database.all_credits[code])
+        return int((by_code.get(code) or {}).get("credit_hours_min") or 0)
+
+    completed_codes = {canon(normalize_code(x)) for x in profile.completed_courses}
+    score.completed_credits = sum(_credits_of(c) for c in completed_codes)
+    score.total_credits = score.completed_credits + score.planned_credits
+
+    # --- UPPER LEVEL REQUIREMENT --------------------------------------------------------------
+    #
+    # "at least 32 semester hours of coursework ... expected to be at least junior-level
+    # (30000+)" — the crawl states this as prose on a group with no options, so like the
+    # University Core it is unscorable from the group tree and entirely computable from the plan
+    # itself. Counted the same way as the graduation total: DISTINCT courses, completed plus
+    # planned, each contributing its credits once.
+    #
+    # The test is the FIRST DIGIT of the course number, not `>= 30000`, so it holds for both this
+    # catalog's five-digit codes (CS 30700) and any three-digit legacy code (CS 307) that reaches
+    # the scorer — both are junior-level and both should count.
+    upper = {c for c in ({canon(normalize_code(x)) for x in profile.completed_courses} | seen)
+             if c in by_code and _is_upper_level(c)}
+    score.upper_level_credits = sum(int(by_code[c].get("credit_hours_min") or 0) for c in upper)
+    score.meets_upper_level = score.upper_level_credits >= score.upper_level_required
+    # The program's own crawled minimum where it states one; 120 is Purdue's floor for a
+    # bachelor's degree and the fallback when the catalog page omits it.
+    program_rows = database.rows("programs")
+    stated = next((r.get("total_credits_min") for r in program_rows if r.get("total_credits_min")),
+                  None)
+    score.graduation_credits_required = float(stated or 120)
+    score.meets_graduation_credits = score.total_credits >= score.graduation_credits_required
+    if not score.meets_graduation_credits:
+        short = score.graduation_credits_required - score.total_credits
+        missing_graduation = (
+            f"{short:g} more credit(s) toward the {score.graduation_credits_required:g}-credit "
+            f"graduation minimum ({score.completed_credits} completed + {score.planned_credits} "
+            f"planned = {score.total_credits})"
+        )
+    else:
+        missing_graduation = None
+
     canonical_satisfied = {canon(normalize_code(c)) for c in profile.completed_courses} | seen
     missing_labels: list[str] = []
     for group in _groups_from_tables(database):
@@ -310,6 +406,18 @@ def score_against_real_db(
 
     score.requirement_coverage = score.groups_satisfied / score.groups_total \
         if score.groups_total else 1.0
+    # LISTED WITH THE REQUIREMENTS, BUT NOT COUNTED IN `requirement_coverage`. Coverage is
+    # "what fraction of the requirement groups are satisfied"; the credit floor is not a group
+    # and folding it in would quietly change the denominator every existing number was computed
+    # against. It appears here so a short plan says so in the one place a reader looks.
+    if missing_graduation:
+        missing_labels.append(f"Graduation credit minimum: {missing_graduation}")
+    if not score.meets_upper_level:
+        missing_labels.append(
+            f"Upper Level Requirement: {score.upper_level_required - score.upper_level_credits:g} "
+            f"more credit(s) from courses numbered 30000+ "
+            f"({score.upper_level_credits} of {score.upper_level_required:g})"
+        )
     score.missing_requirements = missing_labels
     score.viable = not counts and score.requirement_coverage >= 1.0
 

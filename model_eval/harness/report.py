@@ -621,6 +621,96 @@ def _review_queue(records: list[dict], out_path: Path) -> int:
     return len(rows)
 
 
+def spec_sweep_table(root: Path) -> list[str]:
+    """Markdown decode-throughput table across the `run.py spec-sweep` arms, or [] if none ran.
+
+    HERE, NOT IN run.py, so `report` and `spec-sweep --compare-only` render one table from one
+    implementation — report.py already owns every other results-to-markdown table, and a second
+    copy in the CLI is how the two drift into disagreeing about the same numbers.
+
+    Reads `results/results_spec_<type>/runs_baseline.jsonl`, one directory per arm, written by
+    `run.py spec-sweep`. Speculative decoding changes only HOW tokens are produced, never which
+    ones, so the plan/QA tables above are the arms' quality check and this one is purely about
+    speed — the two belong in the same report rather than in separate places.
+    """
+    results = root / "results"
+    if not results.is_dir():
+        return []
+    arms = [(d.name[len("results_spec_"):].replace("_", "-"), d)
+            for d in sorted(results.iterdir())
+            if d.is_dir() and d.name.startswith("results_spec_")]
+    if not arms:
+        return []
+    # "none" is the baseline every other arm is divided by, so it has to come first whatever
+    # the directory sort produced.
+    arms.sort(key=lambda a: (a[0] != "none", a[0]))
+
+    def decode_tps(recs: list[dict[str, Any]]) -> float | None:
+        vals = [r["eval_count"] / (r["predicted_ms"] / 1000) for r in recs
+                if (r.get("eval_count") or 0) > 20 and (r.get("predicted_ms") or 0) > 0]
+        return statistics.median(vals) if vals else None
+
+    loaded = [(name, _load(d / "runs_baseline.jsonl")) for name, d in arms]
+    by_arm = [(name, _by_model(recs)) for name, recs in loaded]
+    old = _by_model(_load(root / "results_old/results/runs_baseline.jsonl"))
+    base_name, base_by_model = by_arm[0]
+
+    header = ["Model"] + [f"`{n}` tok/s" for n, _ in by_arm]
+    if len(by_arm) > 1:
+        header += ["Change", "Identical output"]
+    header += ["results_old"]
+    lines = [
+        "## Speculative decoding — `run.py spec-sweep`",
+        "",
+        "Median decode throughput per model, one column per `--spec-type` arm. Speculative "
+        "decoding drafts cheap tokens and verifies them in one batched pass: it trades spare "
+        "compute for fewer weight reads. Rejected drafts are wasted compute, so an arm CAN "
+        "come out slower than `none` — that is a result, not a bug.",
+        "",
+        "| " + " | ".join(header) + " |",
+        "|" + "|".join(["---"] * len(header)) + "|",
+    ]
+
+    for model in sorted({m for _, bm in by_arm for m in bm} | set(old)):
+        base = decode_tps(base_by_model.get(model, []))
+        row = [f"`{model}`"]
+        for _, bm in by_arm:
+            tps = decode_tps(bm.get(model, []))
+            row.append(f"{tps:.1f}" if tps else "—")
+        if len(by_arm) > 1:
+            alt = decode_tps(by_arm[1][1].get(model, []))
+            row.append(f"{alt / base:.2f}x" if (base and alt) else "—")
+            # A throughput win on an arm whose TEXT diverged is not comparing like with like:
+            # at a fixed seed the arms should produce nearly the same tokens.
+            def key(r: dict[str, Any]) -> tuple:
+                return (r.get("stage"), r.get("question_id"), r.get("run_idx"))
+            a = {key(r): r.get("output") for r in base_by_model.get(model, [])}
+            b = {key(r): r.get("output") for r in by_arm[1][1].get(model, [])}
+            shared = [k for k in a if k in b]
+            row.append(f"{sum(1 for k in shared if a[k] == b[k])}/{len(shared)}"
+                       if shared else "—")
+        o = decode_tps(old.get(model, []))
+        row.append(f"{o:.1f}" if o else "—")
+        lines.append("| " + " | ".join(row) + " |")
+
+    lines += [
+        "",
+        f"Baseline column is `{base_name}`. `results_old` was recorded on an older llama.cpp "
+        "build (this box was bumped to b10362 for Muse Glimmer support), so it is a drift "
+        "cross-check — not the baseline the speculative-decoding comparison rests on.",
+        "",
+    ]
+    return lines
+
+
+def _by_model(recs: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    out: dict[str, list[dict[str, Any]]] = {}
+    for rec in recs:
+        if rec.get("model"):
+            out.setdefault(rec["model"], []).append(rec)
+    return out
+
+
 def generate_report(root: Path) -> Path:
     cfg = yaml.safe_load((root / "config.yaml").read_text())
     results = root / cfg["paths"]["results_dir"]
@@ -742,6 +832,8 @@ def generate_report(root: Path) -> Path:
         "",
     ]
 
+    lines += spec_sweep_table(root)
+
     report_path = results / "report.md"
     report_path.write_text("\n".join(lines))
     print(f"Wrote {report_path} ({count} items in the review queue)")
@@ -759,7 +851,12 @@ def _discover_school_dirs(root: Path) -> list[tuple[str, Path]]:
         return []
     out = []
     for d in sorted(base.iterdir()):
-        if d.is_dir() and d.name.startswith("results_"):
+        # `results_spec_<type>/` are spec-sweep ARMS, not schools — same school for every one
+        # of them, differing only by --spec-type. Pooling them here would double-count the one
+        # school they ran and invent slugs like "spec_none" in the per-school grid. They are
+        # reported by `spec_sweep_table` instead.
+        if d.is_dir() and d.name.startswith("results_") \
+                and not d.name.startswith("results_spec_"):
             out.append((d.name[len("results_"):], d))
     return out
 

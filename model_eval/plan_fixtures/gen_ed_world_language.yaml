@@ -45,7 +45,11 @@ program:
   major_subject: "NONE"
   preferred_major_courses_per_semester: 5
   max_major_courses_per_semester: 5
-  target_credits_per_semester: 15
+  # null since 2026-08-12: no fixed per-semester aim. The planner derives
+  # ceil(credits still to place / semesters still available), clamped by the cap, so the
+  # requirements finish spread evenly instead of every term reaching for the same number.
+  # See cs_machine_intelligence.yaml for the measurement behind it.
+  target_credits_per_semester: null
   hard_credit_cap: 18
 
 courses:

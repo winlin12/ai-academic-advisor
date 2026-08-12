@@ -143,8 +143,18 @@ def select_remaining_courses(rows: list[dict], completed: set[str]) -> list[str]
 
     Required groups contribute every unmet course. Selective groups ("choose N from list")
     contribute just enough unmet options — in catalog display order — to cover the group's
-    credit target, counting the student's completed courses toward the group first. Required
+    credit target, counting toward it every option the student is ALREADY taking. Required
     blocks come before all selectives (TODO §4.3), and duplicates keep their first slot.
+
+    A COURSE COUNTS FOR EVERY LIST IT APPEARS IN (2026-08-12). "Already taking" means completed
+    OR selected for an earlier group, and until this date only the completed half counted: a
+    selective group whose options were already on the list as another group's requirement was
+    handed a full, undiminished credit target and picked MORE courses to fill it. A CS major
+    whose core already covers the Data Science major's statistics option was told to take a
+    second statistics course for the same 3 credits. That is the same double-counting rule the
+    eval harness scores against (`real_db.merge_real_db_bases`), now applied to the input side:
+    Purdue does cap how much a minor may share with a major, and that cap is deliberately not
+    modelled here — inventing one the catalog does not state fails plans that are legal.
     """
     completed_normalized = {normalize_course_code(code) for code in completed}
 
@@ -186,11 +196,15 @@ def select_remaining_courses(rows: list[dict], completed: set[str]) -> list[str]
                 credits if credits is not None else DEFAULT_OPTION_CREDITS
                 for _code, credits in group["options"]
             )
-        remaining_needed = float(target) - sum(
-            credits if credits is not None else DEFAULT_OPTION_CREDITS
-            for code, credits in group["options"]
-            if code in completed_normalized
-        )
+        # `seen`, not `completed_normalized`: every option already on the plan pays into this
+        # group's target too. Deduplicated because a group may list the same code twice (two
+        # crawled rows for one option), and one course must not pay its credits twice here.
+        counted: set[str] = set()
+        remaining_needed = float(target)
+        for code, credits in group["options"]:
+            if code in seen and code not in counted:
+                counted.add(code)
+                remaining_needed -= credits if credits is not None else DEFAULT_OPTION_CREDITS
         for code, credits in group["options"]:
             if remaining_needed <= 0:
                 break

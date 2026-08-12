@@ -9,22 +9,33 @@ llamacpp:
   keep_log_lines: 400
 
 run:
-  # DROPPED BACK TO 16384, 2026-08-06 — was 32768 since 2026-07-31, when the mock-database
-  # export grew past 16384's headroom. That export is gone now: `course_prerequisites` is
-  # inlined into `courses` instead of a separate table, `course_planner_terms` was removed
-  # outright (no more offering-term scoring — see catalog_export.py's module docstring), and
-  # `unresolved_requirement_groups` was trimmed from 8 entries to 1. Measured against the real
-  # program (`real_db.program_id` below) at this size: 14311 of 14336 tokens available
-  # (num_ctx minus max_plan_tokens), comfortably under, across every `world_language`/
-  # `gen_ed_preference` combination tried. Revert to 32768 (or higher) first if Mode B starts
-  # exceed_context_size_error-ing again — that error is unambiguous, unlike a silently
-  # truncated plan.
+  # ONE SLOT OF 16384. Reverted 2026-08-11 from the 65536/4 multi-user experiment, on measured
+  # evidence that concurrency LOSES throughput on this workload — see `parallel` below. 16384 is
+  # a floor, not a preference: Mode B's prompt is ~12.3k tokens (~12.6k for the dual-major
+  # scenario) and `max_plan_tokens` is 2048, so a smaller context truncates every plan request
+  # and `server.check_slot_context` fails the run rather than let that happen silently.
   num_ctx: 16384
+  # HOW MANY STUDENTS ARE ON THE SITE AT ONCE. The machinery is real — `runner.run_model` keeps
+  # exactly this many requests in flight via `_run_pool` — but it is OFF, because measuring it
+  # showed it does not pay here:
+  #
+  #   qwen3.5-9b Mode B, parallel 4:  58.6 s per request -> 4/58.6 = 0.068 req/s
+  #   qwen3.5-9b Mode B, serial:      ~12 s per request  -> 1/12   = 0.083 req/s
+  #
+  # Break-even would be 48 s; at 58.6 s four-way batching is ~18% SLOWER in aggregate than
+  # serving one student at a time. The earlier 1.93x figure was measured with a ~50-token prompt
+  # and does not survive the real ~12k-token one: four simultaneous prefills contend for compute,
+  # and every decode step then reads the KV of all four sequences on a workload that is already
+  # memory-bandwidth-bound.
+  #
+  # Set it back to 4 (with num_ctx 65536) to re-run that experiment on hardware where it might
+  # pay — a single card with real bandwidth and headroom. Note that latency recorded at
+  # `parallel > 1` includes queue time and is not comparable to a serial run's.
   parallel: 1
   n_gpu_layers: 999
   n_cpu_moe: 7
-  cache_type_k: "f16"
-  cache_type_v: "f16"
+  cache_type_k: "q8_0"
+  cache_type_v: "q8_0"
   temperature: 0.15
   seed: 67
   top_p: 0.9
@@ -37,69 +48,115 @@ run:
   explain_question: "Why is my plan sequenced this way, and where is it risky?"
   planning_terms: [fall, spring]
   save_transcripts: true
-  # plan_a | plan_b | qa | explain | converge (Mode C — see the `convergence:` block below for
-  # its own knobs). `run.py run` with no --tasks runs every one of these; `--tasks` narrows it.
   default_tasks: [plan_a, plan_b, qa, explain, converge]
 
+# --- SPECULATIVE DECODING ------------------------------------------------------------------
+# A 0.8B draft model proposes tokens and the model under test verifies them in one batched pass
+# (see harness/server.py's own `speculative decoding` section for the mechanism and the flags).
+# Generation here is memory-bandwidth-bound, so the verification of four drafted tokens costs
+# barely more than decoding one — that is where the wall-clock comes from.
+#
+# MEASURED ON THIS BOX 2026-08-11, one 8-semester-plan generation (~1841 tokens of JSON, the
+# shape every mode here actually produces), same prompt/seed/sampler, spec vs. --no-spec:
+#
+#   qwen3.6-27b     18.65 -> 25.04 tok/s  (+34%)   96.7% of drafted tokens accepted
+#   qwen3.5-9b      52.44 -> 53.87 tok/s  (+2.7%)  96.0% accepted
+#
+# THE 9B GAIN IS NOISE-ADJACENT AND THAT IS THE EXPECTED SHAPE, not a misconfiguration: the
+# draft costs a fixed ~4 small forward passes per verification, and the bigger the target the
+# more that buys. A 9B fully on one card is already cheap enough per token that drafting nearly
+# breaks even. `draft:` is left on for it anyway — it does not lose, and dropping it would make
+# the Qwen entries differ from each other on an axis unrelated to what is being measured.
+# Structured JSON under a schema is the best case for acceptance (the draft rarely has a real
+# choice to get wrong); prose answers accept less, so do not read 96% as a general figure.
+#
+# ⚠ TURN THIS OFF (`run.py run --no-spec`) BEFORE COMPARING AGAINST PRE-2026-08-11 RESULTS.
+# Accepting a drafted token depends on the target's sampler agreeing with the draft, so at
+# temperature 0.15 a speculative run is a near — not exact — reproduction of the unspeculated
+# sampling path: same model, same seed, possibly a different plan. Latency numbers from the two
+# settings measure different things by design; quality numbers must not be pooled across them.
+# Every `env` record and `meta_{tag}.json` carries `speculative` so a file can be told apart.
+# CONFIRMED, not theoretical: the two 27B runs measured above returned DIFFERENT PLANS from the
+# identical prompt and seed (different electives, a different course in semester 2). Per-record
+# `draft_n`/`draft_n_accepted`/`draft_acceptance` in runs_*.jsonl say what each generation did.
+speculative:
+  enabled: true
+
+  # Qwen3.5-0.8B (Q6_K, 0.64 GiB) — the smallest model that shares the Qwen3.5/3.6 vocabulary
+  # (248320 tokens, identical across 0.8B/2B/4B/9B/27B/35B-A3B; `run.py check` verifies it
+  # rather than trusting this comment). Q6_K, not the Q4_K_M every target here uses: quant
+  # damage costs a 0.8B model proportionally more accuracy, acceptance rate is the entire
+  # source of the speedup, and the 110 MB over Q4_K_M is nothing against 20 GB of VRAM.
+  # NO DRAFT EXISTS for gemma4-* or muse-glimmer-30b — a different vocabulary cannot draft for
+  # them at all (llama.cpp aborts the server at load), which is why `draft:` is per-model below
+  # rather than something applied to every entry.
+  draft_gguf: "qwen3.5-0.8b-draft/Qwen3.5-0.8B-Q6_K.gguf"
+
+  n_max: 4          # tokens drafted per verification pass
+  n_min: 0
+  p_min: 0.75       # stop drafting when the draft model's own confidence drops below this
+  cache_type_k: "q8_0"
+  cache_type_v: "q8_0"
+
+  # ALL 24 DRAFT LAYERS ON ONE CARD. The draft is worthless if it is itself slow — a partially
+  # offloaded draft would add CPU-speed latency to every verification pass. Pinned to CUDA0 so
+  # it cannot re-balance the hand-sized `--tensor-split` the big models are tuned around.
+  n_gpu_layers_draft: 99
+  device_draft: "CUDA0"
+
 models:
-  
+
   - name: "qwen3.6-27b"
     gguf: "qwen3.6-27b/Qwen3.6-27B-Q4_K_M.gguf"
     bracket: server
     think: false
-    # TENSOR-SPLIT SWEEP, 2026-08-09 (RTX 3060 12GB @ CUDA0 / RTX 2060 SUPER 8GB @ CUDA1). Was
-    # 0.62,0.38. Measured across 0.45,0.55 -> 0.70,0.30 (400-token /v1/chat/completions bench,
-    # server restarted fresh each point): 0.45/0.50 OOM CUDA1 outright, 0.55 crashed (SIGSEGV,
-    # right at the edge), 0.60 was the best of everything that ran clean at 19.9 tok/s, then
-    # monotonically WORSE moving toward CUDA0 (0.62: 19.3, 0.65: 18.8, 0.70: 17.8) — this model
-    # keeps `n_cpu_moe: 7` on top of the split, so loading CUDA0 (the card already doing the
-    # most work) further only makes it slower, it does not buy headroom. 0.60 is also not a
-    # knife's edge pick: 0.55 already failed, so this sits one full step inside the safe range,
-    # not AT the boundary a slightly heavier prompt could cross.
+    # Draft back ON and the split back to the 16k-context values (2026-08-11). Both were only
+    # ever changed to buy VRAM for the 65536/4 experiment, which is reverted above: at
+    # num_ctx 16384 the KV is 693 MiB instead of 2774, so the 792 MiB draft fits again.
+    # MEASURED here: 18.65 -> 25.04 tok/s (+34%), 96.7% of drafted tokens accepted.
+    draft: true
     extra_args: ["--tensor-split", "0.60,0.40"]
-  # COMMENTED OUT 2026-08-08 for the school-fixture sweep — only qwen3.6-27b and gemma4-26b are
-  # in scope, for time's sake. Uncomment to restore the full model sweep.
-  # - name: "qwen3.5-9b"
-  #   gguf: "qwen3.5-9b/Qwen3.5-9B-Q4_K_M.gguf"
-  #   bracket: 12gb
-  #   think: false
-  #   extra_args: ["--split-mode", "none", "--main-gpu", "0"]
-  #   extra_args: ["--tensor-split", "0.63,0.37"]
-  # - name: "gemma4-12b"
-  #   gguf: "gemma4-12b/gemma-4-12b-it-IQ4_XS.gguf"
-  #   bracket: 12gb
-  #   think: false
-  #   extra_args: ["--split-mode", "none", "--main-gpu", "0"]
+  - name: "qwen3.5-9b"
+    gguf: "qwen3.5-9b/Qwen3.5-9B-Q4_K_M.gguf"
+    bracket: 12gb
+    think: false
+    draft: true
+    extra_args: ["--split-mode", "none", "--main-gpu", "0"]
+  - name: "gemma4-12b"
+    gguf: "gemma4-12b/gemma-4-12b-it-IQ4_XS.gguf"
+    bracket: 12gb
+    think: false
+    extra_args: ["--split-mode", "none", "--main-gpu", "0"]
   - name: "gemma4-26b"
     gguf: "gemma4-26b/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"
     bracket: server
     think: false
     n_cpu_moe: 0
-    # TENSOR-SPLIT SWEEP, 2026-08-09 — see qwen3.6-27b's own note just above for the method.
-    # Was 0.62,0.38. 0.45/0.50 OOM CUDA1 (this model is fully GPU-resident, `n_cpu_moe: 0`, so
-    # it has less slack than qwen's partially-CPU-offloaded footprint). 0.55 and 0.60 tied for
-    # best (65.3 / 65.5 tok/s); 0.60 chosen for the same reason as qwen — one step off the
-    # observed failure boundary rather than adjacent to it. 0.62 measured 64.1, 0.65 measured
-    # 60.6, and 0.70 OOM'd CUDA0 outright (`cudaMalloc failed: out of memory` allocating the KV
-    # cache buffer) — this card is the bottleneck past ~0.65, not the one that wants more of
     # the model.
     extra_args: ["--tensor-split", "0.60,0.40"]
-  # - name: "qwen3.6-35b-a3b"
-  #   gguf: "qwen3.6-35b-a3b/Qwen_Qwen3.6-35B-A3B-Q4_K_M.gguf"
-  #   bracket: server
-  #   think: false
-  #   n_cpu_moe: 9
-  #   extra_args: ["--tensor-split", "0.63,0.37"]
-  #   # ~5.5 GiB of experts live in system RAM here, past RLIMIT_MEMLOCK; --mlock only produces a
-  #   # failed-to-lock warning on every start. The 23.50 above was measured without it.
-  #   mlock: false
-  # - name: "gemma4-e4b"
-  #   gguf: "gemma4-e4b/gemma-4-E4B-it-Q4_K_M.gguf"
-  #   bracket: 12gb
-  #   think: false
-  #   extra_args: ["--split-mode", "none", "--main-gpu", "0"]
-
-
+  - name: "qwen3.6-35b-a3b"
+    gguf: "qwen3.6-35b-a3b/Qwen_Qwen3.6-35B-A3B-Q4_K_M.gguf"
+    bracket: server
+    think: false
+    n_cpu_moe: 9
+    # Same Qwen3.5/3.6 vocabulary as the dense entries above. This is the model that stands to
+    # gain most from drafting: its experts are split across CPU RAM, so each verified token is
+    # unusually expensive and amortizing four of them over one pass is worth more here.
+    draft: true
+    extra_args: ["--tensor-split", "0.67,0.33"]
+    # ~5.5 GiB of experts live in system RAM here, past RLIMIT_MEMLOCK; --mlock only produces a
+    # failed-to-lock warning on every start. The 23.50 above was measured without it.
+    mlock: false
+  - name: "gemma4-e4b"
+    gguf: "gemma4-e4b/gemma-4-E4B-it-Q4_K_M.gguf"
+    bracket: 12gb
+    think: false
+    extra_args: ["--split-mode", "none", "--main-gpu", "0"]
+  - name: "muse-glimmer-30b"
+    gguf: "muse-glimmer-30b/Muse-Glimmer-30B-UD-Q4_K_XL.gguf"
+    bracket: server
+    think: false
+    extra_args: ["--tensor-split", "0.60,0.40"]
 paths:
   plan_fixture: "plan_fixtures/cs_machine_intelligence.yaml"
   questions: "questions.yaml"
@@ -113,7 +170,13 @@ paths:
 # if it matches more than one program) or MODEL_EVAL_REAL_DB_URL / _PROGRAM_ID directly.
 real_db:
   url: "postgresql://catalog:catalog@localhost:5433/catalog_ingestion"
-  program_id: "4aecc496-3cfd-4090-b822-334e09007668"
+  # RE-POINTED 2026-08-10 for this box's own fresh crawl — program_id is DB-assigned (a plain
+  # `sync-program --poid 36006` UUID), not portable between installs. Old value
+  # (4aecc496-3cfd-4090-b822-334e09007668) was the original dev machine's row; verified this
+  # one instead: `select id from programs where name ilike '%Machine Intelligence%'` ->
+  # 145 requirement_groups / 19 top-level, matching this program page's own "48 requirement
+  # groups (19 top-level)" parse plus the shared/linked pages it resolves against.
+  program_id: "fc72500c-2942-497c-b5bf-411a33700333"
   # UNSET ON PURPOSE. Widens the course universe beyond what a requirement_options row
   # explicitly names — every undergraduate course under these subject prefixes becomes a
   # real, choosable elective, budget permitting — but a FIXED subject applied to every
@@ -137,6 +200,35 @@ real_db:
     - "Statistics"
     - "PHYSICS I - Physics I AND Physics II are required for a sequence."
     - "PHYSICS II - Physics I AND Physics II are required for a sequence."
+
+  # SAME KIND OF MANUAL OVERRIDE, one level down: equivalences the crawl records as separate
+  # required courses. `{alias: primary}` — the alias is folded onto the primary everywhere
+  # scoring and the rendered database look, exactly like a crawled `course_aliases` row.
+  #
+  # WHY THIS ONE EXISTS. Purdue's calculus requirement is two ALTERNATIVE SEQUENCES: MA 16100 +
+  # MA 16200 (5 credits each) or MA 16500 + MA 16600 (4 each). Acalog lists all four as plain
+  # consecutive rows under one "Mathematics" heading with no "or" between them, so the crawl
+  # stores four rows with is_required=true and is_selective_option=false — indistinguishable, to
+  # `real_db.py`'s chain detector, from a genuine "take all four". The group therefore scored as
+  # needing all four, and a plan holding the perfectly valid MA 16100 + MA 16200 was reported
+  # `short: missing MA 16500, MA 16600`, dragging down requirement coverage for something no
+  # model could have done differently.
+  #
+  # NOT A GUESS — THE CRAWL ITSELF CORROBORATES BOTH PAIRS, just not in the group that gets
+  # scored. Checked against this box's own crawl 2026-08-11: the sibling group "Mathematics
+  # (8-10 credits)" stores MA 16100 with is_selective_option=true immediately followed by
+  # MA 16500 (and MA 16200 followed by MA 16600) — the "or" chain `real_db.py` already knows how
+  # to read — as do the "Fall 1st Year"/"Spring 1st Year" sample-schedule groups. The chain
+  # detector only acts on chains found inside a required group, so that evidence never reached
+  # the flattened "Mathematics" group. The plan fixture has always modeled this correctly
+  # (MA 16500 `equivalent_to: MA 16100`); this is the real-database path agreeing with it.
+  #
+  # Only applies where the alias is an option of a REQUIRED group of the program being loaded,
+  # so this list is safe to share across every school in the multi-school sweep. Re-verify after
+  # a re-crawl, same as force_selective_groups above.
+  manual_course_aliases:
+    "MA 16500": "MA 16100"
+    "MA 16600": "MA 16200"
 
 # --- MODE C: retry to convergence -------------------------------------------------------------
 # The name is reused: `results_old8/runs_*.jsonl` still holds `"stage": "plan_mode_c"` records

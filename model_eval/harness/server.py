@@ -31,6 +31,7 @@ TWO SUPPORTED TOPOLOGIES, picked from whether ``server_exe`` ends in ``.exe``:
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import struct
@@ -88,18 +89,23 @@ _GGUF_SCALAR_FMT = {
 _GGUF_STRING, _GGUF_ARRAY = 8, 9
 
 
-def gguf_block_count(path: str | Path) -> int | None:
-    """The model's layer count from its own gguf metadata, or None if unreadable.
+def _gguf_scan(path: str | Path, wanted: tuple[str, ...]) -> dict[str, int]:
+    """Read the gguf header once and return ``{suffix: value}`` for the requested key suffixes.
 
-    The key is architecture-prefixed (``gemma4.block_count``, ``qwen3moe.block_count``, ...),
-    so it is matched by suffix. Returning None rather than raising keeps a malformed or
-    truncated header from taking down a run that did not ask for layer-relative offload;
-    the caller decides whether it actually needed the number.
+    SCALARS yield their value; ARRAYS yield their element COUNT, which is the useful number for
+    the one array anybody asks about here (``tokenizer.ggml.tokens``'s length *is* the
+    vocabulary size — gguf stores no separate vocab_size key). Keys are matched by suffix
+    because most are architecture-prefixed (``gemma4.block_count``, ``qwen3moe.block_count``).
+
+    Scanning stops as soon as every wanted key has been found, so the common case still reads
+    only the first few KB. A malformed or truncated header yields whatever was found before the
+    error rather than raising — the caller decides whether it actually needed the number.
     """
+    found: dict[str, int] = {}
     try:
         with open(path, "rb") as f:
             if f.read(4) != b"GGUF":
-                return None
+                return found
             _version, _n_tensors, n_kv = struct.unpack("<IQQ", f.read(20))
 
             def read(fmt: str) -> Any:
@@ -125,12 +131,43 @@ def gguf_block_count(path: str | Path) -> int | None:
             for _ in range(n_kv):
                 key = f.read(read("<Q")).decode("utf-8", "replace")
                 vtype = read("<I")
-                if key.endswith(".block_count") and vtype in _GGUF_SCALAR_FMT:
-                    return int(read(_GGUF_SCALAR_FMT[vtype]))
-                skip_value(vtype)
+                match = next((w for w in wanted if key.endswith(w)), None)
+                if match is None or match in found:
+                    skip_value(vtype)
+                    continue
+                if vtype in _GGUF_SCALAR_FMT:
+                    found[match] = int(read(_GGUF_SCALAR_FMT[vtype]))
+                elif vtype == _GGUF_ARRAY:
+                    # Peek the element count, then rewind and skip the array properly — the
+                    # count is what an array-valued key means to every caller here.
+                    where = f.tell()
+                    _elem_type, count = read("<I"), read("<Q")
+                    found[match] = int(count)
+                    f.seek(where)
+                    skip_value(vtype)
+                else:
+                    skip_value(vtype)
+                if len(found) == len(wanted):
+                    break
     except (OSError, struct.error, ValueError):
-        return None
-    return None
+        return found
+    return found
+
+
+def gguf_block_count(path: str | Path) -> int | None:
+    """The model's layer count from its own gguf metadata, or None if unreadable."""
+    return _gguf_scan(path, (".block_count",)).get(".block_count")
+
+
+def gguf_vocab_size(path: str | Path) -> int | None:
+    """How many tokens this gguf's tokenizer has, or None if unreadable.
+
+    THE ONE NUMBER THAT DECIDES whether a draft model can serve a target one (see
+    `resolve_draft`): llama.cpp refuses to start a speculative pair whose vocabularies differ
+    by more than a hundred tokens, and it refuses at *load* time, minutes in — which without
+    this check reads as "that model is broken" rather than "that draft doesn't belong to it".
+    """
+    return _gguf_scan(path, ("tokenizer.ggml.tokens",)).get("tokenizer.ggml.tokens")
 
 
 def resolve_n_cpu_moe(
@@ -171,6 +208,110 @@ def resolve_n_cpu_moe(
             # experts on the card", and 0 is --cpu-moe.
             return max(0, blocks - int(n_gpu_moe))
     return None
+
+
+# --- speculative decoding -----------------------------------------------------------------
+#
+# A small draft model proposes `spec.n_max` tokens, the big one verifies them in ONE batched
+# forward pass, and every token the big model would have produced anyway is kept. Generation
+# stays memory-bandwidth-bound on this box, so verifying four tokens costs barely more than
+# decoding one — the speedup is real, and it is entirely a launch-flag concern (see
+# `build_argv`), which is why it lives here and not in the client.
+#
+# OPT-IN PER MODEL, NOT A RUN-LEVEL DEFAULT APPLIED TO EVERYTHING. The draft has to share the
+# target's vocabulary; llama.cpp checks that at load time and aborts the server if it doesn't,
+# so a draft applied blindly to every entry in config.yaml would not degrade gracefully — it
+# would turn every non-Qwen model into a `[SKIP] ... exited during startup`, minutes into the
+# load. Hence `speculative.draft_gguf` (the shared default) plus a per-model `draft:` opt-in.
+#
+# ⚠ A SPECULATIVE RUN IS NOT TOKEN-IDENTICAL TO A NON-SPECULATIVE ONE. llama.cpp accepts a
+# drafted token when the target's own sampler agrees with it, and `--spec-draft-p-min` lets it
+# stop drafting early; at temperature > 0 that is a *near*, not exact, reproduction of the
+# unspeculated sampling path. Same model, same prompt, same seed can therefore land on a
+# different plan. That is why the setting is recorded in `meta_{tag}.json` and in every `env`
+# record: quality numbers from a speculative sweep and a non-speculative one describe two
+# different sampling paths and must not be pooled. `run.py run --no-spec` turns it off for a
+# run that needs to be comparable to the pre-2026-08-11 results.
+
+
+def speculative_enabled(cfg: dict[str, Any]) -> bool:
+    """Is speculative decoding on for this process?
+
+    `MODEL_EVAL_SPECULATIVE` (0/1) wins over `config.yaml`'s `speculative.enabled` — the same
+    env-override pattern `run.py` already uses for MODEL_EVAL_PLAN_FIXTURE and friends, chosen
+    for the same reason: it reaches `run_eval`, `run_convergence` and `run_thinking_experiment`
+    alike without threading a new parameter through three call chains and their signatures.
+    """
+    override = os.environ.get("MODEL_EVAL_SPECULATIVE")
+    if override is not None:
+        return override.strip().lower() in ("1", "true", "yes", "on")
+    return bool((cfg.get("speculative") or {}).get("enabled", False))
+
+
+def resolve_draft(cfg: dict[str, Any], model_cfg: dict[str, Any]) -> Path | None:
+    """The draft gguf this model should be served with, or None for plain decoding.
+
+    A model's own `draft:` entry decides: `true` takes `speculative.draft_gguf`, a string names
+    its own gguf (relative to `models_root`, like every other gguf path here), and absent or
+    `false` means this model does not speculate. Returns a path that may not exist — `check`
+    reports a missing draft as a problem; failing here would take down a whole sweep over one
+    misconfigured entry.
+    """
+    if not speculative_enabled(cfg):
+        return None
+    draft = model_cfg.get("draft")
+    if not draft:
+        return None
+    spec = cfg.get("speculative") or {}
+    rel = spec.get("draft_gguf") if draft is True else str(draft)
+    if not rel:
+        raise ValueError(
+            f"model {model_cfg.get('name', '?')} sets `draft: true` but config.yaml's "
+            f"`speculative.draft_gguf` is unset — there is no default draft model to use."
+        )
+    return Path(cfg["llamacpp"]["models_root"]) / rel
+
+
+def draft_argv(cfg: dict[str, Any], model_cfg: dict[str, Any], *, windows: bool) -> list[str]:
+    """The `-md ...` half of the command line, or [] when this model doesn't speculate.
+
+    `--spec-type draft-simple` is passed EXPLICITLY. This build defaults `--spec-type` to
+    `none`, and the failure mode of leaving it out is the expensive kind: the server starts,
+    loads both models, serves every request correctly — and never drafts a single token, so the
+    only symptom is that the speedup you added a whole model to get is missing.
+    """
+    draft_local = resolve_draft(cfg, model_cfg)
+    if draft_local is None:
+        return []
+    spec = cfg.get("speculative") or {}
+    argv = [
+        "--spec-type", "draft-simple",
+        "-md", to_server_path(draft_local, windows=windows),
+        # How many tokens to propose per verification pass. Too few wastes the batched
+        # forward pass; too many spends draft time on tokens the target will reject anyway.
+        "--spec-draft-n-max", str(spec.get("n_max", 4)),
+        "--spec-draft-n-min", str(spec.get("n_min", 0)),
+        # Stop drafting once the draft model's own confidence falls below this — a cheap way
+        # to not pay for a speculation that is about to be rejected.
+        "--spec-draft-p-min", str(spec.get("p_min", 0.75)),
+        # The draft's KV cache is quantized like the target's (config's own defaults), because
+        # its whole job is to be small: an f16 cache for a 0.8B draft would cost more VRAM
+        # than the weights it drafts with.
+        "--spec-draft-type-k", str(spec.get("cache_type_k", cfg["run"]["cache_type_k"])),
+        "--spec-draft-type-v", str(spec.get("cache_type_v", cfg["run"]["cache_type_v"])),
+    ]
+    # KEEP THE DRAFT OFF THE SPLIT unless told otherwise. The target models here are hand-sized
+    # against a two-card `--tensor-split`; letting the draft land wherever the fit pass wants
+    # would silently re-balance memory the target's split was tuned around. `device_draft`
+    # pins it to one device (`CUDA0`), `n_gpu_layers_draft` decides how much of it is resident.
+    ngl_draft = spec.get("n_gpu_layers_draft")
+    if ngl_draft is not None:
+        argv += ["-ngld", str(ngl_draft)]
+    device_draft = spec.get("device_draft")
+    if device_draft:
+        argv += ["--spec-draft-device", str(device_draft)]
+    argv += [str(a) for a in spec.get("extra_args", [])]
+    return argv
 
 
 def is_windows_exe(server_exe: str | Path | None) -> bool:
@@ -431,8 +572,11 @@ def build_argv(
         # n_ctx 8192 per slot). So raising this silently shrinks what a single request may use,
         # and `slot_context()` below is what stops that going unnoticed.
         #
-        # The runner issues one request at a time, so anything above 1 sits idle while costing
-        # context. It is here so the eval can be run at the deployment's real slot count.
+        # AS OF 2026-08-11 THE RUNNER ACTUALLY FILLS THESE. This used to read "the runner issues
+        # one request at a time, so anything above 1 sits idle while costing context" — true
+        # then, and the reason `parallel` was left at 1. `runner.run_model` now keeps exactly
+        # `parallel` requests in flight (`_run_pool`), so the slot count is the simulated
+        # concurrent-user count and the eval measures queueing the way the deployment will.
         "--parallel", str(run.get("parallel", 1)),
         "--no-mmap",
         "--no-webui",
@@ -486,6 +630,9 @@ def build_argv(
     # --mlock OOMs on models larger than this box's RAM; see config's mlock_max_gb.
     if model_cfg.get("mlock", True):
         argv.append("--mlock")
+    # BEFORE the model's own extra_args, so a per-model override still gets the last word on
+    # any flag the speculative block also sets.
+    argv += draft_argv(cfg, model_cfg, windows=windows)
     argv += [str(a) for a in model_cfg.get("extra_args", [])]
     return argv
 

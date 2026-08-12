@@ -88,13 +88,16 @@ class _StubClient:
 # --- the prompt ------------------------------------------------------------------------------
 
 
-def test_the_prompt_names_the_target_load_not_only_the_ceiling():
+def test_the_prompt_names_the_work_left_not_only_the_ceiling():
     """A ceiling alone produced a monotonic slide to half the opening load across 162 eval
-    plans, because nothing ever told the model the room was supposed to be used."""
+    plans, because nothing ever told the model the room was supposed to be used. The total
+    outstanding says the room is there to be used; a per-semester quota is deliberately absent,
+    since a quota is something a model can satisfy while still leaving requirements unplaced."""
     _system, user = build_prompts(_profile(), _catalog())
-    assert "the load to reach, not a ceiling" in user
     assert "credits still outstanding" in user
+    assert "place all of them" in user
     assert "12 is the hard limit" in user
+    assert "Aim for" not in user
 
 
 def test_the_completed_list_is_stated_as_closed():

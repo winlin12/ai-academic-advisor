@@ -13,6 +13,13 @@
   python run.py run --major cs              just one school (see `check --major` above)
   python run.py run [--models a,b] [--brackets 8gb,coder] [--tasks plan_a,plan_b,qa]
   python run.py run --mitigate --models X   mitigation pass (multi-iteration revise loop)
+  python run.py run --no-spec               same sweep with SPECULATIVE DECODING off. On by
+                                             default (config.yaml's `speculative:` block) for
+                                             the models that declare a `draft:`; turn it off
+                                             when the run has to be token-comparable to results
+                                             recorded before it existed — accepting a drafted
+                                             token depends on the target's sampler agreeing,
+                                             so quality numbers do not pool across the setting
   python run.py run --major cs --tasks converge --preflight   MODE C only: validate locked
                                              slots, spend no GPU time (needs --major: only
                                              schools with a *.locked_slots.yaml sibling support it)
@@ -92,6 +99,11 @@ def main() -> None:
                    help="rewrite the fixture's offered_terms from observed PurdueIO offerings")
     servep = sub.add_parser("serve", help="launch llama-server for one model and hold it")
     servep.add_argument("model", help="model name from config.yaml")
+    serve_spec = servep.add_mutually_exclusive_group()
+    serve_spec.add_argument("--spec", dest="spec", action="store_true", default=None,
+                            help="force speculative decoding ON, overriding config.yaml")
+    serve_spec.add_argument("--no-spec", dest="spec", action="store_false",
+                            help="force speculative decoding OFF")
 
     runp = sub.add_parser(
         "run", help="every school by default (results/results_<slug>/ each); --major for one")
@@ -107,6 +119,17 @@ def main() -> None:
                            "runs_mitigated.jsonl (plan_a/plan_b/qa/explain only)")
     runp.add_argument("--major", help="run just one school instead of every school — see "
                                       "`check --major`")
+    # SPECULATIVE DECODING (config.yaml's `speculative:` block; harness/server.py builds the
+    # flags). On by default there for the models that declare a `draft:`; --no-spec forces it
+    # off for a run that has to be comparable to results recorded before it existed, and --spec
+    # forces it on for a config.yaml that has it disabled. Both reach converge and
+    # plan_b_thinking too, since all three launch their servers through the same `build_argv`.
+    spec_group = runp.add_mutually_exclusive_group()
+    spec_group.add_argument("--spec", dest="spec", action="store_true", default=None,
+                            help="force speculative decoding ON, overriding config.yaml")
+    spec_group.add_argument("--no-spec", dest="spec", action="store_false",
+                            help="force speculative decoding OFF — use this when the run must "
+                                 "be token-comparable to a non-speculative one")
     # converge-only knobs. No-ops unless "converge" is in --tasks.
     runp.add_argument("--variants", help="converge only: comma-separated blind,feedback "
                                          "(default: config.yaml's convergence.enabled_variants)")
@@ -136,6 +159,15 @@ def main() -> None:
         if program_id:
             os.environ["MODEL_EVAL_REAL_DB_PROGRAM_ID"] = program_id
         print(f"[major] {args.major!r} -> {slug} ({name})")
+
+    # SAME PATTERN, SAME REASON as the fixture/program env vars above: `--spec`/`--no-spec` has
+    # to reach every server launch in this process — run_eval's, run_convergence's and
+    # run_thinking_experiment's — and they do not share a call chain. `harness.server.
+    # speculative_enabled` reads this and lets it win over config.yaml's `speculative.enabled`.
+    if getattr(args, "spec", None) is not None:
+        os.environ["MODEL_EVAL_SPECULATIVE"] = "1" if args.spec else "0"
+        print(f"[spec] speculative decoding forced {'ON' if args.spec else 'OFF'} "
+              f"for this run (config.yaml overridden)")
 
     if args.cmd == "doctor":
         doctor()
@@ -484,12 +516,14 @@ def check() -> None:
         REQUIREMENT_SCOPE_ALIASES, build_scenario_database, load_real_db,
         real_db_base_from_fixture,
     )
-    from harness.server import gpu_memory_used_mb
+    from harness.server import gpu_memory_used_mb, slot_context
 
     cfg = _cfg()
     fixture_rel = os.environ.get("MODEL_EVAL_PLAN_FIXTURE", cfg["paths"]["plan_fixture"])
     fixture = load_fixture(ROOT / fixture_rel)
-    budget_tokens = cfg["run"]["num_ctx"] - cfg["run"]["max_plan_tokens"]
+    # Per-SLOT, matching `runner.load_context` exactly — see its comment for why deriving this
+    # from num_ctx silently over-fills Mode B's prompt the moment `parallel` goes above 1.
+    budget_tokens = slot_context(cfg["run"]) - cfg["run"]["max_plan_tokens"]
     if fixture.source == "fixture":
         # No Postgres for a `program.source: fixture` pseudo-major — see
         # `harness.runner.load_context`'s identical branch and
@@ -509,6 +543,7 @@ def check() -> None:
             broaden_subjects=(tuple(real_db_cfg["broaden_subjects"])
                              if real_db_cfg.get("broaden_subjects") else None),
             force_selective_groups=tuple(real_db_cfg.get("force_selective_groups") or ()),
+            manual_course_aliases=real_db_cfg.get("manual_course_aliases") or {},
             budget_tokens=budget_tokens,
             scope_filter=REQUIREMENT_SCOPE_ALIASES.get(fixture.requirement_scope),
         )
@@ -639,10 +674,12 @@ def check() -> None:
     # num_ctx is big enough. This guard is the reason a `num_ctx: 8192` edit fails `check`
     # instead of producing 135 HTTP 400s halfway through a sweep.
     from harness.server import (  # noqa: PLC0415
-        approx_tokens, check_slot_context, slot_context,
+        approx_tokens, check_slot_context,
     )
-    budget = cfg["run"]["num_ctx"] - cfg["run"]["max_plan_tokens"]
+    # PER-SLOT, for the same reason `budget_tokens` above is: at `parallel: 4` the server's
+    # total context is four students' worth, and a prompt is only ever shown to one of them.
     slot = slot_context(cfg["run"])
+    budget = slot - cfg["run"]["max_plan_tokens"]
     print(f"\nper-slot context: {slot} tokens "
           f"(num_ctx {cfg['run']['num_ctx']} / parallel {cfg['run'].get('parallel', 1)}), "
           f"minus max_plan_tokens {cfg['run']['max_plan_tokens']} = "
@@ -684,6 +721,8 @@ def check() -> None:
             print(f"  MISSING  {model['name']}: {path}")
     print(f"  {len(cfg['models']) - missing}/{len(cfg['models'])} gguf files present")
 
+    problems += _check_speculative(cfg, root)
+
     gpu = gpu_memory_used_mb()
     print(f"\nnvidia-smi: {'available, ' + str(gpu) + ' MB used' if gpu else 'NOT available'}")
 
@@ -693,6 +732,75 @@ def check() -> None:
             print(f"  - {problem}")
         sys.exit(1)
     print("\n✅ check passed. Run `python run.py doctor` before the first run on a new box.")
+
+
+def _check_speculative(cfg: dict, models_root: Path) -> list[str]:
+    """Is every model's draft pairing one llama-server will actually accept?
+
+    THE FAILURE THIS EXISTS TO MOVE EARLIER. A draft whose vocabulary doesn't match its target's
+    is not a warning in llama.cpp — the server aborts, and it aborts at load time, several
+    minutes into the run, once per model, where it reads as "that model is broken" rather than
+    "that draft doesn't belong to it". Vocabulary sizes come from the ggufs' own headers
+    (`gguf_vocab_size`), so this checks the files on disk rather than trusting config.yaml's
+    comment about which families share a tokenizer.
+
+    The 100-token tolerance is llama.cpp's own (`SPEC_VOCAB_MAX_SIZE_DIFFERENCE`): a draft may
+    differ by a handful of added special tokens, but not by a whole tokenizer.
+    """
+    from harness.server import gguf_vocab_size, resolve_draft, speculative_enabled
+
+    problems: list[str] = []
+    if not speculative_enabled(cfg):
+        print("\nspeculative decoding: OFF "
+              "(config.yaml `speculative.enabled: false`, or MODEL_EVAL_SPECULATIVE=0)")
+        return problems
+
+    spec = cfg.get("speculative") or {}
+    print(f"\nspeculative decoding: ON — draft {spec.get('draft_gguf')!r} "
+          f"(n_max {spec.get('n_max', 4)}, p_min {spec.get('p_min', 0.75)})")
+    vocab_cache: dict[Path, int | None] = {}
+
+    def vocab(path: Path) -> int | None:
+        if path not in vocab_cache:
+            vocab_cache[path] = gguf_vocab_size(path)
+        return vocab_cache[path]
+
+    for model in cfg["models"]:
+        try:
+            draft_path = resolve_draft(cfg, model)
+        except ValueError as exc:
+            problems.append(str(exc))
+            continue
+        if draft_path is None:
+            print(f"  {model['name']:22s} no draft — plain decoding")
+            continue
+        if not draft_path.exists():
+            problems.append(
+                f"model {model['name']} speculates against {draft_path}, which does not exist. "
+                f"Download it, or drop `draft:` from that entry."
+            )
+            print(f"  {model['name']:22s} MISSING DRAFT {draft_path}")
+            continue
+        target_vocab, draft_vocab = vocab(models_root / model["gguf"]), vocab(draft_path)
+        if target_vocab is None or draft_vocab is None:
+            # Unreadable header. Not a hard failure — the ggufs may still be fine and only the
+            # cheap metadata scan gave up — but say so rather than implying it was verified.
+            print(f"  {model['name']:22s} draft {draft_path.name} "
+                  f"(vocab UNVERIFIED — could not read a gguf header)")
+            continue
+        delta = abs(target_vocab - draft_vocab)
+        if delta > 100:
+            problems.append(
+                f"model {model['name']} (vocab {target_vocab}) cannot be drafted for by "
+                f"{draft_path.name} (vocab {draft_vocab}) — llama.cpp allows a difference of "
+                f"at most 100 tokens and aborts the server at load otherwise. Use a draft from "
+                f"the same model family, or drop `draft:` from that entry."
+            )
+            print(f"  {model['name']:22s} VOCAB MISMATCH {target_vocab} vs {draft_vocab}")
+        else:
+            print(f"  {model['name']:22s} draft {draft_path.name} "
+                  f"(vocab {target_vocab}{'' if delta == 0 else f' vs {draft_vocab}'} ✓)")
+    return problems
 
 
 def _load_questions(cfg: dict) -> list:

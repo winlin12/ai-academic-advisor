@@ -119,6 +119,16 @@ class CatalogDatabase:
     db_hash: str
     # table -> a short hash of just that table's rows, for per-table drift diagnostics.
     files: dict[str, str] = field(default_factory=dict)
+    # CREDIT HOURS FOR THE WHOLE COURSE UNIVERSE, including courses trimmed out of `tables`.
+    #
+    # `courses` above is budget-trimmed to what fits one prompt, which is right for what the
+    # model is SHOWN and wrong for what the student HAS. A completed gen-ed like ENGL 10600
+    # routinely does not survive the trim, and scoring it off `tables` therefore counted zero
+    # credits for a course the student really took — mi-ai-early lost 12 of its completed
+    # credits that way (ENGL 10600, COM 11400, PHIL 11000, HIST 10300), which fed straight into
+    # a false "short of the 120-credit graduation minimum". Populated from the UNTRIMMED base;
+    # empty for a hand-built database, in which case scoring falls back to `tables` as before.
+    all_credits: dict[str, float] = field(default_factory=dict)
 
     def rows(self, table: str) -> list[dict[str, Any]]:
         return self.tables.get(table, [])

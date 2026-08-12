@@ -248,8 +248,24 @@ Where things are:
   `requirement_groups` and "cover every requirement group" does not apply to them. Never invent
   a course code to satisfy one.
 - `course_aliases` - `alias_of` is an approved substitute. Take one, never both.
+- `attributes` on a course lists the University Core competencies it carries, e.g. `UCC: QR`.
+  A course tagged `UCC: QR` satisfies the "University Core: Quantitative Reasoning" group.
 
 Rules, all hard:
+- ONE COURSE CAN SATISFY SEVERAL REQUIREMENTS AT ONCE, and you should use that. A single course
+  may count toward the major, the college requirement, and a University Core competency
+  simultaneously — taking MA 16100 covers the major math requirement AND `UCC: QR`. Do not
+  schedule a second course to cover a requirement one you already placed also satisfies. Look
+  for options that close more than one group at a time; the shortest legal plan is the good one.
+- BUT CREDITS COUNT ONCE. A course double-counting across three requirement lists still
+  contributes its credit hours exactly once toward the degree total. The plan must reach the
+  graduation credit minimum in REAL credits: completed credits plus the credits of the distinct
+  courses you schedule. Satisfying every group with too few total credits does not graduate the
+  student.
+- UPPER LEVEL REQUIREMENT: at least 32 credit hours must come from courses numbered 30000 or
+  above, counting completed and planned together. Introductory courses do not count toward it,
+  so a plan made entirely of 10000- and 20000-level work fails this even when every requirement
+  group is covered.
 - PREREQUISITES COME FIRST. Every prerequisite of a course must be in a STRICTLY EARLIER
   semester than that course, or already completed. The same semester is NOT early enough.
   Before you place a course, check its own `prereq_groups`: every code in it must already be
@@ -520,8 +536,30 @@ def _database_degree_program(database: CatalogDatabase) -> str:
     return f"{name}, {degree_type}" if degree_type else name
 
 
-def _profile_block(profile: Profile, fixture: Fixture | None = None,
-                   scenario: Scenario | None = None,
+def _full_program_line(scenario: Scenario | None, primary: str) -> str:
+    """The student's WHOLE degree — primary program plus any second major or minor.
+
+    `_database_degree_program` reads `programs`, which holds only the program the database was
+    loaded for; a scenario's extra programs are merged in as requirement GROUPS (see
+    `real_db.merge_real_db_bases`) and never reach that table. So without this the prompt
+    announced "Computer Science: Machine Intelligence" to a student whose requirement list was
+    14 groups of `Data Science (major): ...` and `Mathematics (minor): ...` — the model was
+    expected to plan a dual major and a minor while being told it was planning one major.
+
+    Rendered from `Scenario.additional_programs`, the same field the merge itself reads, so the
+    sentence and the requirement list cannot drift apart.
+    """
+    extras = getattr(scenario, "additional_programs", ()) if scenario is not None else ()
+    if not extras:
+        return primary
+    parts = [
+        f"{label} (second major)" if kind == "major" else f"{label} ({kind})"
+        for _poid, kind, label in extras
+    ]
+    return f"{primary} + {' + '.join(parts)}"
+
+
+def _profile_block(profile: Profile, scenario: Scenario | None = None,
                    database: CatalogDatabase | None = None) -> str:
     """The student, and — explicitly — the boundary of what they have already done.
 
@@ -550,13 +588,15 @@ def _profile_block(profile: Profile, fixture: Fixture | None = None,
     label = ("Already completed (complete list)" if profile.completed_courses
              else "Already completed")
     preference_line = _elective_preference_line(scenario) if scenario is not None else None
-    degree_program = (_database_degree_program(database) if database is not None
-                      else profile.degree_program)
+    degree_program = _full_program_line(
+        scenario,
+        _database_degree_program(database) if database is not None else profile.degree_program,
+    )
     fye_line = _fye_deadline_line(profile, database)
     return (
         f"STUDENT: {profile.name} — {degree_program}\n"
         f"{label}: {completed}\n"
-        f"{credit_load_line(profile, fixture)}\n"
+        f"{credit_load_line(profile)}\n"
         f"{major_load_line(profile)}\n"
         + (f"{preference_line}\n" if preference_line else "")
         + (f"{fye_line}\n" if fye_line else "")
@@ -609,25 +649,25 @@ def _fye_deadline_line(profile: Profile, database: CatalogDatabase | None) -> st
     )
 
 
-def credit_load_line(profile: Profile, fixture: Fixture | None = None) -> str:
-    """The load to REACH, then the load never to exceed. Target first, and always a number.
+def credit_load_line(profile: Profile) -> str:
+    """The shape to place the work in. No credit figures at all.
 
-    THE TARGET WAS MISSING ENTIRELY, and that was the bug. `target_credits_per_semester` is
-    null in the fixture — deliberately, so the planner derives the split per term — and this
-    function read that null as "there is no honest number to print", falling back to a line
-    that named only the LIMIT. So every Mode B prompt told the model a ceiling and nothing to
-    aim at, and phrased even the spreading advice as a warning against filling terms up.
+    The line used to name a per-semester target — the same even split
+    ``planner.semester_credit_target`` computes at semester 0 — because an earlier version named
+    only the LIMIT, and models drifted downward under it: results_old9, 162 Mode B plans, mean
+    credits by semester position 13.7, 12.3, 12.0, 11.1, 11.0, 8.5, 7.9, 7.1, with
+    `gen-ed-selective: 0/6 credits` the single most common unmet requirement (57 plans).
 
-    Models did what the prompt asked. results_old9, 162 Mode B plans, mean credits by semester
-    position: 13.7, 12.3, 12.0, 11.1, 11.0, 8.5, 7.9, 7.1 — a monotonic slide to half the
-    opening load, while `gen-ed-selective: 0/6 credits` was the single most common unmet
-    requirement (57 plans). The model was leaving courses unscheduled in terms that had room,
-    because nothing ever told it the room was supposed to be used.
-
-    There IS an honest number: the same even split ``planner.semester_credit_target`` computes
-    at semester 0 — credits still to place, over semesters available, clamped by the cap. The
-    planner spends the whole plan aiming at it, so naming it is describing what a good plan
-    looks like, not inventing a figure.
+    BOTH NUMBERS CAME OUT ON 2026-08-12. The per-semester quota went first: a quota is not the
+    objective — finishing the requirements is, evenly spread — and stating one invites the model
+    to satisfy it and stop, the same failure the number was added to fix, one level up. The
+    credits-outstanding total followed, and Mode B is why. That total was
+    `sum(fixture.credits(c) for c in profile.remaining_courses)` — the FIXTURE's nine
+    requirement groups — while a Mode B model plans against the real crawled database's twenty-
+    odd. The prompt was stating a finishing condition for a different degree than the one it
+    handed the model, precise enough to be believed and wrong. The requirement lists in the
+    database are the finishing condition; they are already in front of the model, and the
+    scorers count against them.
     """
     # NO CAP LANGUAGE AT ALL, as of 2026-08-06 — an explicit experiment, not a fixed
     # conclusion: transcripts read like the model was staying suspiciously close to the
@@ -639,26 +679,9 @@ def credit_load_line(profile: Profile, fixture: Fixture | None = None) -> str:
     # now shows up as a real, measured violation instead of being warned off it in advance. If
     # this needs reverting, `limit`/`hard_cap` are still on `profile` — only the prose describing
     # them was removed here; see git history for the exact two lines to restore.
-    target = profile.target_credits_per_semester
-    remaining = 0
-    if fixture is not None:
-        remaining = sum(fixture.credits(code) for code in profile.remaining_courses)
-    if not target and remaining > 0 and profile.semesters_to_plan > 0:
-        target = -(-remaining // profile.semesters_to_plan)          # ceil, ints only
-    if not target:
-        # No fixture to count against (Mode A's call site) — name the shape only.
-        return ("Spread the courses evenly across all "
-                f"{profile.semesters_to_plan} semesters instead of filling the early ones and "
-                "leaving the later ones empty")
-    aim = int(target)
-    # THE NUMERATOR IS STATED TOO. The target is remaining/semesters, and giving only the
-    # quotient leaves the model no way to notice it has dropped something: a plan missing one
-    # 4-credit course still looks locally sensible in every term. Naming the total makes the
-    # arithmetic checkable — sum the plan, compare, and an omission is visible instead of
-    # invisible. It also states the finishing condition, which is the thing a plan is FOR.
-    total = f"{remaining} credits still outstanding. " if remaining else ""
-    return (f"Credits: {total}Aim for {aim} per semester, spread evenly across every semester "
-            f"available rather than front-loaded.")
+    return ("Spread the courses evenly across all "
+            f"{profile.semesters_to_plan} semesters instead of filling the early ones and "
+            "leaving the later ones empty")
 
 
 def major_load_line(profile: Profile) -> str:
@@ -801,7 +824,7 @@ class PromptBuilder:
 
     def _plan_user(self, scenario: Scenario) -> str:
         return (
-            f"{_profile_block(scenario.profile, self.fixture, scenario, self.database)}\n\n"
+            f"{_profile_block(scenario.profile, scenario, self.database)}\n\n"
             f"STUDENT'S REQUEST:\n{scenario.feedback}\n\n"
             f"Produce the plan of study."
         )
@@ -827,7 +850,7 @@ class PromptBuilder:
                 "Mode C needs a catalog database — pass one to PromptBuilder(database=...). "
                 "See harness/real_db.py."
             )
-        parts = [_profile_block(scenario.profile, self.fixture, scenario, self.database), ""]
+        parts = [_profile_block(scenario.profile, scenario, self.database), ""]
         if locked:
             terms = _term_sequence(scenario.profile)
             # Grouped by semester once the set gets large: after a repair pass the "locked" set

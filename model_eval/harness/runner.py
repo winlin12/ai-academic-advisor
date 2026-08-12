@@ -29,7 +29,9 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -43,7 +45,7 @@ from .fixtures import Fixture, Scenario, load_fixture
 from .llamacpp_client import GenerationResult, LlamaCppClient, LlamaCppError
 from .real_db import (
     REQUIREMENT_SCOPE_ALIASES, RealDatabaseBase, build_scenario_database, fetch_real_db_base,
-    real_db_base_from_fixture,
+    merge_real_db_bases, real_db_base_from_fixture, resolve_poid,
 )
 from .real_scoring import RealScore, score_against_real_db
 from .planner import (
@@ -55,8 +57,24 @@ from .prompts import (
     proposal_schema,
 )
 from .server import (
-    ServerHandle, gpu_memory_used_mb, resolve_host, slot_context, start_server,
+    ServerHandle, gpu_memory_used_mb, resolve_draft, resolve_host, slot_context,
+    speculative_enabled, start_server,
 )
+
+# WHAT THE PROMPT COSTS BESIDES THE DATABASE. `build_scenario_database`'s `budget_tokens` sizes
+# the rendered database ONLY, but the thing that has to fit in a slot is the whole prompt: the
+# schema description, the hard rules, the student's profile and feedback, and the response
+# format. Deriving the budget as `slot - max_plan_tokens` therefore over-spends by however much
+# that wrapper costs, and single-program scenarios only fit because the trimmer's own
+# chars-per-token estimate (2.2) is conservative against the 2.9 this harness measured.
+#
+# IT STOPPED FITTING when a scenario gained a second major and a minor (2026-08-11): three
+# programs' requirement groups rendered to ~14.7k tokens against a 14,336 budget, and
+# `check_slot_context` failed the run — correctly. Reserving the wrapper explicitly is the fix,
+# and it makes the budget mean "what the database may use" rather than "what the prompt may use
+# minus nothing". 1500 is measured against this fixture's Mode B prompt with the database
+# removed, rounded up.
+_PROMPT_OVERHEAD_TOKENS = 1500
 
 WARMUP_SYSTEM = "You reply with exactly one word."
 WARMUP_USER = "Reply with the single word: ready"
@@ -87,6 +105,10 @@ class EvalContext:
     # cost paid once per run instead of once per (model, replicate, scenario) triple.
     _scenario_databases: dict[str, CatalogDatabase] = field(default_factory=dict)
     _scenario_prompts: dict[str, PromptBuilder] = field(default_factory=dict)
+    # poid -> that program's own fetched base, for scenarios pursuing a second major or a minor
+    # (`Scenario.additional_programs`). Fetched ONCE in `load_context`, like `real_db_base`
+    # itself — each one is a full Postgres round trip, and merging is pure Python.
+    extra_program_bases: dict[str, RealDatabaseBase] = field(default_factory=dict)
 
     def database_for(self, scenario: Scenario) -> CatalogDatabase:
         """The real catalog THIS scenario is shown for Mode B/C — `real_db_base` narrowed by
@@ -98,8 +120,19 @@ class EvalContext:
         """
         cached = self._scenario_databases.get(scenario.id)
         if cached is None:
+            # SECOND MAJORS / MINORS merged in first, so the trimmer below sizes the whole
+            # multi-program degree against the budget rather than trimming the primary to fit
+            # and then blowing past it with the extras.
+            base = self.real_db_base
+            extras = [
+                (self.extra_program_bases[poid], kind, label)
+                for poid, kind, label in scenario.additional_programs
+                if poid in self.extra_program_bases
+            ]
+            if extras:
+                base = merge_real_db_bases(base, extras)
             cached = build_scenario_database(
-                self.real_db_base, gen_ed_preference=scenario.gen_ed_preference,
+                base, gen_ed_preference=scenario.gen_ed_preference,
                 world_language=scenario.world_language, budget_tokens=self.budget_tokens,
             )
             self._scenario_databases[scenario.id] = cached
@@ -315,7 +348,15 @@ def load_context(root: Path) -> EvalContext:
     # — see `harness/real_db.py`'s module docstring for why the split exists (a real program's
     # own gen-ed menus can be far too large to render whole, so what a scenario is actually shown
     # depends on ITS `gen_ed_preference`/`world_language`, not just the program).
-    budget_tokens = cfg["run"]["num_ctx"] - cfg["run"]["max_plan_tokens"]
+    # THE SLOT'S context, not the server's total. `build_scenario_database` FILLS this budget —
+    # a bigger number renders a bigger elective menu into Mode B's prompt — so deriving it from
+    # `num_ctx` meant raising num_ctx to 65536 for four slots inflated the prompt to ~49k tokens
+    # while each slot still only held 16384. Every plan request would have been truncated by the
+    # context, on every model at once, and scored as if the model had rambled. `run.py check`
+    # caught it (see `check_slot_context`); this is the fix. What one student is shown must be a
+    # function of what one student's slot can hold.
+    budget_tokens = (slot_context(cfg["run"]) - cfg["run"]["max_plan_tokens"]
+                     - _PROMPT_OVERHEAD_TOKENS)
     if fixture.source == "fixture":
         # NO POSTGRES AT ALL for a `program.source: fixture` pseudo-major (school-core /
         # gen-ed+world-language test cases) — this fixture's own courses/requirement_groups
@@ -335,6 +376,12 @@ def load_context(root: Path) -> EvalContext:
             broaden_subjects=(tuple(real_db_cfg["broaden_subjects"])
                              if real_db_cfg.get("broaden_subjects") else None),
             force_selective_groups=tuple(real_db_cfg.get("force_selective_groups") or ()),
+            manual_course_aliases=real_db_cfg.get("manual_course_aliases") or {},
+            # Every course any scenario says the student already took, so its credits are known
+            # even when this program's own requirements never mention it (ENGL 10600, COM 11400).
+            extra_course_codes=tuple(sorted(
+                {c for s in fixture.scenarios for c in s.profile.completed_courses}
+            )),
             scope_filter=scope_filter,
         )
         print(f"[real-db] loaded program {program_id} from {pg_url} "
@@ -343,8 +390,30 @@ def load_context(root: Path) -> EvalContext:
               f"maximal universe)"
               + (f" [scope={fixture.requirement_scope}]" if scope_filter else ""))
 
+    # EXTRA PROGRAMS (second majors, minors) — one fetch per distinct poid across every
+    # scenario, before any scenario database is built. A failure here is raised, not skipped: a
+    # second major that silently vanished would let the plan score as if the student owed
+    # nothing extra, which reads as a good plan rather than a broken fixture.
+    extra_program_bases: dict[str, RealDatabaseBase] = {}
+    wanted = {poid for s in fixture.scenarios for poid, _kind, _label in s.additional_programs}
+    if wanted and fixture.source != "fixture":
+        real_db_cfg = cfg.get("real_db", {})
+        pg_url = os.environ.get("MODEL_EVAL_REAL_DB_URL", real_db_cfg["url"])
+        for poid in sorted(wanted):
+            extra_id = resolve_poid(pg_url, poid)
+            extra_program_bases[poid] = fetch_real_db_base(
+                pg_url, extra_id,
+                force_selective_groups=tuple(real_db_cfg.get("force_selective_groups") or ()),
+                manual_course_aliases=real_db_cfg.get("manual_course_aliases") or {},
+                scope_filter=REQUIREMENT_SCOPE_ALIASES.get(fixture.requirement_scope),
+            )
+            print(f"[real-db] + additional program poid {poid} "
+                  f"({len(extra_program_bases[poid].always_groups)} required + "
+                  f"{len(extra_program_bases[poid].elective_groups)} elective group(s))")
+
     default_database = build_scenario_database(real_db_base, budget_tokens=budget_tokens)
     return EvalContext(
+        extra_program_bases=extra_program_bases,
         cfg=cfg,
         root=root,
         fixture=fixture,
@@ -391,12 +460,26 @@ def _env_record(
     # The server's own answer to "what context am I running?" — the check Ollama made
     # impossible. A mismatch here means this model was NOT compared at the configured size.
     server_ctx = props.get("default_generation_settings", {}).get("n_ctx") or props.get("n_ctx")
+    # SPECULATIVE DECODING, recorded per model because it is per model: only the entries with a
+    # `draft:` speculate (see `server.resolve_draft`), so one sweep's records legitimately mix
+    # drafted and undrafted models and nothing else in the file would say which is which.
+    # WHETHER IT PAID OFF is answered per generation instead, by `_base_record`'s
+    # `draft_accepted`/`draft_n` — an acceptance rate is a property of what was generated, not
+    # of the launch, and averaging it over a model's real workload is the only honest read.
+    draft_path = resolve_draft(ctx.cfg, model_cfg)
+    speculative = {
+        "enabled": draft_path is not None,
+        "draft_gguf": str(draft_path) if draft_path else None,
+        **({k: v for k, v in (ctx.cfg.get("speculative") or {}).items()
+            if k in ("n_max", "n_min", "p_min")} if draft_path else {}),
+    }
     return {
         "model": model_cfg["name"],
         "stage": "env",
         "gguf": model_cfg["gguf"],
         "bracket": model_cfg.get("bracket"),
         "think_setting": model_cfg.get("think"),
+        "speculative": speculative,
         "argv": handle.argv,
         "vram_baseline_mb": vram_baseline,
         "vram_after_warmup_mb": after,
@@ -408,6 +491,11 @@ def _env_record(
         # gets, which is num_ctx/parallel. Comparing to num_ctx would flag every model as
         # incomparable the moment `parallel` went above 1.
         "configured_parallel": ctx.cfg["run"].get("parallel", 1),
+        # HOW MANY REQUESTS WERE IN FLIGHT alongside every generation in this run. The single
+        # field that says whether this file's `ttft_s`/`total_s` are one student's latency or
+        # four students queueing — above 1 they include time spent waiting for a slot, which is
+        # the point, but it makes them incomparable to any `parallel: 1` run.
+        "simulated_users": max(1, int(ctx.cfg["run"].get("parallel", 1))),
         "expected_slot_ctx": slot_context(ctx.cfg["run"]),
         "ctx_matches_config": (
             server_ctx == slot_context(ctx.cfg["run"]) if server_ctx else None),
@@ -417,6 +505,12 @@ def _env_record(
 
 
 def _base_record(model: str, res: GenerationResult, static_hash: str, **extra) -> dict[str, Any]:
+    # llama-server reports the draft counters in its own `timings` block, and ONLY when it
+    # actually drafted (`draft_n > 0`) — so these keys are absent, not zero, for a model with no
+    # draft, and the difference is worth preserving: "did not speculate" and "speculated and
+    # every token was rejected" are opposite findings that a 0 would merge.
+    timings = res.raw_final.get("timings") or {}
+    drafted = timings.get("draft_n")
     rec = {
         "model": model,
         "static_hash": static_hash,
@@ -430,6 +524,11 @@ def _base_record(model: str, res: GenerationResult, static_hash: str, **extra) -
         "truncated": res.truncated,
         "output": res.text,
     }
+    if drafted:
+        accepted = timings.get("draft_n_accepted") or 0
+        rec["draft_n"] = drafted
+        rec["draft_n_accepted"] = accepted
+        rec["draft_acceptance"] = round(accepted / drafted, 4)
     rec.update(extra)
     return rec
 
@@ -887,6 +986,64 @@ def run_explain(
 # --- top level --------------------------------------------------------------------------------
 
 
+class _LockedWriter:
+    """`out`, made safe for the concurrent workers below.
+
+    Every task function (`run_mode_a`, `run_mode_b`, `run_explain`, `run_qa`) writes its record
+    with a bare `out.write(json.dumps(rec) + "\\n")`. With four of them running at once those
+    calls interleave mid-line and corrupt the JSONL — the identical failure `_run_lock` exists
+    to prevent between processes, arriving from inside one process instead. Wrapping the file
+    rather than adding a lock to each call site keeps all four functions unchanged and means a
+    task function added later cannot forget to take it.
+    """
+
+    def __init__(self, stream) -> None:
+        self._stream = stream
+        self._lock = threading.Lock()
+
+    def write(self, text: str) -> None:
+        with self._lock:
+            self._stream.write(text)
+
+    def flush(self) -> None:
+        with self._lock:
+            self._stream.flush()
+
+
+def _item_name(item: Any) -> str:
+    """A short, readable id for an error line — scenarios carry `.id`, questions are dicts."""
+    if isinstance(item, dict):
+        return str(item.get("id") or item.get("question") or "?")[:60]
+    return str(getattr(item, "id", item))[:60]
+
+
+def _run_pool(items: list, work, *, concurrency: int, label: str) -> None:
+    """Run `work(item)` over `items` with exactly `concurrency` in flight — the simulation.
+
+    A WORKER POOL, NOT A BATCH DUMP. Handing all 8 scenarios to the server at once and letting
+    it drain them 4 at a time would measure a backlog draining, which is a different question:
+    the wait a student experiences depends on how many people are on the site, not on how deep
+    the queue behind them is. A pool of `concurrency` keeps the in-flight count at exactly the
+    number of simulated users for the whole run.
+
+    ONE ITEM'S FAILURE IS ONE ITEM'S FAILURE. Serially, an exception propagated out of
+    `run_model` and abandoned the model; that is no longer acceptable when three other requests
+    are mid-flight and would be cancelled with it, so each item's exception is caught, recorded
+    as a `stage: "error"` row, and the rest of the wave continues.
+    """
+    if concurrency <= 1:
+        for item in items:
+            work(item)
+        return
+    with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix=label) as pool:
+        futures = {pool.submit(work, item): item for item in items}
+        for future in as_completed(futures):
+            exc = future.exception()
+            if exc is not None:
+                print(f"[error] {label} {_item_name(futures[future])}: "
+                      f"{type(exc).__name__}: {exc}")
+
+
 def _ensure_server_alive(
     ctx: EvalContext, handle: ServerHandle, client: LlamaCppClient, model_cfg: dict,
     vram_baseline: list[int] | None,
@@ -954,29 +1111,61 @@ def run_model(ctx: EvalContext, model_cfg: dict, out, *, tasks: set[str], mitiga
                   f"implies {env['expected_slot_ctx']} (num_ctx {env['configured_num_ctx']} / "
                   f"parallel {env['configured_parallel']}) — NOT comparable to the others.")
 
+        # HOW MANY STUDENTS ARE ON THE SITE AT ONCE — the same number as the server's slot
+        # count, deliberately, and read from the one place that already sets it. Diverging the
+        # two would either leave paid-for slots idle (concurrency < parallel) or queue requests
+        # behind a full server, which measures a backlog rather than concurrent users
+        # (concurrency > parallel). See config.yaml's `run.parallel`.
+        concurrency = max(1, int(ctx.cfg["run"].get("parallel", 1)))
+        out = _LockedWriter(out)
+
+        # BUILT BEFORE ANY WORKER STARTS. `database_for`/`prompts_for` memoize per scenario, and
+        # a scenario's database is a token-budget fill loop, not a cheap dict lookup. Warming
+        # them here keeps that work out of the measured window — otherwise the first wave's
+        # latency would include building four databases and would not be comparable to the
+        # second wave's, which finds them cached.
+        for scenario in ctx.fixture.scenarios:
+            ctx.prompts_for(scenario)
+
         runs = ctx.cfg["run"]["runs_per_pair"]
         for run_idx in range(runs):
-            # Plan first: the feature that matters most gets the data if a run is cut short.
-            for scenario in ctx.fixture.scenarios:
-                try:
-                    handle, client, recovery = _ensure_server_alive(
-                        ctx, handle, client, model_cfg, vram_baseline)
-                except RuntimeError as exc:
-                    print(f"[SKIP] {name}: {exc} — abandoning remaining scenarios for this model")
-                    out.write(json.dumps({"model": name, "stage": "error", "error": str(exc)}) + "\n")
-                    out.flush()
-                    return
-                if recovery:
-                    out.write(json.dumps(recovery, default=str) + "\n")
-                    out.flush()
-                    print(f"[recover] {name}: back up, resuming at {scenario.id}")
-                if "plan_a" in tasks:
-                    run_mode_a(ctx, client, model_cfg, scenario, run_idx, out, mitigate=mitigate)
-                if "plan_b" in tasks:
-                    run_mode_b(ctx, client, model_cfg, scenario, run_idx, out, mitigate=mitigate)
-                if "explain" in tasks:
-                    run_explain(ctx, client, model_cfg, scenario, run_idx, out, mitigate=mitigate)
+            # HEALTH-CHECKED PER WAVE, NOT PER SCENARIO. Serially this ran before every
+            # scenario; under a pool it cannot, because a restart swaps `handle`/`client` out
+            # from under any worker already using them. Once per wave keeps the recovery
+            # behaviour (a crash still costs one wave, not the model's whole run) without
+            # racing the workers for the server it is trying to replace.
+            try:
+                handle, client, recovery = _ensure_server_alive(
+                    ctx, handle, client, model_cfg, vram_baseline)
+            except RuntimeError as exc:
+                print(f"[SKIP] {name}: {exc} — abandoning remaining scenarios for this model")
+                out.write(json.dumps({"model": name, "stage": "error", "error": str(exc)}) + "\n")
                 out.flush()
+                return
+            if recovery:
+                out.write(json.dumps(recovery, default=str) + "\n")
+                out.flush()
+                print(f"[recover] {name}: back up, resuming at replicate {run_idx + 1}")
+
+            def one_scenario(scenario, *, _client=client, _run_idx=run_idx) -> None:
+                """One simulated student's session: their plan, then the explanation of it.
+
+                The tasks stay SEQUENTIAL within a scenario — a student does not ask for a plan
+                and an explanation of it simultaneously. The concurrency is across students,
+                which is what four people on the site actually looks like.
+                """
+                if "plan_a" in tasks:
+                    run_mode_a(ctx, _client, model_cfg, scenario, _run_idx, out, mitigate=mitigate)
+                if "plan_b" in tasks:
+                    run_mode_b(ctx, _client, model_cfg, scenario, _run_idx, out, mitigate=mitigate)
+                if "explain" in tasks:
+                    run_explain(ctx, _client, model_cfg, scenario, _run_idx, out, mitigate=mitigate)
+                out.flush()
+
+            # Plan first: the feature that matters most gets the data if a run is cut short.
+            _run_pool(list(ctx.fixture.scenarios), one_scenario,
+                      concurrency=concurrency, label="scenario")
+
             if "qa" in tasks:
                 try:
                     handle, client, recovery = _ensure_server_alive(
@@ -990,10 +1179,15 @@ def run_model(ctx: EvalContext, model_cfg: dict, out, *, tasks: set[str], mitiga
                     out.write(json.dumps(recovery, default=str) + "\n")
                     out.flush()
                     print(f"[recover] {name}: back up, resuming QA")
-                for question in ctx.questions:
-                    run_qa(ctx, client, model_cfg, question, run_idx, out, mitigate=mitigate)
+
+                def one_question(question, *, _client=client, _run_idx=run_idx) -> None:
+                    run_qa(ctx, _client, model_cfg, question, _run_idx, out, mitigate=mitigate)
+
+                _run_pool(list(ctx.questions), one_question,
+                          concurrency=concurrency, label="qa")
                 out.flush()
-            print(f"  [{name}] replicate {run_idx + 1}/{runs} done")
+            print(f"  [{name}] replicate {run_idx + 1}/{runs} done "
+                  f"(concurrency {concurrency})")
     finally:
         handle.stop(trim_log_lines=ctx.cfg["llamacpp"].get("keep_log_lines", 400))
         time.sleep(ctx.cfg["llamacpp"].get("cooldown_s", 5))
@@ -1171,8 +1365,22 @@ def write_meta(ctx: EvalContext, tag: str, selected: list[dict], tasks: set[str]
         "host": ctx.host,
         "tasks": sorted(tasks),
         "models": [m["name"] for m in selected],
+        # See `_env_record`'s `simulated_users`. Hoisted to the top level of the meta too,
+        # because "is this a load-test run or a solo run?" is the first thing that has to be
+        # true before any latency number in the matching JSONL means anything.
+        "simulated_users": max(1, int(ctx.cfg["run"].get("parallel", 1))),
         "run": ctx.cfg["run"],
         "llamacpp": ctx.cfg["llamacpp"],
+        # WHICH SAMPLING PATH THIS FILE'S RECORDS CAME OFF. A speculative run reproduces the
+        # unspeculated one only approximately (see `server.py`'s speculative section), so this
+        # is the field that says whether two results directories may be pooled — `enabled` here
+        # is the effective value after `--spec`/`--no-spec`, not just what config.yaml says.
+        "speculative": {
+            **(ctx.cfg.get("speculative") or {}),
+            "enabled": speculative_enabled(ctx.cfg),
+            "models": {m["name"]: (str(d) if (d := resolve_draft(ctx.cfg, m)) else None)
+                       for m in selected},
+        },
         "fixture": {
             "path": str(ctx.fixture.path.name),
             "hash": ctx.fixture.fixture_hash,

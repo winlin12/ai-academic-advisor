@@ -59,7 +59,12 @@ program:
   # Mode B/C read this program's live catalog via `harness/real_db.py`, same source
   # `mechanical_engineering.yaml`'s own header describes. Selected by `run.py`'s
   # `--major`/multi-school loop, not a live DB text search — see `run.py resolve_major`.
-  real_db_program_id: "4aecc496-3cfd-4090-b822-334e09007668"
+  # RE-POINTED 2026-08-10 for this box's own fresh crawl — see config.yaml's real_db.program_id
+  # comment for how this UUID was verified (145 requirement_groups / 19 top-level, matching
+  # this program page's own "48 requirement groups (19 top-level)" parse). Old value
+  # (4aecc496-3cfd-4090-b822-334e09007668) was the original dev machine's row and does not
+  # exist in this database.
+  real_db_program_id: "fc72500c-2942-497c-b5bf-411a33700333"
   # SCOPE, added 2026-08-09 — Mode B/C now measure ONLY this program's own major-scope
   # requirement groups (real_db._scope_for == "program"); college/university-scoped groups
   # (gen-ed, First-Year Engineering, ...) are dropped from what the model is shown and
@@ -115,12 +120,13 @@ program:
   # unchanged, 0 courses unplanned. Set this to the same value as the cap to get the old
   # front-loading back; set it per scenario to model a student who wants a specific load.
   #
-  # SET TO 15, 2026-08-06 — a typical full-time load, on request. This trades back some of the
-  # even-spread benefit above: a scenario whose remaining credits divided by semesters is well
-  # under 15 will now aim higher early and can run out of degree requirements to place in the
-  # last term(s) — the exact front-loading shape the `null` default was added to fix. Revert to
-  # `null` if that reappears in the transcripts.
-  target_credits_per_semester: 15
+  # Was set to 15 on 2026-08-06 (a typical full-time load, on request) and REVERTED TO null on
+  # 2026-08-12, together with the "aim for N per semester" clause in the Mode B prompt. The
+  # objective is finishing the requirements, evenly spread — not hitting a per-semester quota,
+  # which a scenario with fewer remaining credits than 15 x semesters can only hit by
+  # front-loading, the exact shape null was added to fix. Every fixture in this directory is
+  # null now; set it back here (or per scenario) to model a student who asks for a specific load.
+  target_credits_per_semester: null
 
   # THE REGISTRAR'S CEILING — added 2026-08-02, the third and last number in this family, and
   # the only one that is a rule about the UNIVERSITY rather than about a student. 18 credits is
@@ -714,7 +720,7 @@ requirement_groups:
 
 scenarios:
   - id: mi-fresh-start
-    label: "Incoming CS major, MI track, nothing completed"
+    label: "Incoming CS major, MI track, + Data Science 2nd major + Math minor"
     profile:
       name: "Avery"
       degree_program: "Computer Science, BS — Machine Intelligence"
@@ -723,10 +729,34 @@ scenarios:
       start_year: 2026
       semesters_to_plan: 8
       max_credits_per_semester: 16
+    # SECOND MAJOR + MINOR, added 2026-08-11 — the first scenario in this harness to test one.
+    # Keyed on Purdue's own `programs.poid`, not the crawl's surrogate UUID, so a re-crawl does
+    # not orphan them the way it orphaned 16 of 19 fixtures' `real_db_program_id`.
+    #
+    # THIS IS THE HARDEST SCENARIO IN THE SET BY DESIGN, and the point is what it exposes: three
+    # programs' requirement groups at once, unlimited double counting between them (a course
+    # satisfies every list it appears in), but credits counted once per distinct course toward
+    # the graduation minimum. A model that treats the three as independent will schedule the
+    # same course three times or blow the 8-semester horizon; a model that over-shares will
+    # satisfy every group and land short on real credits. Both failures are visible in
+    # `total_credits` / `meets_graduation_credits` against `requirement_coverage`.
+    #
+    # NOTE the catalog lists two undergraduate "Data Science" programs (poid 35150 and 35637,
+    # near-identical option counts). 35150 is used here; if a re-crawl makes them distinguishable
+    # this should be revisited rather than assumed still right.
+    additional_programs:
+      - poid: "35150"
+        kind: major
+        label: "Data Science"
+      - poid: "34871"
+        kind: minor
+        label: "Mathematics"
     feedback: >-
       I'm starting from scratch and I want to concentrate in machine intelligence.
-      Please get me into the AI and machine learning courses as early as the
-      prerequisites allow.
+      I'm also pursuing a second major in Data Science and a minor in Mathematics,
+      so please use courses that count toward more than one of those wherever the
+      catalog allows it. Please get me into the AI and machine learning courses as
+      early as the prerequisites allow.
     assertions:
       - kind: scheduled_before
         course: "CS 37300"

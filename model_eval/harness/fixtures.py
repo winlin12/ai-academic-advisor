@@ -54,6 +54,17 @@ class Scenario:
     # entirely; see `real_db._language_window`. None leaves language menus in the general
     # gen_ed_preference ranking, same as any other elective group.
     world_language: tuple[str, int] | None = None
+    # SECOND MAJORS AND MINORS this student is also pursuing — `(poid, kind, label)` per extra
+    # program, keyed on Purdue's own `programs.poid` rather than the crawl's surrogate UUID so a
+    # re-crawl does not orphan them (the failure that stranded 16 of 19 fixtures).
+    #
+    # MODE B/C ONLY, and scenario-level rather than fixture-level on purpose: "CS student who is
+    # also doing a Data Science second major and a Math minor" is a property of one student, not
+    # of the program. Every requirement group of every listed program is merged into what the
+    # model is shown and scored against; a course satisfies each of them independently (the
+    # harness allows unlimited double counting), while its CREDITS count once toward the
+    # graduation total. See `real_db.merge_real_db_bases`.
+    additional_programs: tuple[tuple[str, str, str], ...] = ()
 
 
 @dataclass
@@ -140,6 +151,13 @@ def select_remaining_courses(
 
     ``kind: all`` mirrors a required requirement_group; ``kind: choose`` mirrors a selective
     one. Required blocks come before all selectives and duplicates keep their first slot.
+
+    A COURSE COUNTS FOR EVERY LIST IT APPEARS IN (2026-08-12) — the same rule
+    ``real_db.merge_real_db_bases`` scores against, applied to the input side. A ``choose``
+    group's target is paid down by every option already on the list, whether the student
+    completed it or an earlier group required it; before this date only completed courses
+    counted, so a group whose options were already scheduled elsewhere still pulled in extra
+    courses to fill a target that was in fact already met.
     """
     required: list[str] = []
     selective: list[str] = []
@@ -162,9 +180,15 @@ def select_remaining_courses(
         target = group.get("choose_credits")
         if target is None:
             target = min((credits_of(c) or DEFAULT_OPTION_CREDITS) for c in options)
-        needed = float(target) - sum(
-            credits_of(code) or DEFAULT_OPTION_CREDITS for code in options if code in completed
-        )
+        # `seen`, not `completed`: an option another group already put on the list pays into
+        # this group's target too. Deduplicated — one course must not pay twice within one
+        # group, even if the group lists it twice.
+        counted: set[str] = set()
+        needed = float(target)
+        for code in options:
+            if code in seen and code not in counted:
+                counted.add(code)
+                needed -= credits_of(code) or DEFAULT_OPTION_CREDITS
         for code in options:
             if needed <= 0:
                 break
@@ -241,6 +265,11 @@ def load_fixture(path: Path) -> Fixture:
                     (str(row["world_language"]["subject"]).upper(),
                      int(row["world_language"]["level"]))
                     if row.get("world_language") else None
+                ),
+                additional_programs=tuple(
+                    (str(extra["poid"]), str(extra.get("kind") or "major"),
+                     str(extra.get("label") or extra["poid"]))
+                    for extra in (row.get("additional_programs") or [])
                 ),
             )
         )

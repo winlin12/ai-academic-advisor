@@ -88,6 +88,30 @@ def test_select_remaining_skips_completed_and_counts_them_toward_selectives():
     assert remaining == ["CS 18200", "STAT 51100"]
 
 
+def test_select_remaining_counts_a_required_course_toward_a_selective_that_lists_it():
+    """A course counts for every list it appears in. CS 18000 is a core requirement AND one of
+    the selective's options, so the selective is already paid for and must not pull in a second
+    course for credits the student is taking anyway."""
+    rows = [
+        _row("g-core", "core", None, "CS 18000", 4.0),
+        _row("g-sel", "selective", 3.0, "CS 18000", 4.0),
+        _row("g-sel", "selective", 3.0, "STAT 35000", 3.0),
+    ]
+    assert select_remaining_courses(rows, completed=set()) == ["CS 18000"]
+
+
+def test_select_remaining_counts_one_shared_course_once_per_group():
+    """Paying the target down twice from one course would leave a 6-credit group half-empty."""
+    rows = [
+        _row("g-core", "core", None, "CS 18000", 4.0),
+        # The same option crawled twice under one group, plus a genuine second option.
+        _row("g-sel", "selective", 6.0, "CS 18000", 4.0),
+        _row("g-sel", "selective", 6.0, "CS 18000", 4.0),
+        _row("g-sel", "selective", 6.0, "STAT 35000", 3.0),
+    ]
+    assert select_remaining_courses(rows, completed=set()) == ["CS 18000", "STAT 35000"]
+
+
 def test_select_remaining_selective_without_credit_target_chooses_one():
     rows = [
         _row("g-sel", "elective", None, "PHIL 11000", None),

@@ -216,7 +216,7 @@ def plan_schema(terms: list[str], course_codes: list[str]) -> dict[str, Any]:
 
 
 def credit_load_line(profile: StudentProfile, catalog: ProgramCatalog) -> str:
-    """The load to REACH, then the load never to exceed. Target first, and always a number.
+    """What is left to place, the shape to place it in, and the load never to exceed.
 
     NAMING ONLY THE CEILING WAS A MEASURED BUG. Across 162 Mode B plans the eval recorded mean
     credits by semester position of 13.7, 12.3, 12.0, 11.1, 11.0, 8.5, 7.9, 7.1 — a monotonic
@@ -224,25 +224,24 @@ def credit_load_line(profile: StudentProfile, catalog: ProgramCatalog) -> str:
     selective group left at 0 credits. The model was leaving courses unscheduled in terms that
     had room, because nothing ever told it the room was supposed to be used.
 
-    There is an honest number to print: the same even split `planner.semester_credit_target`
-    computes at semester 0. The planner aims at it for the whole plan, so naming it describes
-    what a good plan looks like rather than inventing a figure. The NUMERATOR is stated too —
-    given only the quotient, a plan missing one 4-credit course still looks locally sensible in
-    every term, and the total is what makes the omission checkable.
+    The fix was a per-semester target ("aim for N"), and the TARGET CAME BACK OUT on 2026-08-12,
+    matching the eval harness. A quota is not the objective — finishing the requirements is,
+    evenly spread — and a student whose remaining credits divided by their semesters falls under
+    the quota can only reach it by front-loading, which is the same failure one level up. The
+    numerator stays, because it is the finishing condition and it makes an omission checkable:
+    given only a per-term figure, a plan missing one 4-credit course looks locally sensible in
+    every term. `target_credits_per_semester` is no longer read here; `planner` still honours it
+    when a student asks for a specific load.
     """
     limit = profile.max_credits_per_semester
     remaining = sum(catalog.credits(code) for code in profile.remaining_courses)
-    target = profile.target_credits_per_semester
-    if not target and remaining > 0 and profile.semesters_to_plan > 0:
-        target = -(-remaining // profile.semesters_to_plan)          # integer ceiling
-    if not target:
+    if not remaining:
         return (f"Credits per semester: never more than {limit}; spread the courses evenly "
                 f"across all {profile.semesters_to_plan} semesters instead of filling the "
                 f"early ones to the limit")
-    aim = min(int(target), limit)
-    total = f"{remaining} credits still outstanding. " if remaining else ""
-    return (f"Credits: {total}Aim for {aim} per semester — the load to reach, not a ceiling. "
-            f"{limit} is the hard limit.")
+    return (f"Credits: {remaining} credits still outstanding — place all of them, spread "
+            f"evenly across every semester available rather than front-loaded. {limit} is the "
+            f"hard limit.")
 
 
 def major_load_line(profile: StudentProfile) -> str:

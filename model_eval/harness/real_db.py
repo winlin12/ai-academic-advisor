@@ -91,7 +91,8 @@ import json
 import logging
 import re
 from collections import Counter
-from dataclasses import dataclass, field
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -100,6 +101,11 @@ from psycopg.rows import dict_row
 
 from .catalog_export import TABLES, CatalogDatabase, chain_depths, render_context
 from .fixtures import Fixture
+# `normalize_code` only — so a hand-written `manual_course_aliases` key is matched against the
+# crawl the same way a model's own course code is ("ma16500", "MA-16500" -> "MA 16500"), rather
+# than silently never matching over a spacing difference. plan_scorers imports fixtures/planner
+# and never real_db, so this direction adds no cycle.
+from .plan_scorers import normalize_code
 from .planner import Course
 
 logger = logging.getLogger(__name__)
@@ -212,7 +218,50 @@ def _scope_for(requirement_type: str) -> str:
 # names on purpose: the fixture author writes what a student would call it ("major"), `_scope_for`
 # classifies `requirement_groups.requirement_type` against the crawl's own "program" tier.
 # Shared between `harness.runner.load_context` and `run.py check` so both stay in sync.
-REQUIREMENT_SCOPE_ALIASES = {"major": "program", "college": "college", "university": "university"}
+#
+# CUMULATIVE, NOT EXCLUSIVE, as of 2026-08-11 — and this is the fix for "university, school and
+# world-language requirements never resolve". It used to map each fixture scope to exactly ONE
+# `_scope_for` tier and drop every group not in it, so `requirement_scope: major` (which every
+# real-major fixture uses) discarded all 12 of CS's college/university groups. The effect was
+# not that those requirements scored badly — they were not shown to the model or scored at all,
+# while the course MENUS that satisfy them survived, because those menus carry
+# `requirement_type = NULL` and `_scope_for` calls anything untyped "program". The model was
+# handed 619 culture courses and 103 history courses and never told it owed a world language or
+# a University Core.
+#
+# A degree is nested: a major student owes the major AND the college core AND the university
+# core. So "major" now means every tier, "college" means college + university, and "university"
+# means university alone — each scope is what a student at that level actually has to complete.
+REQUIREMENT_SCOPE_ALIASES = {
+    "major": frozenset({"program", "college", "university"}),
+    "college": frozenset({"college", "university"}),
+    "university": frozenset({"university"}),
+}
+
+# Purdue's University Core Curriculum competencies, as they appear in the catalog's own option
+# text: "MA 16100 - Plane Analytic Geometry And Calculus I (UCC: QR) Credit Hours: 5.00".
+#
+# THE CORE IS ENTIRELY RECOVERABLE FROM THIS, and from nothing else in the crawl. Every
+# `requirement_groups` row that *states* the core ("University Core Requirements", type `core`)
+# is prose-only — 0 options, 0 children, 463 characters of raw_text — so the requirement is
+# unscorable from the group tree. But 40,007 `requirement_options` rows carry a UCC tag inline
+# (HUM 24289, BSS 6376, SCI 3001, STS 1900, QR 1767, IL 1243, AI 615, OC 563, WC 253 — measured
+# 2026-08-11), which is exactly the nine competencies the prose names. Parsing them onto the
+# course gives the model, and the scorer, a checkable core requirement without any crawl change.
+_UCC_RE = re.compile(r"UCC:\s*([A-Z]{2,3})\b")
+
+# Competency code -> the name the catalog gives it, for the rendered requirement.
+UCC_COMPETENCIES = {
+    "WC": "Written Communication",
+    "OC": "Oral Communication",
+    "IL": "Information Literacy",
+    "QR": "Quantitative Reasoning",
+    "SCI": "Science",
+    "STS": "Science, Technology & Society",
+    "HUM": "Human Cultures: Humanities",
+    "BSS": "Human Cultures: Behavioral/Social Science",
+    "AI": "AI Working Competency",
+}
 
 # MEASURED against this export's own JSON (dense, punctuation- and code-heavy) rather than
 # assumed from the 4:1 prose rule of thumb — see `app/services/plan_context.py`'s identical
@@ -234,6 +283,19 @@ _LANGUAGE_SUBJECTS = {
     "SPAN", "FR", "GER", "ITAL", "CHNS", "RUSS", "JPNS", "KOR", "ARAB", "PTGS",
     "LATN", "HEBR", "ASL",
 }
+
+# THE ONE PLACE THIS HARNESS EVER STOPPED A COURSE COUNTING TWICE. `Curriculum Note`'s crawled
+# raw_text states a genuine exclusivity rule — "Courses taken to meet the Foreign Language and
+# Culture requirement may not also be used to meet the General Education or Great Issues
+# requirements" — and the Gen-Ed merge below enforced it by withholding every language-subject
+# course from the pooled Gen-Ed group (see that call site for the incident that prompted it).
+#
+# OFF SINCE 2026-08-12, by decision: the harness now counts EVERY instance a course is used,
+# with no exception, so a French course fills the language requirement and the Gen-Ed pool at
+# the same time. Real exclusivity rules like this one exist and this is knowingly not modelling
+# them; a plan is scored generously here rather than failed for an overlap the scorer cannot
+# see the whole of. Flip to True to restore the crawled rule — nothing else has to change.
+_ENFORCE_LANGUAGE_GENED_EXCLUSION = False
 
 # The crawled group whose raw prose (`College of Science Core Requirements`) states the real
 # world-language rule: "Language and Culture (1-9 credits) Complete ONE of the Options from
@@ -488,6 +550,8 @@ def fetch_real_db_base(
     *,
     broaden_subjects: tuple[str, ...] | None = None,
     force_selective_groups: tuple[str, ...] = (),
+    manual_course_aliases: Mapping[str, str] | None = None,
+    extra_course_codes: tuple[str, ...] = (),
     scope_filter: str | None = None,
 ) -> RealDatabaseBase:
     """Read every table `catalog_export.TABLES` names, for one program, from the real Postgres
@@ -502,6 +566,13 @@ def fetch_real_db_base(
     a descriptive (non-generic) name is exactly the case none of those heuristics can safely
     call — see `config.yaml`'s `real_db.force_selective_groups` for the ones verified by hand
     for this program and why.
+
+    `manual_course_aliases` — `{alias_code: primary_code}` equivalences the crawl did not
+    record, applied exactly like the synthetic "or"-chain aliases below and for the same reason.
+    Needed when a group lists two ALTERNATIVE SEQUENCES as four independently required rows
+    (`is_required` true, `is_selective_option` false on every one), which is what the chain
+    detector keys off and therefore cannot see — see `config.yaml`'s
+    `real_db.manual_course_aliases` for the pairs verified by hand for this program.
 
     `scope_filter` — one of `_scope_for`'s own return values (`"program"`, `"college"`,
     `"university"`), or `None` (default: no filtering, every existing caller's behaviour is
@@ -545,7 +616,10 @@ def fetch_real_db_base(
             SELECT rg.id::text AS group_id, rg.name, rg.requirement_type, rg.credits_min,
                    rg.display_order, rg.parent_group_id::text AS parent_group_id,
                    COALESCE(c.course_code, ro.course_code_raw) AS course_code,
-                   ro.credits AS option_credits, ro.is_selective_option
+                   ro.credits AS option_credits, ro.is_selective_option,
+                   -- Carries the "(UCC: QR)" competency tag; see `_UCC_RE`. The only place in
+                   -- the crawl the University Core is recoverable from.
+                   ro.option_text
             FROM requirement_groups rg
             JOIN requirement_options ro ON ro.requirement_group_id = rg.id
             LEFT JOIN courses c ON c.id = ro.course_id
@@ -585,9 +659,17 @@ def fetch_real_db_base(
         chain_primary_gid: dict[str, str] = {}
         chaining: dict[str, bool] = {}
         chain_head: dict[str, str] = {}
+        # course code -> the University Core competencies it carries. Collected from EVERY
+        # option row across the program before any scope/elective filtering runs, because a
+        # course's UCC tag is a property of the course, not of whichever menu happened to list
+        # it — CS 18000 is `UCC: IL` wherever it appears.
+        ucc_by_code: dict[str, set[str]] = {}
         for row in raw_options:
             gid = row["group_id"]
             code = row["course_code"].strip()
+            for tag in _UCC_RE.findall(row.get("option_text") or ""):
+                if tag in UCC_COMPETENCIES:
+                    ucc_by_code.setdefault(code, set()).add(tag)
             meta = groups_meta.setdefault(gid, {
                 "name": row["name"] or "Requirement",
                 "requirement_type": row["requirement_type"] or "",
@@ -620,8 +702,12 @@ def fetch_real_db_base(
         # group already did, so no downstream code needed to change. `scope_filter=None` (the
         # default) is a no-op: every existing caller's behaviour is untouched byte-for-byte.
         if scope_filter is not None:
+            # A SET OF TIERS, not one tier — see `REQUIREMENT_SCOPE_ALIASES`. A bare string is
+            # still accepted (and still means exactly that one tier) so any caller passing
+            # `_scope_for`'s own vocabulary directly keeps working unchanged.
+            allowed = ({scope_filter} if isinstance(scope_filter, str) else frozenset(scope_filter))
             dropped_gids = {gid for gid, meta in groups_meta.items()
-                            if _scope_for(meta["requirement_type"]) != scope_filter}
+                            if _scope_for(meta["requirement_type"]) not in allowed}
             for gid in dropped_gids:
                 groups_meta.pop(gid, None)
                 option_codes.pop(gid, None)
@@ -808,25 +894,30 @@ def fetch_real_db_base(
         # need both at once — impossible — and every plan score as missing one of them no
         # matter what it scheduled).
         #
-        # STRICT PAIRS ONLY — a head with more than one chained alternate is dropped rather than
-        # aliased, even inside an `all_of` group. Confirmed on CS MI's own "Required Courses for
-        # Machine Intelligence": "MA 41600 or STAT 41600" (2 rows, a genuine cross-listing — MA
-        # 41600 and STAT 41600 ARE the same Probability course under two departments) is
-        # immediately followed by "STAT 51200 or ..." — a real crawl artifact where the run
-        # keeps chaining because STAT 41600's OWN row is also marked `is_selective_option`, and
-        # STAT 51200 ("Applied Regression Analysis") is a genuinely different course, not a
-        # third listing of Probability. A 2-item run is unambiguous; anything longer is exactly
-        # as unreliable a signal as the elective-menu case `always_gids` filters out above, and
-        # gets left alone rather than guessed at.
-        run_length: dict[str, int] = {}
-        for alt_code, primary_code in chain_primary.items():
-            run_length[primary_code] = run_length.get(primary_code, 0) + 1
+        # ANY RUN LENGTH, NOT JUST PAIRS — every alt_code in a chain aliases to that chain's own
+        # HEAD, independently; `requirement_coverage`'s "kind: all" check only needs each alias
+        # to canonicalise to the same primary, so a 3-, 4-, ... way run is exactly as sound as a
+        # 2-way one, not a different, riskier case. This used to be capped at run length 1 (i.e.
+        # exactly one alternate) out of caution that a longer run might really be an elective
+        # menu misfiled into an `all_of` group — but that risk is already handled: `_is_elective`
+        # decides `always_gids` vs `elective_gids` BEFORE this loop ever runs, so a chain reaching
+        # here has already been judged "this group is genuinely required," length included in
+        # what it saw. WAS the exact case for the cap's removal: CS MI's own "Required Courses
+        # for Machine Intelligence" has "MA 41600 or STAT 41600 or STAT 51200" as its last
+        # 3-credit slot — MA 41600/STAT 41600 are a genuine cross-listing (same Probability
+        # course, two departments) and STAT 51200 ("Applied Regression Analysis") is a real,
+        # different course that satisfies the same slot, not a third listing of Probability. The
+        # old length-1 cap left all three listed as independently required (18 credits of "must
+        # take every one" against a `credits_min` of 12), which both mis-scored any plan that
+        # picked one of the three and let a model burn a course slot scheduling MA 41600 AND
+        # STAT 41600 back to back, not realizing they were the same course. Aliasing every
+        # alternate to its run's head fixes both: the group's own `courses` list drops to just
+        # the head, matching `credits_min` exactly, and `course_aliases` (shown to the model,
+        # "take one, never both") now names the whole run.
         existing_alias_codes = {row["course_code"] for row in course_aliases_rows}
         for alt_code, primary_code in chain_primary.items():
             gid = chain_primary_gid.get(alt_code)
             if gid not in always_gids or alt_code in existing_alias_codes:
-                continue
-            if run_length.get(primary_code, 0) != 1:
                 continue
             course_aliases_rows.append({
                 "course_code": alt_code, "alias_of": primary_code,
@@ -835,6 +926,62 @@ def fetch_real_db_base(
             if alt_code in option_codes.get(gid, []):
                 option_codes[gid] = [c for c in option_codes[gid] if c != alt_code]
                 option_credits.get(gid, {}).pop(alt_code, None)
+
+        # HAND-STATED EQUIVALENCES THE CRAWL NEVER RECORDED AS ONE. The loop above can only see
+        # alternation the catalog expressed as an in-line "or" (`is_selective_option` chains).
+        # An Acalog page that lists two ALTERNATIVE SEQUENCES as plain consecutive rows under one
+        # heading produces four rows with `is_required` true and `is_selective_option` false on
+        # every one, and nothing in the crawl distinguishes that from a genuine "take all four".
+        # CS MI's "Mathematics" group is exactly this: MA 16100/16200 (the 5-credit sequence) and
+        # MA 16500/16600 (the 4-credit one) are two tracks through the same requirement, and a
+        # student takes ONE — but the group scored as needing all four, so every plan in every
+        # mode was reported `short: missing MA 16500, MA 16600` no matter what it scheduled, and
+        # the coverage number it fed was wrong for a reason the model had no way to fix.
+        #
+        # Applied here, AFTER the chain aliases, so a crawled `course_aliases` row or a detected
+        # chain always wins over a hand-written line that has gone stale against a re-crawl.
+        # Same "crawl doesn't structure it, so state it once by hand" pattern — and the same
+        # obligation to re-verify after a re-crawl — as `force_selective_groups` above.
+        # RECOMPUTED, not reused: the chain loop above appends to `course_aliases_rows` without
+        # updating `existing_alias_codes`, and the whole question here is "did anything already
+        # alias this code?". Note that being in `chain_primary` is NOT enough to skip on — the
+        # chain loop only acts on chains found inside an `always_gid`, so a pair the crawl
+        # records as an "or" in some OTHER group (a sample-schedule or credit-bounded sibling)
+        # reaches here still unaliased. That is exactly the CS MI case below.
+        existing_alias_codes = {row["course_code"] for row in course_aliases_rows}
+        for alias_code, primary_code in (manual_course_aliases or {}).items():
+            alias_code, primary_code = normalize_code(alias_code), normalize_code(primary_code)
+            if alias_code in existing_alias_codes:
+                continue
+            gid = next((g for g in always_gids if alias_code in option_codes.get(g, [])), None)
+            if gid is None:
+                # Not in any required group of THIS program — the pair is for another program,
+                # or a re-crawl moved it. Silent by design: `manual_course_aliases` is one list
+                # shared by every school the sweep runs, so "not applicable here" is the normal
+                # case, not a misconfiguration.
+                continue
+            if primary_code not in option_codes.get(gid, []):
+                # BOTH HALVES OF THE PAIR MUST BE IN THE SAME REQUIRED GROUP for the alias to
+                # mean anything, and the common reason they aren't is not a stale config line —
+                # it is a program that genuinely requires only ONE of the two sequences. Most
+                # engineering programs really do require MA 16500 + MA 16600 specifically; there
+                # is no alternation to collapse there, and aliasing MA 16500 onto an MA 16100
+                # the requirement never named would invent a substitution the catalog doesn't
+                # allow. Debug, not warning: across a multi-school sweep this is the majority
+                # case for these pairs, so warning-level would be pure noise.
+                logger.debug(
+                    "manual alias %s -> %s not applied in group %r: the primary is not one of "
+                    "its options, so this program requires the alias in its own right.",
+                    alias_code, primary_code, groups_meta[gid]["name"],
+                )
+                continue
+            course_aliases_rows.append({
+                "course_code": alias_code, "alias_of": primary_code,
+                "reason": "hand-verified equivalent sequence (not structured by the crawl)",
+            })
+            existing_alias_codes.add(alias_code)
+            option_codes[gid] = [c for c in option_codes[gid] if c != alias_code]
+            option_credits.get(gid, {}).pop(alias_code, None)
 
         always_codes = {c for gid in always_gids for c in option_codes.get(gid, [])} | {
             row["course_code"] for row in course_aliases_rows
@@ -879,6 +1026,33 @@ def fetch_real_db_base(
             (sorted(codes),),
         )
         courses_by_code = {row["course_code"]: row for row in cur.fetchall()}
+        # COURSES THE STUDENT HOLDS BUT THIS PROGRAM NEVER LISTS. A CS major's completed
+        # transcript routinely contains ENGL 10600 and COM 11400 — real Purdue courses with real
+        # credit hours (4 and 3) that appear nowhere in the CS requirement universe, so the
+        # query above never sees them. Without this they were priced at zero and the student was
+        # reported short of a graduation minimum they had actually met.
+        #
+        # Fetched into `courses_by_code` only, which feeds `all_credits`; they are NOT added to
+        # the rendered `courses` table, because the model has no reason to be shown courses that
+        # are neither a requirement of this program nor available to schedule — the student has
+        # already taken them.
+        wanted_extra = sorted(set(extra_course_codes) - set(courses_by_code))
+        if wanted_extra:
+            cur.execute(
+                """
+                SELECT DISTINCT ON (course_code) course_code, title, credit_hours_min,
+                       attributes_raw
+                FROM courses WHERE course_code = ANY(%s) ORDER BY course_code
+                """,
+                (wanted_extra,),
+            )
+            for row in cur.fetchall():
+                courses_by_code.setdefault(row["course_code"], row)
+        # UCC COMPETENCIES ONTO THE COURSE, so a course's line in the rendered database says
+        # which University Core requirements taking it would satisfy. `attributes_raw` stays the
+        # crawl's own field; these are merged with it in `_course_row` rather than overwriting.
+        for code, row in courses_by_code.items():
+            row["ucc_tags"] = sorted(ucc_by_code.get(code, ()))
         missing_required = always_codes - set(courses_by_code)
         if missing_required:
             raise LookupError(
@@ -1058,18 +1232,16 @@ def fetch_real_db_base(
     # Education or Great Issues requirements" — a genuinely separate requirement, which is why
     # `world_language` targets it on its own (see `build_scenario_database`).
     #
-    # THAT RULE HAS TO BE ENFORCED BY CODE, NOT JUST BY NOT FOLDING THE GROUP IN: a department's
-    # "Approved Courses by Subject" listing is not limited to upper-division culture courses —
-    # it names the FULL department catalog, proficiency sequence included, for every language
-    # department (French, Spanish, ...). Real incident 2026-08-06: French courses rendered in
-    # BOTH the Gen-Ed pool's `requirement_options` AND the dedicated Language and Culture
-    # group's, so the SAME course counted toward both simultaneously and the model completed
-    # the "language" line twice over from what was really one set of courses — exactly the
-    # double-count the crawled rule above forbids. Fixed by excluding EVERY course under a
-    # `_LANGUAGE_SUBJECTS` prefix from the Gen-Ed pool outright — not just the codes the
-    # dedicated group happens to name, since a narrower exclusion still leaves a department's
-    # OTHER language courses (upper-division literature, culture-in-the-language) sitting in
-    # BOTH buckets. Language content lives in exactly one place: the dedicated group below.
+    # THAT RULE WAS ENFORCED BY CODE UNTIL 2026-08-12, and is now deliberately NOT enforced —
+    # see `_ENFORCE_LANGUAGE_GENED_EXCLUSION` above. What it did: a department's "Approved
+    # Courses by Subject" listing is not limited to upper-division culture courses, it names
+    # the FULL department catalog, proficiency sequence included, for every language department
+    # (French, Spanish, ...). Incident 2026-08-06: French courses rendered in BOTH the Gen-Ed
+    # pool's `requirement_options` AND the dedicated Language and Culture group's, so the SAME
+    # course counted toward both at once. Every course under a `_LANGUAGE_SUBJECTS` prefix was
+    # therefore excluded from the Gen-Ed pool outright — not just the codes the dedicated group
+    # happens to name, since a narrower exclusion still leaves a department's OTHER language
+    # courses (upper-division literature, culture-in-the-language) sitting in both buckets.
     _subject_browse = _collapse_subtree("Approved Courses by Subject")
     _culture_gid = next((r["id"] for r in tree_rows if r["name"] == "Culture Course List"), None)
     _gened_leaves = (_subject_browse[1] if _subject_browse else []) + (
@@ -1077,7 +1249,7 @@ def fetch_real_db_base(
     _gened_candidate_codes = {c for g in _gened_leaves for c in option_codes.get(g, [])}
     _lang_reserved = frozenset(
         c for c in _gened_candidate_codes if c.split(" ", 1)[0] in _LANGUAGE_SUBJECTS
-    )
+    ) if _ENFORCE_LANGUAGE_GENED_EXCLUSION else frozenset()
     _apply_merge(_gened_leaves, group_id="merged-culture-gened",
                 credits_min=9.0, name="General Education / Culture Course List",
                 exclude=_lang_reserved)
@@ -1118,6 +1290,54 @@ def fetch_real_db_base(
         name="Laboratory Science",
     )
 
+    # ONE REQUIREMENT, CRAWLED TWICE, INSIDE A SINGLE PROGRAM (2026-08-12). A Purdue program
+    # page states its college core in its own department block AND again in the College of
+    # Science core block, and the crawler captures both: CS carries `Mathematics` (no type, no
+    # credit figure) and `Mathematics (8-10 credits)` (`requirement_type: college`, 8.0) with
+    # the SAME four options MA 16100/16200/16500/16600, and `Statistics` (5 options) beside
+    # `Statistics (3 credits)` (2 of those same 5). The student was shown Mathematics twice and
+    # scored against two separate math requirements for one body of coursework.
+    #
+    # Same collapse, same justification as `merge_real_db_bases` does across programs — a course
+    # satisfies every list it appears in, so if two same-named groups really were different
+    # requirements, whatever closes one already closes the other. The survivor is the one naming
+    # the MOST options (ties broken by display order, so the result does not depend on dict
+    # ordering); it keeps its own option list rather than absorbing the duplicate's, since a
+    # union would force an `all_of` survivor to require courses its own list never named. It
+    # DOES adopt a credit target the duplicate states and it lacks — that figure is the one real
+    # thing the college's copy carries.
+    def _dedupe_same_name_groups() -> None:
+        nonlocal always_gids, elective_gids
+        by_key: dict[str, list[str]] = {}
+        for gid in (*always_gids, *elective_gids):
+            by_key.setdefault(
+                _requirement_name_key(groups_meta[gid]["name"]), []).append(gid)
+        dropped: set[str] = set()
+        for gids in by_key.values():
+            if len(gids) < 2:
+                continue
+            keep, *rest = sorted(
+                gids,
+                key=lambda g: (-len(option_codes.get(g, [])), groups_meta[g]["display_order"]),
+            )
+            if groups_meta[keep]["credits_min"] is None:
+                stated = [groups_meta[g]["credits_min"] for g in rest
+                          if groups_meta[g]["credits_min"] is not None]
+                if stated:
+                    groups_meta[keep]["credits_min"] = max(stated)
+            dropped.update(rest)
+            logger.info(
+                "real_db: one requirement crawled under %d names, keeping %r: %s",
+                len(gids), groups_meta[keep]["name"],
+                ", ".join(f"{groups_meta[g]['name']!r} ({len(option_codes.get(g, []))} options)"
+                          for g in (keep, *rest)),
+            )
+        if dropped:
+            always_gids = [g for g in always_gids if g not in dropped]
+            elective_gids = [g for g in elective_gids if g not in dropped]
+
+    _dedupe_same_name_groups()
+
     def _language_subject(codes: list[str]) -> str | None:
         if not codes:
             return None
@@ -1149,6 +1369,53 @@ def fetch_real_db_base(
                            key=lambda g: g.display_order)
     elective_groups = sorted((_build_group(gid) for gid in elective_gids),
                              key=lambda g: g.display_order)
+
+    # --- UNIVERSITY CORE, SYNTHESIZED FROM THE UCC TAGS -------------------------------------
+    #
+    # The crawl states the core only as prose (see `_UCC_RE`): the "University Core
+    # Requirements" group is 0 options, 0 children, 463 characters of text naming nine
+    # competencies. Every course that satisfies one is tagged inline in its option text and
+    # nowhere else. So the core is rebuilt here as nine ordinary `choose_credits` groups — one
+    # per competency, options being the courses in THIS program's universe carrying that tag —
+    # which means the existing scorer, renderer and trimmer all handle it with no special case.
+    #
+    # SCOPED TO THIS PROGRAM'S OWN COURSE UNIVERSE, not to all 40,007 tagged rows in the crawl.
+    # "Human Cultures: Humanities" has 24,289 options catalog-wide; rendering that is neither
+    # possible within the context nor useful. What a student needs is "of the courses in front
+    # of you, these carry HUM", and each course's own `attributes` says so too.
+    #
+    # Only emitted when the program actually crawls a University Core group — a fixture-sourced
+    # pseudo-major or a program whose page omits it should not grow a requirement out of thin
+    # air. 3.0 credits per competency is Purdue's standard single-course core slot.
+    has_core_group = any(
+        (r.get("name") or "") == "University Core Requirements" for r in tree_rows
+    )
+    if has_core_group and ucc_by_code:
+        # NO LONGER "UNRESOLVED", because it just got resolved. Leaving the prose row in place
+        # would have the export contradict itself: `unresolved_requirement_groups` tells the
+        # model "nothing to schedule here, never invent a code to satisfy one" about the very
+        # requirement the nine groups below make schedulable. It also stops paying prompt weight
+        # for a duplicate. (Civics Literacy is not in `_UNRESOLVED_KEPT` and so was already
+        # dropped — it is an advising hold, not coursework, and there is nothing to plan for it.)
+        unresolved_rows = [r for r in unresolved_rows
+                           if r.get("name") != "University Core Requirements"]
+        universe = set(courses_by_code)
+        for order, (tag, label) in enumerate(UCC_COMPETENCIES.items()):
+            tagged = sorted(c for c in universe if tag in ucc_by_code.get(c, ()))
+            if not tagged:
+                continue  # this program's universe cannot satisfy it; say nothing rather than
+                          # assert a requirement with an empty menu
+            elective_groups.append(GroupMeta(
+                group_id=f"ucc-{tag.lower()}",
+                name=f"University Core: {label} (UCC: {tag})",
+                requirement_type="choose_credits",
+                credits_min=3.0,
+                display_order=9000 + order,   # after the program's own groups, before nothing
+                option_codes=tagged,
+                option_credits={c: float(courses_by_code[c]["credit_hours_min"] or 3.0)
+                                for c in tagged},
+                language_subject=None,
+            ))
 
     return RealDatabaseBase(
         program_id=program_id, program_row=program,
@@ -1200,7 +1467,10 @@ def real_db_base_from_fixture(fixture: Fixture) -> RealDatabaseBase:
         (elective_groups if is_elective else always_groups).append(gm)
 
     courses_by_code = {
-        c.code: {"title": c.title, "credit_hours_min": c.credits, "attributes_raw": None}
+        # `ucc_tags` empty: a `source: fixture` pseudo-major has no crawled option text to parse
+        # competencies out of, and inventing them would be fabricating a catalog claim.
+        c.code: {"title": c.title, "credit_hours_min": c.credits, "attributes_raw": None,
+                 "ucc_tags": []}
         for c in fixture.catalog
     }
     prereq_by_code = {
@@ -1289,6 +1559,12 @@ def _language_window(codes: list[str], subject: str, level: int) -> list[str]:
     return subject_codes[start:start + 3]
 
 
+# Levels the department ladder is rebuilt over in `_language_path_options`: Purdue numbers two
+# courses per catalog "hundred", so 8 levels covers 10100 through 40200 — every numbered
+# language course a bachelor's plan can reach.
+_MAX_LANGUAGE_LEVEL = 8
+
+
 def _expected_course_number(level: int) -> int:
     """Purdue's language-sequence numbering: two courses per catalog "hundred" (10100/10200,
     20100/20200, 30100/30200, ...), incrementing the hundred every two proficiency levels.
@@ -1321,6 +1597,19 @@ def _language_path_options(
     course in the list (`subject_sequence[1:]`) instead of the two courses actually ahead of
     them.
 
+    THE SEQUENCE IS THE DEPARTMENT'S, NOT THE CRAWLED GROUP'S (2026-08-12). The requirement
+    group names exactly three courses per language — Levels I, II and III (GER 10100/10200/
+    20100) — because three is what a student STARTING AT LEVEL 1 takes. Read as the whole
+    sequence, that list runs out for anybody placed higher: a level-2 German student got
+    `ahead = [GER 10200, GER 20100]`, which is two courses, so `third_language` was empty and
+    the pool collapsed to 2 sequence courses + 1 culture course against a 9-credit target —
+    three forced courses with no path to choose between, and the only "alternative" a
+    lower-level course (GER 10500, Accelerated Basic German) they had already placed out of.
+    Level IV (GER 20200) exists and is in this program's course universe; it was simply never
+    named by the group. So the ladder is rebuilt from every course in the subject whose number
+    IS a sequence number (`_expected_course_number`), unioned with whatever the group named,
+    and the culture alternative is likewise held to courses at or above the student's floor.
+
     Returns a small option pool (2 guaranteed sequence courses, plus up to one alternative
     each for the 3rd credit) and a credit target computed from real course credits so EITHER
     path satisfies it. The `choose_credits` scorer only sums credits from whatever the model
@@ -1330,8 +1619,12 @@ def _language_path_options(
     on `force_selective_groups` for the same "crawl doesn't structure it, so state it once by
     hand" pattern).
     """
+    ladder = {_expected_course_number(lv) for lv in range(1, _MAX_LANGUAGE_LEVEL + 1)}
     subject_sequence = sorted(
-        (c for c in sequence_codes if c.split(" ", 1)[0] == subject), key=_course_number,
+        {c for c in sequence_codes if c.split(" ", 1)[0] == subject}
+        | {c for c in base.courses_by_code
+           if c.split(" ", 1)[0] == subject and _course_number(c) in ladder},
+        key=_course_number,
     )
     floor = _expected_course_number(level)
     ahead = [c for c in subject_sequence if _course_number(c) >= floor]
@@ -1339,7 +1632,8 @@ def _language_path_options(
     third_language = ahead[2:3]
     culture = sorted(
         (c for c in base.courses_by_code
-         if c.split(" ", 1)[0] == subject and c not in subject_sequence),
+         if c.split(" ", 1)[0] == subject and c not in subject_sequence
+         and _course_number(c) >= floor),
         key=_course_number,
     )[:1]
     pool = list(dict.fromkeys(two + third_language + culture))
@@ -1440,7 +1734,11 @@ def _partial_database(
             "course_code": code,
             "title": courses_by_code[code]["title"] or code,
             "credit_hours_min": courses_by_code[code]["credit_hours_min"],
-            "attributes": _attributes(courses_by_code[code]["attributes_raw"]),
+            # Crawl attributes UNIONED with the parsed University Core tags — `UCC: HUM` and
+            # friends. This is what makes "which of these courses satisfies Human Cultures?"
+            # answerable from the rendered database instead of from a 24,000-row menu.
+            "attributes": sorted(set(_attributes(courses_by_code[code]["attributes_raw"]))
+                                 | {f"UCC: {t}" for t in courses_by_code[code].get("ucc_tags", ())}),
         }
         # PREREQ FIELDS INLINED, not a separate `course_prerequisites` table (removed
         # 2026-08-06 — see catalog_export.py's module docstring): present ONLY for a course
@@ -1482,6 +1780,13 @@ def _partial_database(
     return CatalogDatabase(
         path=Path(f"postgres://{base.program_id}"), tables=tables,
         db_hash=digest.hexdigest()[:16], files=files,
+        # THE UNTRIMMED universe, so a completed course that did not survive the prompt trim
+        # still has its credits when scoring counts what the student already holds. Deliberately
+        # NOT part of `db_hash`/`files` above: it is not shown to the model and does not change
+        # the experiment, so folding it into the hash would invalidate every prior run's static
+        # hashes over a field none of them rendered.
+        all_credits={code: float(row.get("credit_hours_min") or 0)
+                     for code, row in base.courses_by_code.items()},
     )
 
 
@@ -1626,12 +1931,145 @@ def build_scenario_database(
     return _partial_database(base, final_codes, kept_by_group)
 
 
+def resolve_poid(pg_url: str, poid: str) -> str:
+    """Purdue's own `programs.poid` -> this crawl's surrogate UUID.
+
+    Fixtures and scenarios name extra programs by POID because it is the catalog's identifier
+    and survives a re-crawl; every loader below wants the UUID. Raises rather than returning
+    None: a second major that silently fails to resolve would score as "this student owes
+    nothing extra", which looks like a passing plan instead of a broken configuration.
+    """
+    with psycopg.connect(pg_url, row_factory=dict_row) as conn, conn.cursor() as cur:
+        cur.execute("SELECT id::text AS id, name FROM programs WHERE poid = %s", (str(poid),))
+        rows = cur.fetchall()
+    if not rows:
+        raise LookupError(
+            f"no program with poid {poid!r} in this crawl — it may not have been crawled yet "
+            f"(the 2026-2027 sync runs ~2 min/program), or the poid is wrong."
+        )
+    return rows[0]["id"]
+
+
+_CREDIT_ANNOTATION_RE = re.compile(
+    r"\s*\(\s*[\d.]+(?:\s*[-–]\s*[\d.]+)?\s*(?:credit|credits|cr)\.?\s*\)\s*$", re.IGNORECASE
+)
+
+
+def _requirement_name_key(name: str) -> str:
+    """Two crawled group names that denote the same requirement, as one comparable key.
+
+    Programs stamp their own credit figure onto a shared requirement's name ("Mathematics" vs
+    "Mathematics (8-10 credits)"), so the annotation is stripped and the rest is casefolded with
+    runs of whitespace collapsed. Nothing else is normalised: the point is to catch one program
+    annotating what another left bare, not to guess that differently-worded requirements match.
+    """
+    return " ".join(_CREDIT_ANNOTATION_RE.sub("", name).split()).casefold()
+
+
+def merge_real_db_bases(
+    primary: RealDatabaseBase, extras: list[tuple[RealDatabaseBase, str, str]],
+) -> RealDatabaseBase:
+    """One student pursuing several programs at once, as a single database to plan against.
+
+    `extras` is `(base, kind, label)` per additional program — a second major or a minor. Their
+    requirement groups are added to the primary's, each renamed `"<label>: <group>"` and
+    re-keyed by program so two programs' identically-named groups ("Algebra" appears in both the
+    Math major and the Math minor; "Statistics" in nearly everything) stay distinct instead of
+    silently overwriting one another.
+
+    NO DEDUPLICATION OF REQUIREMENTS, deliberately, and no attempt to net out overlap between
+    the programs. Purdue does cap how much a minor may share with a major, but this harness
+    models unlimited double counting by decision (2026-08-11): a course satisfies every list it
+    appears in. What stops that from inventing a free degree is that credits are counted per
+    DISTINCT COURSE toward the graduation minimum — see `real_scoring`'s `total_credits`. A plan
+    can therefore close every group of all three programs and still fail on credits, which is
+    the honest failure mode; the reverse (inventing an overlap cap the catalog does not state)
+    would fail plans that are actually legal.
+
+    Courses, prereqs and aliases are unioned. Where two programs describe the same course code,
+    the PRIMARY program's row wins — same course, and the primary is the one whose scenarios,
+    completed list and credit targets the fixture was written around.
+    """
+    always = list(primary.always_groups)
+    elective = list(primary.elective_groups)
+    courses = dict(primary.courses_by_code)
+    prereqs = dict(primary.prereq_by_code)
+    aliases = list(primary.course_aliases_rows)
+    notes = list(primary.program_notes_rows)
+    unresolved = list(primary.unresolved_rows)
+
+    seen_aliases = {(r["course_code"], r["alias_of"]) for r in aliases}
+    # THE UNIVERSITY CORE IS THE UNIVERSITY'S, NOT EACH PROGRAM'S. Every program this loader
+    # touches grows its own synthesized `ucc-*` groups (see `UCC_COMPETENCIES`), so a student
+    # doing two majors would otherwise be told to satisfy Quantitative Reasoning twice — nine
+    # duplicate requirements per extra program, each a real scoring target the student does not
+    # actually owe, and a large amount of prompt spent saying the same thing again. These are
+    # the one class of group where "same name means same requirement" is not a guess: this
+    # module generates them, from one university-wide competency list. Crawled groups are NOT
+    # deduplicated on name — two programs' "Statistics" may be genuinely different requirements,
+    # and merging them on a name match would erase real work.
+    existing_ucc = {g.group_id for g in always + elective if g.group_id.startswith("ucc-")}
+    # SHARED COLLEGE REQUIREMENTS, likewise counted once. Purdue replicates a college's core onto
+    # every program page inside that college, so two College of Science majors each crawl their
+    # own copy of "Great Issues in Science", "Laboratory Science", "Technical Writing &
+    # Presenting" and seven more — MEASURED on CS + Data Science, 10 of Data Science's 15 groups
+    # are byte-identical in name to one of CS's. A student in both majors completes that core
+    # once.
+    #
+    # SAFE UNDER THIS HARNESS'S DOUBLE-COUNTING RULE, which is what makes a name match
+    # defensible here even though `merge_real_db_bases` refuses name matching in general: a
+    # course satisfies every list it appears in, so if two identically-named groups really were
+    # different requirements, any course closing one already closes the other. Collapsing them
+    # therefore cannot change which courses the student must take — only how many times the
+    # prompt says so. What it does buy is real: without it the three-program prompt is 14.7k
+    # tokens against a 14,336 budget and the run will not start.
+    #
+    # MATCHED ON `_requirement_name_key`, NOT BYTE-FOR-BYTE, since 2026-08-12. Programs annotate
+    # the same core requirement with their own credit figure — CS crawls "Mathematics" and Data
+    # Science crawls "Mathematics (8-10 credits)"; likewise "Statistics" and "Statistics (3
+    # credits)" — and an exact match let both through, so a CS + Data Science student was shown
+    # Mathematics twice and owed two separate math requirements for one body of coursework. The
+    # annotation is the only difference between those names, and the credit figure it carries is
+    # the SECOND program's, i.e. exactly the number the primary's own group already answers.
+    existing_names = {_requirement_name_key(g.name) for g in always + elective}
+    for base, kind, label in extras:
+        prefix = f"{label} ({kind})"
+        for bucket, source in ((always, base.always_groups), (elective, base.elective_groups)):
+            for group in source:
+                key = _requirement_name_key(group.name)
+                if group.group_id in existing_ucc or key in existing_names:
+                    continue
+                existing_names.add(key)
+                bucket.append(replace(
+                    group,
+                    group_id=f"{base.program_id}:{group.group_id}",
+                    name=f"{prefix}: {group.name}",
+                ))
+        for code, row in base.courses_by_code.items():
+            courses.setdefault(code, row)
+        for code, row in base.prereq_by_code.items():
+            prereqs.setdefault(code, row)
+        for row in base.course_aliases_rows:
+            key = (row["course_code"], row["alias_of"])
+            if key not in seen_aliases:
+                seen_aliases.add(key)
+                aliases.append(row)
+        unresolved += [dict(r, name=f"{prefix}: {r['name']}") for r in base.unresolved_rows]
+
+    return replace(
+        primary, always_groups=always, elective_groups=elective, courses_by_code=courses,
+        prereq_by_code=prereqs, course_aliases_rows=aliases, program_notes_rows=notes,
+        unresolved_rows=unresolved,
+    )
+
+
 def load_real_db(
     pg_url: str,
     program_id: str,
     *,
     broaden_subjects: tuple[str, ...] | None = None,
     force_selective_groups: tuple[str, ...] = (),
+    manual_course_aliases: Mapping[str, str] | None = None,
     budget_tokens: int = 14336,
     gen_ed_preference: str | None = None,
     world_language: tuple[str, int] | None = None,
@@ -1644,7 +2082,8 @@ def load_real_db(
     """
     base = fetch_real_db_base(
         pg_url, program_id, broaden_subjects=broaden_subjects,
-        force_selective_groups=force_selective_groups, scope_filter=scope_filter,
+        force_selective_groups=force_selective_groups,
+        manual_course_aliases=manual_course_aliases, scope_filter=scope_filter,
     )
     return build_scenario_database(
         base, gen_ed_preference=gen_ed_preference, world_language=world_language,
