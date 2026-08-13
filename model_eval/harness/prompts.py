@@ -34,7 +34,7 @@ import json
 from typing import Any
 
 from .fixtures import Fixture, Scenario
-from .catalog_export import CatalogDatabase, render_context, render_context_lean
+from .catalog_export import CatalogDatabase, render_context
 from .plan_scorers import normalize_code
 from .planner import Course, Plan, Profile, first_planning_term, next_term
 
@@ -232,6 +232,14 @@ def catalog_tags(catalog: list[Course]) -> list[str]:
 # scoring plans against it as if it were a hard fact. See `catalog_export.py`'s module
 # docstring for the removal and how it turns the constraint off everywhere (prompt AND
 # scorer) at once, just by no longer populating `offered_terms`.
+# UNRESOLVED REQUIREMENT GROUPS REMOVED, 2026-08-12 (moves the static hash again). The bullet
+# describing them was four lines of "here is a category of requirement; there is nothing you can
+# do about it" — a distinction with no action attached, held next to `requirement_groups`, which
+# looks identical and is the one the model must act on. Transcripts read like the models were
+# spending attention on it anyway. The table itself is gone from the export (see
+# `catalog_export.TABLES`) and from `real_scoring`, so the prompt no longer names a section that
+# is not there. Prose-stated university requirements come back when they can be shown as
+# something schedulable, the way the synthesized `ucc-*` groups already are.
 PLAN_SYSTEM = """\
 You build a semester-by-semester plan of study from a read-only export of the advisor\'s
 catalog database. Use only what is in that export.
@@ -240,13 +248,9 @@ Where things are:
 - `courses` - every course that exists, with credit_hours_min, listed in prerequisite order.
   `prereq_groups` (AND-of-ORs) and `coreq_codes` appear directly on a course's own row, present
   only when that course actually has them.
-- `requirement_groups` + `requirement_options` - the degree requirements, joined on
-  course_code. `all_of` = take every option. `choose_credits` = take enough to reach
-  `credits_min`.
-- `unresolved_requirement_groups` - real requirements (e.g. university gen-ed) the catalog
-  states in prose, not as a course list. Nothing to schedule here; they are not part of
-  `requirement_groups` and "cover every requirement group" does not apply to them. Never invent
-  a course code to satisfy one.
+- `requirement_groups` - the degree requirements, one row per group, each carrying its own
+  `options` list of the courses that satisfy it. `all_of` = take every option.
+  `choose_credits` = take enough to reach `credits_min`. Groups are named, not numbered.
 - `course_aliases` - `alias_of` is an approved substitute. Take one, never both.
 - `attributes` on a course lists the University Core competencies it carries, e.g. `UCC: QR`.
   A course tagged `UCC: QR` satisfies the "University Core: Quantitative Reasoning" group.
@@ -293,45 +297,6 @@ terms to the limit and leave the later ones light on credits, and do not leave a
 credits when something legal could go in it. Selective groups usually offer more options than
 the student needs: when a term has room, pick an option whose prerequisites are already
 satisfied."""
-
-# LEAN VARIANT — for a `program.source: fixture` pseudo-major (school-core / gen-ed+world-
-# language test cases), whose database is `catalog_export.render_context_lean`'s
-# requirement-groups-only export, not `render_context`'s full one. PLAN_SYSTEM's "Where things
-# are" section names `courses`/`prereq_groups`/`coreq_codes`/`course_aliases` — tables and
-# fields that render_context_lean never emits — so using it unchanged here would describe a
-# schema the model is not actually being shown. Composed the same "shared rules, one definition"
-# way as PLAN_LOCKED_RULES below: every rule that still applies (never invent a code, never
-# re-schedule a completed or already-placed course, cover every group, spread credits evenly)
-# is unchanged; only the schema description and the prerequisite-checking rule (there are none
-# to check here) differ.
-PLAN_SYSTEM_LEAN = """\
-You build a semester-by-semester plan of study from a read-only export of the advisor\'s
-catalog database. Use only what is in that export.
-
-Where things are:
-- `requirement_groups` - the degree requirements for this test case, each with its own
-  `options` (course code + credits) listed inline. `kind: "all"` = take every option.
-  `kind: "choose"` = take enough options to reach `credits_min`.
-- There is no separate course catalog and no prerequisite data here — these requirements have
-  no meaningful prerequisite chain to sequence, on purpose (see the header of whichever fixture
-  produced this export).
-
-Rules, all hard:
-- NEVER SCHEDULE A COURSE THE STUDENT HAS ALREADY TAKEN. The student\'s "Already completed"
-  line is the complete list of what is done; those courses are finished and must not appear
-  anywhere in your plan. They still count as satisfying requirement groups — a completed course
-  is credit the student already holds, not work still to do.
-- NEVER SCHEDULE THE SAME COURSE TWICE. Each course appears at most once in the WHOLE plan, not
-  once per semester. Before you add a course to a semester, check the semesters you have
-  already written and the completed list.
-- Only courses named in `requirement_groups`. Never invent a code.
-- Cover every requirement group. A group is already covered if the student completed its
-  options — check the completed list before scheduling anything for it.
-
-SPREAD THE WORK EVENLY. Balance CREDIT HOURS, not course count, across ALL the semesters the
-student has. Add up the credits in each semester as you place courses and keep that sum near
-the target every semester, including the last ones. Do not fill the early terms to the limit
-and leave the later ones light on credits."""
 
 # =============================================================================================
 # MODE C — retry-to-convergence. See harness/convergence.py for what it measures.
@@ -454,11 +419,24 @@ PLAN_SCHEMA: dict[str, Any] = {
 # routers/advisor.py respectively.
 # =============================================================================================
 
+# CHANGED 2026-08-12, and it is a deliberate change of POLICY, not of wording. The previous
+# prompt told the model to refuse whenever the retrieved context did not contain the answer
+# ("say you don't have that rule on file"), and the models did exactly that — the transcripts
+# are full of one-line refusals to questions a human advisor would have taken a swing at.
+# Refusing is the safe failure for a system that might be quoted as authoritative; it is also
+# useless to a student who asked a real question, and it was firing far more often than the
+# thin-context items alone.
+#
+# WHAT THIS COSTS, stated plainly because it lands in the scoring: `questions.yaml` labels 18
+# of 39 items `expected_behavior: abstain`, and those labels were written against the OLD
+# policy. Under this prompt a best-effort answer to a thin-context question is the model
+# obeying its instructions, and `scorers.score_qa` will nonetheless record `behavior_ok: False`
+# for it. Expect the "Abstained OK" column to collapse on the next sweep. That number is now
+# measuring the prompt, not the model — decide whether those 18 items should be re-labelled to
+# "answer with a caveat" before reading anything into it.
 QA_SYSTEM = (
-    "You are a college academic advisor. Answer using ONLY the CONTEXT below, which contains "
-    "retrieved degree rules and course descriptions. If the context does not contain the "
-    "answer, say you don't have that rule on file and suggest the student confirm with their "
-    "department. Be concise, and quote the specific requirement text you relied on."
+    "You are a senior college academic advisor, answer using the context below. If not "
+    "possible, answer to the best of your ability."
 )
 
 EXPLAIN_SYSTEM = """\
@@ -520,7 +498,7 @@ def _database_degree_program(database: CatalogDatabase) -> str:
     """The major actually loaded via `real_db.program_id`/`--major`, read off the database
     itself rather than trusted from a hardcoded fixture field.
 
-    `profile.degree_program` is authored per-scenario in `plan_fixtures/*.yaml` and was never
+    `profile.degree_program` is the program's own catalog name (`fixtures.synthesize_scenarios`) and was never
     kept in sync with whichever program `--major` points the real database at — the fixture
     file only picks which SCENARIOS (student names, completed-course lists, assertions) exist,
     not which catalog the model is shown. Mode B/C always render the real database, so this is
@@ -750,17 +728,13 @@ class PromptBuilder:
         # here: it is byte-stable and lands in the static hash, so a change to the underlying
         # catalog correctly stops old Mode B records being comparable.
         self.database = database
-        # `source: fixture` pseudo-majors (school-core / gen-ed+world-language test cases) get
-        # the stripped requirement-groups-only render AND the matching system-prompt schema
-        # description — see `catalog_export.render_context_lean`, `PLAN_SYSTEM_LEAN`, and
-        # `real_db.real_db_base_from_fixture`'s docstrings for why. Every other fixture (the
-        # default `source: real_db`) is unchanged. Picked once here, not per call, so Mode B
-        # and Mode C (`_plan_static`/`plan_convergence`) can never disagree about which schema
-        # this fixture's database block actually is.
-        lean = fixture.source == "fixture"
-        self._plan_system = PLAN_SYSTEM_LEAN if lean else PLAN_SYSTEM
-        renderer = render_context_lean if lean else render_context
-        self._database_block = renderer(database) if database is not None else None
+        # ONE SCHEMA, ONE SYSTEM PROMPT. There used to be a second, "lean" pair here for
+        # `program.source: fixture` pseudo-majors (school-core / gen-ed+world-language test
+        # cases), whose export was requirement-groups-only and so needed its own schema
+        # description. Those fixtures went with `plan_fixtures/` (2026-08-12); every program is
+        # now a real crawled one rendered by `render_context`.
+        self._plan_system = PLAN_SYSTEM
+        self._database_block = render_context(database) if database is not None else None
 
     # -- Mode A: revise-plan proposal (the app's real path) ---------------------------------
 

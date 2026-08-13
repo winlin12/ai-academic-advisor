@@ -41,11 +41,11 @@ import yaml
 
 from . import plan_scorers, scorers
 from .catalog_export import CatalogDatabase
-from .fixtures import Fixture, Scenario, load_fixture
+from .fixtures import Fixture, Scenario
 from .llamacpp_client import GenerationResult, LlamaCppClient, LlamaCppError
 from .real_db import (
-    REQUIREMENT_SCOPE_ALIASES, RealDatabaseBase, build_scenario_database, fetch_real_db_base,
-    merge_real_db_bases, real_db_base_from_fixture, resolve_poid,
+    RealDatabaseBase, build_scenario_database, fetch_real_db_base, fixture_from_database,
+    merge_real_db_bases, resolve_poid,
 )
 from .real_scoring import RealScore, score_against_real_db
 from .planner import (
@@ -274,9 +274,8 @@ def _real_score_detail(score: RealScore, program_name: str) -> str:
     """
     lines: list[str] = [f"## Requirement groups: {program_name}", ""]
     lines.append(
-        f"**{score.groups_satisfied}/{score.groups_total} checkable requirement groups "
-        f"filled** ({score.coverage:.0%}) — {len(score.unresolved)} more the catalog states "
-        f"in prose and this scorer cannot check at all"
+        f"**{score.groups_satisfied}/{score.groups_total} requirement groups filled** "
+        f"({score.coverage:.0%})"
     )
     lines.append("")
 
@@ -288,7 +287,7 @@ def _real_score_detail(score: RealScore, program_name: str) -> str:
     else:
         lines += ["### Violations", "", "None — every hard rule held.", ""]
 
-    lines += ["### Every checkable requirement group", ""]
+    lines += ["### Every requirement group", ""]
     for group in score.groups:
         mark = "✓" if group.satisfied else "✗"
         kind = "choose from list" if group.selective else "take all"
@@ -299,55 +298,38 @@ def _real_score_detail(score: RealScore, program_name: str) -> str:
             lines.append(f"    - short: {group.missing_label}")
     lines.append("")
 
-    if score.unresolved:
-        lines += [
-            f"### Cannot be checked at all ({len(score.unresolved)})",
-            "",
-            "Stated by the catalog in prose, never as a course list — not shown to the model, "
-            "not scored, not counted toward or against coverage above:",
-            "",
-        ]
-        lines += [f"- {u.name}" for u in score.unresolved]
-        lines.append("")
-
     return "\n".join(lines)
 
 
 def load_context(root: Path) -> EvalContext:
     cfg = yaml.safe_load((root / "config.yaml").read_text())
-    # MODEL_EVAL_PLAN_FIXTURE / MODEL_EVAL_RESULTS_DIR — same override pattern as
-    # MODEL_EVAL_REAL_DB_PROGRAM_ID below, set once by `run.py` before dispatch. This is what
-    # lets `run.py run`'s multi-school loop point one process at a different fixture/results
-    # directory per school without editing config.yaml on disk — see `run.py`'s
-    # `resolve_major`/`discover_fixtures`.
-    fixture_rel = os.environ.get("MODEL_EVAL_PLAN_FIXTURE", cfg["paths"]["plan_fixture"])
+    # MODEL_EVAL_REAL_DB_PROGRAM_ID / MODEL_EVAL_RESULTS_DIR — set once by `run.py` before
+    # dispatch, which is what lets the sweep point one process at a different program and
+    # results directory per school without editing config.yaml on disk. See `run.py`'s
+    # `resolve_major`/`_run_sweep`.
+    #
+    # THERE IS NO PLAN FIXTURE ANY MORE (2026-08-12): the program id IS the selection, and the
+    # fixture object every mode still takes is built from that program's own database further
+    # down. See `fixtures.py`'s module docstring.
     results_dir_override = os.environ.get("MODEL_EVAL_RESULTS_DIR")
     if results_dir_override:
         cfg["paths"]["results_dir"] = results_dir_override
-    # Do this BEFORE loading the fixture: the fixture's scenarios are planned with the
-    # deterministic planner, which needs to already know whether summer is schedulable.
+    # Do this BEFORE any planning: the scenarios are planned with the deterministic planner,
+    # which needs to already know whether summer is schedulable.
     set_planning_terms(cfg["run"]["planning_terms"])
-    fixture = load_fixture(root / fixture_rel)
     questions_path = root / cfg["paths"]["questions"]
     questions = yaml.safe_load(questions_path.read_text()) if questions_path.exists() else []
 
-    # THE MODEL'S CONTEXT. Loaded before the prompts are built, because Mode B's static block is
-    # the rendered database — its bytes are in the static hash, so a stale read is a silently
-    # different experiment.
-    #
-    # ALWAYS THE REAL catalog_ingestion/advisor Postgres DB — there is no JSON mock any more
-    # (removed 2026-08-04; see harness/real_db.py and harness/catalog_export.py's module
-    # docstrings for why, and for what does and doesn't survive reading real data straight from
-    # Postgres). `real_db.url`/`program_id`/`broaden_subjects` in config.yaml pick which
-    # program and how wide its elective pool is; the `MODEL_EVAL_REAL_DB_*` env vars override
-    # them for one-off runs without editing the file. Mode A/QA/Explain never touch the database
-    # at all (see prompts.py), so only Mode B/C are affected by any of this.
+    # THE MODEL'S CONTEXT, and now also the source of the students. Loaded before the prompts
+    # are built, because Mode B's static block is the rendered database — its bytes are in the
+    # static hash, so a stale read is a silently different experiment.
     #
     # ONE FETCH, MANY SCENARIOS. `fetch_real_db_base` is the (possibly slow) Postgres half; each
     # scenario's own database is built from it lazily, per-scenario, via `EvalContext.database_for`
     # — see `harness/real_db.py`'s module docstring for why the split exists (a real program's
     # own gen-ed menus can be far too large to render whole, so what a scenario is actually shown
     # depends on ITS `gen_ed_preference`/`world_language`, not just the program).
+    #
     # THE SLOT'S context, not the server's total. `build_scenario_database` FILLS this budget —
     # a bigger number renders a bigger elective menu into Mode B's prompt — so deriving it from
     # `num_ctx` meant raising num_ctx to 65536 for four slots inflated the prompt to ~49k tokens
@@ -357,38 +339,31 @@ def load_context(root: Path) -> EvalContext:
     # function of what one student's slot can hold.
     budget_tokens = (slot_context(cfg["run"]) - cfg["run"]["max_plan_tokens"]
                      - _PROMPT_OVERHEAD_TOKENS)
-    if fixture.source == "fixture":
-        # NO POSTGRES AT ALL for a `program.source: fixture` pseudo-major (school-core /
-        # gen-ed+world-language test cases) — this fixture's own courses/requirement_groups
-        # ARE the whole database. See `real_db.real_db_base_from_fixture`'s docstring.
-        real_db_base = real_db_base_from_fixture(fixture)
-        print(f"[real-db] fixture-sourced ({fixture.slug}), no Postgres round trip — "
-              f"{len(real_db_base.always_groups)} required + "
-              f"{len(real_db_base.elective_groups)} elective requirement group(s), "
-              f"{len(real_db_base.courses_by_code)} courses")
-    else:
-        real_db_cfg = cfg.get("real_db", {})
-        pg_url = os.environ.get("MODEL_EVAL_REAL_DB_URL", real_db_cfg["url"])
-        program_id = os.environ.get("MODEL_EVAL_REAL_DB_PROGRAM_ID", real_db_cfg["program_id"])
-        scope_filter = REQUIREMENT_SCOPE_ALIASES.get(fixture.requirement_scope)
-        real_db_base = fetch_real_db_base(
-            pg_url, program_id,
-            broaden_subjects=(tuple(real_db_cfg["broaden_subjects"])
-                             if real_db_cfg.get("broaden_subjects") else None),
-            force_selective_groups=tuple(real_db_cfg.get("force_selective_groups") or ()),
-            manual_course_aliases=real_db_cfg.get("manual_course_aliases") or {},
-            # Every course any scenario says the student already took, so its credits are known
-            # even when this program's own requirements never mention it (ENGL 10600, COM 11400).
-            extra_course_codes=tuple(sorted(
-                {c for s in fixture.scenarios for c in s.profile.completed_courses}
-            )),
-            scope_filter=scope_filter,
-        )
-        print(f"[real-db] loaded program {program_id} from {pg_url} "
-              f"({len(real_db_base.always_groups)} required + {len(real_db_base.elective_groups)} "
-              f"elective requirement group(s), {len(real_db_base.courses_by_code)} courses in the "
-              f"maximal universe)"
-              + (f" [scope={fixture.requirement_scope}]" if scope_filter else ""))
+    real_db_cfg = cfg.get("real_db", {})
+    pg_url = os.environ.get("MODEL_EVAL_REAL_DB_URL", real_db_cfg["url"])
+    program_id = os.environ.get("MODEL_EVAL_REAL_DB_PROGRAM_ID", real_db_cfg["program_id"])
+    real_db_base = fetch_real_db_base(
+        pg_url, program_id,
+        broaden_subjects=(tuple(real_db_cfg["broaden_subjects"])
+                         if real_db_cfg.get("broaden_subjects") else None),
+        force_selective_groups=tuple(real_db_cfg.get("force_selective_groups") or ()),
+        manual_course_aliases=real_db_cfg.get("manual_course_aliases") or {},
+    )
+    print(f"[real-db] loaded program {program_id} from {pg_url} "
+          f"({len(real_db_base.always_groups)} required + {len(real_db_base.elective_groups)} "
+          f"elective requirement group(s), {len(real_db_base.courses_by_code)} courses in the "
+          f"maximal universe)")
+
+    # THE FIXTURE, built from the database that was just fetched — courses, requirement groups
+    # and the five synthesized students. Built off the DEFAULT (no scenario preference)
+    # database, the same one Mode A/QA/Explain's shared `PromptBuilder` uses: Mode A plans
+    # against `fixture.catalog`, so it must be a single stable course universe rather than one
+    # scenario's narrowed view.
+    default_database = build_scenario_database(real_db_base, budget_tokens=budget_tokens)
+    fixture = fixture_from_database(default_database)
+    print(f"[fixture] {fixture.name} [{fixture.slug}] — {len(fixture.catalog)} courses, "
+          f"{len(fixture.requirement_groups)} requirement groups, "
+          f"{len(fixture.scenarios)} synthesized students")
 
     # EXTRA PROGRAMS (second majors, minors) — one fetch per distinct poid across every
     # scenario, before any scenario database is built. A failure here is raised, not skipped: a
@@ -396,22 +371,18 @@ def load_context(root: Path) -> EvalContext:
     # nothing extra, which reads as a good plan rather than a broken fixture.
     extra_program_bases: dict[str, RealDatabaseBase] = {}
     wanted = {poid for s in fixture.scenarios for poid, _kind, _label in s.additional_programs}
-    if wanted and fixture.source != "fixture":
-        real_db_cfg = cfg.get("real_db", {})
-        pg_url = os.environ.get("MODEL_EVAL_REAL_DB_URL", real_db_cfg["url"])
+    if wanted:
         for poid in sorted(wanted):
             extra_id = resolve_poid(pg_url, poid)
             extra_program_bases[poid] = fetch_real_db_base(
                 pg_url, extra_id,
                 force_selective_groups=tuple(real_db_cfg.get("force_selective_groups") or ()),
                 manual_course_aliases=real_db_cfg.get("manual_course_aliases") or {},
-                scope_filter=REQUIREMENT_SCOPE_ALIASES.get(fixture.requirement_scope),
             )
             print(f"[real-db] + additional program poid {poid} "
                   f"({len(extra_program_bases[poid].always_groups)} required + "
                   f"{len(extra_program_bases[poid].elective_groups)} elective group(s))")
 
-    default_database = build_scenario_database(real_db_base, budget_tokens=budget_tokens)
     return EvalContext(
         extra_program_bases=extra_program_bases,
         cfg=cfg,
@@ -426,13 +397,37 @@ def load_context(root: Path) -> EvalContext:
     )
 
 
-def sampling_options(cfg: dict[str, Any], *, max_tokens: int | None = None) -> dict[str, Any]:
+def sampling_options(
+    cfg: dict[str, Any], *, max_tokens: int | None = None,
+    model_cfg: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Sampling knobs, identical for every model — plus one per-model allowance.
+
+    `reasoning_overhead_tokens` (config.yaml, per model) is ADDED to whatever budget the caller
+    asked for. It exists for models whose chat template ALWAYS opens an analysis channel that
+    the server reports separately as `reasoning_content`, so those tokens are spent before a
+    single character of the answer exists.
+
+    MEASURED ON muse-glimmer-30b, 2026-08-12. Its template is Harmony-style
+    (`<|start|>system<|message|>`, "Reasoning strength: high"), and `--reasoning off
+    --reasoning-budget 0` does not suppress it — the server log shows `forced=0 toks` and the
+    analysis runs anyway. Every plan/proposal/explain generation therefore returned
+    `content: ""` with `finish_reason: length`: 43 records, zero output, scored as a total
+    failure of a model that had not actually been asked a question it could answer yet. At
+    3000 tokens the same request completes in 507 and returns valid JSON.
+
+    This is a HARNESS allowance, not a handicap given to one model: every model still sees the
+    same prompt, the same sampler and the same schema, and the extra budget only buys room for
+    a channel the model cannot switch off. It is per-model because the overhead is a property
+    of the template, not of the task.
+    """
     run = cfg["run"]
+    overhead = int((model_cfg or {}).get("reasoning_overhead_tokens") or 0)
     return {
         "temperature": run["temperature"],
         "top_p": run.get("top_p", 0.9),
         "seed": run["seed"],
-        "max_tokens": max_tokens or run["max_output_tokens"],
+        "max_tokens": (max_tokens or run["max_output_tokens"]) + overhead,
     }
 
 
@@ -583,7 +578,8 @@ def run_mode_a(
         try:
             res = client.chat(
                 system, user,
-                options=sampling_options(ctx.cfg, max_tokens=ctx.cfg["run"]["max_output_tokens"]),
+                options=sampling_options(ctx.cfg, max_tokens=ctx.cfg["run"]["max_output_tokens"],
+                                         model_cfg=model_cfg),
                 think=model_cfg.get("think"),
                 response_format=json_response_format(
                     "PlanEditProposal",
@@ -766,7 +762,8 @@ def _run_freeform_plan(
         res = client.chat(
             system, user,
             options=sampling_options(
-                ctx.cfg, max_tokens=ctx.cfg["run"]["max_plan_tokens"] + extra_max_tokens),
+                ctx.cfg, max_tokens=ctx.cfg["run"]["max_plan_tokens"] + extra_max_tokens,
+                model_cfg=model_cfg),
             think=think_override if think_override is not None else model_cfg.get("think"),
             # THE COURSE ENUM MUST COME FROM THIS SCENARIO'S OWN `database`, NOT
             # `ctx.fixture.catalog` AND NOT ANOTHER SCENARIO'S DATABASE. This schema is what
@@ -862,8 +859,7 @@ def _run_freeform_plan(
         model_cfg["name"], stage, scenario.id, run_idx, system, user, transcript_text,
         verdict=f"viable={real_score.viable} coverage={real_score.requirement_coverage:.0%} "
                 f"violations={real_score.violation_counts or 'none'} | "
-                f"{real_score.groups_satisfied}/{real_score.groups_total} checkable groups, "
-                f"{len(real_score.unresolved)} uncheckable (prose)",
+                f"{real_score.groups_satisfied}/{real_score.groups_total} requirement groups",
         detail=_score_detail(real_score, semesters, scenario.profile)
               + "\n" + _real_score_detail(real_score, program_name),
     )
@@ -898,7 +894,7 @@ def run_qa(
     try:
         res = client.chat(
             system, user,
-            options=sampling_options(ctx.cfg),
+            options=sampling_options(ctx.cfg, model_cfg=model_cfg),
             think=model_cfg.get("think"),
         )
     except LlamaCppError as exc:
@@ -910,6 +906,10 @@ def run_qa(
     rec = _base_record(
         model_cfg["name"], res, static_hash,
         stage="qa", question_id=question["id"], category=question.get("category"),
+        # `topic` (course | policy | process) is what `report._qa_section`'s by-topic table
+        # slices on — a bot can be fluent about prerequisites and useless about how to CODO,
+        # and those two failures average into a single QA number that describes neither.
+        topic=question.get("topic"),
         expected_behavior=question["expected_behavior"], run_idx=run_idx, mitigated=mitigate,
         context_json=json.dumps(chunks, sort_keys=True),
     )
@@ -961,7 +961,11 @@ def run_explain(
     system, user, static_hash = ctx.prompts.explain_plan(question, plan_json)
     try:
         res = client.chat(
-            system, user, options=sampling_options(ctx.cfg), think=model_cfg.get("think")
+            system, user,
+            options=sampling_options(
+                ctx.cfg, max_tokens=ctx.cfg["run"].get("max_explain_tokens"),
+                model_cfg=model_cfg),
+            think=model_cfg.get("think")
         )
     except LlamaCppError as exc:
         out.write(json.dumps({
@@ -975,11 +979,26 @@ def run_explain(
         fixture_hash=ctx.fixture.fixture_hash,
     )
     rec["faithfulness_flags"] = scorers.faithfulness_flags(res.text, plan_json)
+    # CLAIMS THE PLAN ITSELF CONTRADICTS — see `scorers.explain_flags`. Faithfulness alone only
+    # asks "did it invent a course code"; an explanation can pass that and still tell a student
+    # a course sits in a semester it does not, or describe a plan as complete while the planner
+    # is reporting courses it could not fit. Both are checkable against the payload the model
+    # was handed, because the harness generated it.
+    rec["explain_flags"] = scorers.explain_flags(
+        res.text, plan_scorers.plan_to_semesters(plan), list(plan.unplanned_courses)
+    )
+    rec["explain_auto_pass"] = not rec["explain_flags"] and not rec["faithfulness_flags"]
+    rec["unplanned_count"] = len(plan.unplanned_courses)
     rec["needs_review"] = True
     out.write(json.dumps(rec, default=str) + "\n")
     ctx.write_transcript(
         model_cfg["name"], "explain", scenario.id, run_idx, system, user, res.text,
-        verdict=f"faith_flags={len(rec['faithfulness_flags'])} truncated={res.truncated}",
+        verdict=f"faith_flags={len(rec['faithfulness_flags'])} "
+                f"explain_flags={len(rec['explain_flags'])} truncated={res.truncated}",
+        detail=("## Explanation checks\n\n" + (
+            "\n".join(f"- ⚠️ {f}" for f in rec["explain_flags"] + rec["faithfulness_flags"])
+            or "None — every checkable claim matches the plan."
+        )),
     )
 
 
@@ -1381,8 +1400,14 @@ def write_meta(ctx: EvalContext, tag: str, selected: list[dict], tasks: set[str]
             "models": {m["name"]: (str(d) if (d := resolve_draft(ctx.cfg, m)) else None)
                        for m in selected},
         },
+        # THE PROGRAM this run evaluated. Still keyed "fixture" so every reader written
+        # against older meta files keeps working; there is no fixture FILE any more (see
+        # `fixtures.py`), so `path` is the database's own identity and `hash` its db_hash.
         "fixture": {
             "path": str(ctx.fixture.path.name),
+            "name": ctx.fixture.name,
+            "slug": ctx.fixture.slug,
+            "program_id": ctx.fixture.real_db_program_id,
             "hash": ctx.fixture.fixture_hash,
             "verified": ctx.fixture.verified,
             "scenarios": [s.id for s in ctx.fixture.scenarios],
@@ -1415,8 +1440,8 @@ def write_meta(ctx: EvalContext, tag: str, selected: list[dict], tasks: set[str]
                     if ctx.fixture.by_code else None
                 ),
                 # Iterate `files`, not `tables`: `files` is keyed to exactly
-                # `catalog_export.TABLES` (every table `render_context` prints,
-                # `unresolved_requirement_groups` included), while `tables` could in principle
+                # `catalog_export.TABLES` (every table `render_context` prints), while
+                # `tables` could in principle
                 # hold something wider that never got hashed.
                 "tables": {t: {"rows": len(db.rows(t)), "hash": h} for t, h in db.files.items()},
             }

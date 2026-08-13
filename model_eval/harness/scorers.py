@@ -338,3 +338,105 @@ def score_qa(answer: str, chunks: list[dict[str, Any]], expected_behavior: str) 
         "qa_auto_pass": behaved and (expected_behavior == "abstain" or not faith),
         "needs_review": True,  # every free-text answer is manually graded, no exceptions
     }
+
+
+# --- explain-plan scoring ------------------------------------------------------------------
+#
+# WHAT WAS HERE BEFORE: `faithfulness_flags` and nothing else. That answers "did it invent a
+# course code", which is table stakes, and leaves the actual question unmeasured — an
+# explanation can be perfectly faithful, mention only real courses, and still be useless or
+# wrong about WHY the plan looks like it does.
+#
+# WHAT IS DECIDABLE, and this is the whole design constraint. "Was this explanation helpful"
+# is a human judgment and stays one (`needs_review` is still set on every record). But three
+# things about an explanation of a KNOWN plan are mechanically checkable, because the plan is
+# structured data the harness generated itself:
+#
+#   1. PLACEMENT CLAIMS. "You take CS 25100 in your first semester" is either true of the plan
+#      or it is not. The plan is right there.
+#   2. ORDER CLAIMS. "CS 18200 comes before CS 25100" is checkable the same way.
+#   3. DISCLOSURE. When the planner could not fit everything, it says so in
+#      `unplanned_courses`. An explanation that describes the plan as complete while courses
+#      are missing is the single most damaging thing this feature can do to a student, and it
+#      is exactly the failure a fluent model produces — the unplanned list is at the BOTTOM of
+#      a long JSON payload.
+#
+# All three are reported as flags rather than a pass/fail score, and the regexes are
+# deliberately conservative: they only fire on explicit, unambiguous phrasings. A missed claim
+# costs nothing (a human still reads it); a false accusation would poison the review queue,
+# which is the one artifact a person actually reads end to end.
+_ORDINALS = {
+    "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5,
+    "sixth": 6, "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10,
+}
+# "CS 25100 in your third semester", "in semester 3, CS 25100", "third semester: CS 25100"
+_PLACEMENT_RE = re.compile(
+    r"(?:([A-Z]{2,6}\s?\d{3,5})[^.;\n]{0,40}?(?:in|during)\s+(?:your\s+|the\s+)?"
+    r"(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|\d{1,2})(?:st|nd|rd|th)?"
+    r"\s+(?:semester|term))"
+    r"|(?:(?:semester|term)\s+(\d{1,2})[^.;\n]{0,40}?([A-Z]{2,6}\s?\d{3,5}))",
+    re.IGNORECASE,
+)
+# "CS 18200 before CS 25100", "CS 18200 must come before CS 25100"
+_ORDER_RE = re.compile(
+    r"([A-Z]{2,6}\s?\d{3,5})[^.;\n]{0,30}?\bbefore\b[^.;\n]{0,30}?([A-Z]{2,6}\s?\d{3,5})",
+    re.IGNORECASE,
+)
+_COMPLETENESS_PHRASES = (
+    "every requirement", "all requirements", "all of your requirements",
+    "complete plan", "fully covered", "covers everything", "on track to graduate",
+    "nothing is missing", "all set",
+)
+
+
+def _norm(code: str) -> str:
+    return code.upper().replace(" ", "")
+
+
+def explain_flags(answer: str, semesters: list[list[str]], unplanned: list[str]) -> list[str]:
+    """Claims in `answer` that the plan itself contradicts. See the section comment above.
+
+    `semesters` is the plan as lists of course codes, index 0 = first semester; `unplanned` is
+    what the planner could not fit. Both come from the same object the model was shown, so a
+    flag here is a real disagreement with the payload, not a retrieval artifact.
+    """
+    flags: list[str] = []
+    placement = {_norm(code): index + 1
+                 for index, codes in enumerate(semesters) for code in codes}
+
+    for match in _PLACEMENT_RE.finditer(answer):
+        code, ordinal, ordinal2, code2 = match.groups()
+        code, ordinal = (code or code2), (ordinal or ordinal2)
+        if not code or not ordinal:
+            continue
+        wanted = _ORDINALS.get(ordinal.lower(), None)
+        if wanted is None:
+            wanted = int(ordinal) if ordinal.isdigit() else None
+        actual = placement.get(_norm(code))
+        if wanted is None or actual is None:
+            continue
+        if actual != wanted:
+            flags.append(f"says {code.upper()} is in semester {wanted}; plan has it in {actual}")
+
+    for match in _ORDER_RE.finditer(answer):
+        first, second = _norm(match.group(1)), _norm(match.group(2))
+        a, b = placement.get(first), placement.get(second)
+        if a is None or b is None or a < b:
+            continue
+        flags.append(
+            f"says {match.group(1).upper()} comes before {match.group(2).upper()}; "
+            f"plan has them in semesters {a} and {b}"
+        )
+
+    if unplanned:
+        named = any(_norm(code) in _norm(answer) for code in unplanned)
+        lowered = answer.lower()
+        claimed_complete = any(phrase in lowered for phrase in _COMPLETENESS_PHRASES)
+        if not named:
+            flags.append(
+                f"{len(unplanned)} course(s) could not be scheduled "
+                f"({', '.join(unplanned[:4])}) and the explanation never mentions them"
+            )
+        if claimed_complete:
+            flags.append("describes the plan as complete while courses are unscheduled")
+    return flags

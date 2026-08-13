@@ -1,26 +1,42 @@
-"""Load ``plan_fixtures/*.yaml`` into the harness's planner types.
+"""The harness's planner types, and the students the eval runs against.
 
-Two jobs:
+THERE ARE NO FIXTURE FILES ANY MORE (2026-08-12). This module used to load
+``plan_fixtures/*.yaml`` — one hand-authored file per school, carrying that program's course
+catalog, its requirement groups, and a set of hand-written student scenarios. Every one of
+those three is now read from, or derived from, the real crawled database instead:
 
-1. Turn the fixture's course rows into :class:`planner.Course` objects.
-2. Turn its ``requirement_groups`` into the ordered ``remaining_courses`` list a profile
-   carries — a port of ``backend/app/services/planner_catalog.select_remaining_courses``
-   (required groups first, then just enough selective options to cover each group's credit
-   target, counting completed courses toward the group). Mode A has to start from the same
-   baseline production would, or it isn't measuring production.
+    courses + requirement_groups   `real_db.fixture_from_database`, off the same
+                                   `CatalogDatabase` the model is shown
+    students                       `synthesize_scenarios` below, derived from that program's
+                                   own required courses
 
-The fixture's raw bytes are hashed into every plan record: edit the fixture and old records
-stop being comparable, exactly like the prompt-hash rule.
+WHY. A fixture file was a per-program cost paid by hand, so `--major` only ever worked for the
+nineteen programs somebody had written a file for, out of ~950 crawled. Worse, the hand-written
+half drifted: fixtures invented course codes for gen-ed categories that were never real, and
+every model was scored against them (see `real_scoring.py`'s module docstring for what that cost
+in false "missing requirement" reports). What is left is uniform — any program in the catalog is
+a valid `--major`, and every program is described the same way, by the crawl.
+
+What this module still owns:
+
+1. :class:`planner.Course`/:class:`Profile` construction (`Scenario`, `Fixture`).
+2. ``select_remaining_courses`` — the ordered course list a profile carries, a port of
+   ``backend/app/services/planner_catalog.select_remaining_courses`` (required groups first,
+   then just enough selective options to cover each group's credit target, counting completed
+   courses toward the group). Mode A has to start from the same baseline production would, or
+   it isn't measuring production.
+3. ``synthesize_scenarios`` — the students themselves.
+
+The DATABASE hash (`CatalogDatabase.db_hash`) now lands in every plan record where the fixture
+hash used to, and it carries the same meaning: change what the model was shown and old records
+stop being comparable.
 """
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-
-import yaml
 
 from .planner import Course, Profile
 
@@ -76,28 +92,12 @@ class Fixture:
     catalog: list[Course]
     requirement_groups: list[dict[str, Any]]
     scenarios: list[Scenario]
-    # Multi-school support (added 2026-08-08 for the school-sweep feature — see `run.py`'s
-    # `discover_fixtures`/`resolve_major`). `slug` is the short name `run.py run`'s default
-    # "every school" loop uses for `results/results_<slug>/`; `real_db_program_id` is the real,
-    # crawled Postgres program this fixture's scenarios were written against, so Mode B/C read
-    # the SAME program Mode A is scored against instead of whatever config.yaml happened to have
-    # configured last. Both empty ("") for a fixture that hasn't opted in yet — `run.py` treats
-    # an empty `real_db_program_id` as "skip Mode B/C for this fixture" rather than silently
-    # falling back to a different program's data.
+    # Multi-school support. `slug` is the short name `run.py run`'s sweep uses for
+    # `results/results_<slug>/`; `real_db_program_id` is the crawled Postgres program every
+    # mode reads. Both are set by `real_db.fixture_from_database`, which is now the only thing
+    # that builds a `Fixture` at all.
     slug: str = ""
     real_db_program_id: str = ""
-    # "real_db" (default) — Mode B/C's database is fetched live from Postgres via
-    # `real_db_program_id`, exactly as every fixture worked before this field existed.
-    # "fixture" — Mode B/C's database is built from THIS fixture's own `courses`/
-    # `requirement_groups` instead (`real_db.real_db_base_from_fixture`), no Postgres round
-    # trip at all. For the school-core/gen-ed+world-language pseudo-major fixtures, whose
-    # content has no live-DB equivalent to fetch — see those fixtures' own provenance headers.
-    source: str = "real_db"
-    # ""/absent (default) = unchanged: every requirement group Postgres returns for this
-    # program. "major"/"college"/"university" narrows Mode B/C to just that
-    # `real_db._scope_for` tier — see `real_db.fetch_real_db_base`'s `scope_filter` param. A
-    # no-op for a `source: fixture` fixture (there is no live DB to filter).
-    requirement_scope: str = ""
 
     @property
     def by_code(self) -> dict[str, Course]:
@@ -131,21 +131,9 @@ class Fixture:
         return out
 
 
-def _course(row: dict[str, Any]) -> Course:
-    return Course(
-        code=row["code"],
-        title=row.get("title", ""),
-        credits=int(row.get("credits", 0)),
-        prereqs=tuple(row.get("prereqs") or ()),
-        coreqs=tuple(row.get("coreqs") or ()),
-        offered_terms=tuple(row.get("offered_terms") or ()),
-        requirement_tags=tuple(row.get("requirement_tags") or ()),
-        equivalent_to=str(row.get("equivalent_to") or ""),
-    )
-
-
 def select_remaining_courses(
-    groups: list[dict[str, Any]], completed: set[str], credits_of
+    groups: list[dict[str, Any]], completed: set[str], credits_of,
+    canonical: dict[str, str] | None = None,
 ) -> list[str]:
     """Port of ``planner_catalog.select_remaining_courses`` over fixture groups.
 
@@ -158,18 +146,37 @@ def select_remaining_courses(
     completed it or an earlier group required it; before this date only completed courses
     counted, so a group whose options were already scheduled elsewhere still pulled in extra
     courses to fill a target that was in fact already met.
+
+    APPROVED SUBSTITUTES COUNT AS ONE COURSE (2026-08-12), which is what `canonical` is for.
+    The real catalog states an either/or requirement as SEPARATE options on the same group —
+    CS Machine Intelligence's "Mathematics" group lists MA 16100, MA 16200, MA 16500 AND
+    MA 16600, where 16500/16600 are the approved substitutes for 16100/16200 — and with no
+    collapsing this function put all four on the list. The student was told to take Calculus I
+    twice. That was invisible until prerequisites arrived: with ordering unconstrained the two
+    extra courses merely wasted semesters, but with a real chain behind them the planner spent
+    its horizon on the duplicate track, never reached MA 16200, and every downstream course
+    (MA 26100, MA 26500, MA 41600) fell out of the plan — Mode A coverage 91%, viable for
+    nobody, for a program whose requirements are entirely satisfiable.
+
+    The APP does the same job with a different mechanism, and the difference is data, not
+    intent: `planner_db.select_remaining_courses` receives each requirement as a run of
+    alternatives (`[["MA 16100", "MA 16500"]]`) and takes the first of each run. The database
+    export this harness reads flattens options into one list, so the alternative structure is
+    gone by the time it gets here and `course_aliases` is what is left to reconstruct it. Same
+    rule, same result, expressed with what each side actually has.
     """
+    canon = (lambda code: (canonical or {}).get(code, code))  # noqa: E731
     required: list[str] = []
     selective: list[str] = []
-    seen: set[str] = set(completed)
+    seen: set[str] = {canon(c) for c in completed}
 
     for group in groups:
         if group.get("kind") != "all":
             continue
         for code in group.get("courses", []):
-            if code not in seen:
+            if canon(code) not in seen:
                 required.append(code)
-                seen.add(code)
+                seen.add(canon(code))
 
     for group in groups:
         if group.get("kind") != "choose":
@@ -186,104 +193,242 @@ def select_remaining_courses(
         counted: set[str] = set()
         needed = float(target)
         for code in options:
-            if code in seen and code not in counted:
-                counted.add(code)
+            if canon(code) in seen and canon(code) not in counted:
+                counted.add(canon(code))
                 needed -= credits_of(code) or DEFAULT_OPTION_CREDITS
         for code in options:
             if needed <= 0:
                 break
-            if code in seen:
+            if canon(code) in seen:
                 continue
             selective.append(code)
-            seen.add(code)
+            seen.add(canon(code))
             needed -= credits_of(code) or DEFAULT_OPTION_CREDITS
 
     return required + selective
 
 
-def load_fixture(path: Path) -> Fixture:
-    raw = Path(path).read_bytes()
-    data = yaml.safe_load(raw.decode("utf-8"))
-    catalog = [_course(row) for row in data["courses"]]
+# --- students, derived from the program itself --------------------------------------------------
+#
+# FIVE ARCHETYPES, THE SAME FIVE FOR EVERY PROGRAM. They are what the nineteen hand-written
+# fixtures' scenarios all turned out to be variations of, once the program-specific course codes
+# came out: a student starting clean, one part-way through, one who wants a light term, one whose
+# calendar starts in spring, and one in a hurry. Keeping the SET identical across programs is the
+# point — a per-program student list made two schools' numbers incomparable for reasons that had
+# nothing to do with the model.
+#
+# Everything program-specific is derived, never authored: `completed_courses` comes off this
+# program's own required courses in the catalog's prerequisite order, and `major_subject` is
+# whichever subject prefix dominates its requirement groups.
+#
+# `feedback` is the second turn of the Mode A/B feedback variants and Mode C's revise loop, so it
+# has to be a real constraint a planner can act on while naming nothing program-specific.
+_ARCHETYPES: tuple[dict[str, Any], ...] = (
+    {
+        "id": "fresh-start",
+        "label": "First-year student, nothing completed, full eight-semester horizon",
+        "completed": 0,
+        "profile": {"semesters_to_plan": 8},
+        "feedback": "Please keep my first semester lighter — I am adjusting to college and "
+                    "would rather not carry a full load right away.",
+    },
+    {
+        "id": "midway-catchup",
+        "label": "Part-way through the degree, planning the rest",
+        # TWO SEMESTERS OF WORK BEHIND THEM, six ahead — the horizons and the transcripts have
+        # to add up to a whole degree or the scenario is unsatisfiable by construction and
+        # every model scores zero on it for arithmetic reasons. ~5 courses per completed
+        # semester, matching a 15-credit term.
+        "completed": 10,
+        "profile": {"semesters_to_plan": 6},
+        "feedback": "I want to finish on time. If anything has to slip, slip an elective, not "
+                    "a course something else depends on.",
+    },
+    {
+        "id": "light-load",
+        "label": "Working student who cannot carry a full course load",
+        "completed": 0,
+        # TEN SEMESTERS, not eight. A 13-credit ceiling over 8 terms is 104 credits against a
+        # 120-credit degree — the student cannot graduate in that window no matter who plans
+        # it, so an 8-semester horizon here would measure arithmetic, not the model. Taking
+        # longer IS the trade a working student makes.
+        "profile": {"semesters_to_plan": 10, "max_credits_per_semester": 13,
+                    "target_credits_per_semester": 12},
+        "feedback": "I work about 25 hours a week. Twelve or thirteen credits a semester is my "
+                    "real ceiling — please do not plan a term above it.",
+    },
+    {
+        "id": "spring-start",
+        "label": "Spring admit — the calendar starts off-cycle",
+        "completed": 0,
+        "profile": {"start_term": "spring", "semesters_to_plan": 8},
+        "feedback": "I started in the spring, so please do not assume the usual fall-first "
+                    "sequence works for me.",
+    },
+    {
+        "id": "accelerate",
+        "label": "Wants to finish early, willing to carry a heavy load",
+        # Three semesters of credit already banked (AP, dual enrolment, a summer) is what makes
+        # "graduate a year early" a plan rather than a wish — same add-up-to-a-degree rule as
+        # `midway-catchup`.
+        "completed": 15,
+        "profile": {"semesters_to_plan": 6, "max_credits_per_semester": 18},
+        "feedback": "I would like to graduate a year early. I can handle heavy semesters, but "
+                    "not ones that break the prerequisite order.",
+    },
+)
+
+
+def dominant_subject(requirement_groups: list[dict[str, Any]]) -> str:
+    """The subject prefix that carries this degree — "CS", "NUR", "ME".
+
+    `major_subject` drives the per-semester major-course caps and `is_major_course` in every
+    scorer, and it used to be authored per fixture. Counted over the courses in `kind: all`
+    groups only: a required course is the program's own, while a selective menu is mostly
+    gen-ed and would swamp the count with whatever subject happens to have the most electives.
+    Falls back to every group, then to "" (which makes the major-course caps inert rather than
+    wrong) for a program whose requirements name no courses at all.
+    """
+    def _counts(groups: list[dict[str, Any]]) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for group in groups:
+            for code in group.get("courses", []):
+                subject = code.split(" ")[0].strip()
+                if subject:
+                    counts[subject] = counts.get(subject, 0) + 1
+        return counts
+
+    for candidates in (_counts([g for g in requirement_groups if g.get("kind") == "all"]),
+                       _counts(requirement_groups)):
+        if candidates:
+            return max(candidates.items(), key=lambda kv: (kv[1], kv[0]))[0]
+    return ""
+
+
+def _completed_prefix(
+    catalog: list[Course], requirement_groups: list[dict[str, Any]], count: int,
+    canonical: dict[str, str] | None = None,
+) -> list[str]:
+    """The first `count` courses of this degree, in an order a student could have taken them.
+
+    Built from the SAME list the student would be planning if they were starting fresh — the
+    program's own selected courses plus their prerequisite closure — truncated to `count` in
+    catalog order. `real_db` builds `catalog` in prerequisite-chain order and never re-sorts,
+    so a prefix of it is legal by construction: nothing lands on the transcript before
+    something it depends on.
+
+    IT USED TO WALK ONLY `kind: "all"` GROUPS, and stalled almost immediately: a required
+    course whose prerequisite lives in a SELECTIVE group (MA 26100 needs MA 16200, which CS
+    reaches through University Core: Quantitative Reasoning) failed the "are its prerequisites
+    already here" test and stopped the walk. `accelerate` asked for fifteen completed courses
+    and got two — a student one year from graduating, handed a transcript with CS 18000 on it,
+    then scored on whether a model could fit the whole degree into six semesters. Coverage 91%
+    for everyone, no violations, entirely an artifact of this function.
+    """
+    def credits_of(code: str) -> int:
+        course = next((c for c in catalog if c.code == code), None)
+        return course.credits if course else 0
+
+    full = _with_prereq_closure(
+        select_remaining_courses(requirement_groups, set(), credits_of, canonical),
+        catalog, set(), canonical,
+    )
+    wanted = set(full)
+    ordered = [c.code for c in catalog if c.code in wanted]
+    return ordered[:count]
+
+
+def _with_prereq_closure(
+    codes: list[str], catalog: list[Course], completed: set[str],
+    canonical: dict[str, str] | None = None,
+) -> list[str]:
+    """`codes` plus every prerequisite they transitively need that nothing else supplies.
+
+    THE DEGREE AUDIT IS NOT A PLAN, and this is where that bites. A requirement group lists
+    what COUNTS toward the degree, not everything a student must sit through to get there:
+    Mechanical Engineering requires MA 26100, MA 26500 and MA 26600 by name and never mentions
+    Calculus I or II, because the audit assumes those arrive via placement, AP credit, or the
+    University Core. `select_remaining_courses` faithfully reproduces that list — and the
+    deterministic planner then cannot schedule a single one of them, because `generate_plan`
+    only ever places courses that are ON the list and MA 26100's prerequisite is not. Measured
+    on ME: 57% coverage for all five students, with zero violations, purely from this.
+
+    So the closure is added at SCENARIO-CONSTRUCTION time, not inside
+    `select_remaining_courses` — that function is a port of the app's own
+    `planner_catalog.select_remaining_courses` and must keep matching it (`run.py parity`).
+    "What this student still has to take" is a fact about the student, which is exactly what a
+    scenario is for. The app has the same hole and should probably close it the same way, but
+    that is a product decision, not a porting one.
+
+    Added courses come FIRST, in catalog order — `real_db` builds `catalog` in
+    prerequisite-chain order, so that is already a legal sequence, and the planner reads list
+    position as preference. Anything already completed is skipped; a prerequisite naming a
+    course outside the catalog is dropped, since nothing could schedule it anyway.
+    """
+    by_code = {c.code: c for c in catalog}
+    canon = (lambda code: (canonical or {}).get(code, code))  # noqa: E731
+    have = {canon(c) for c in completed} | {canon(c) for c in codes}
+    added: set[str] = set()
+    frontier = list(codes)
+    while frontier:
+        course = by_code.get(frontier.pop())
+        if course is None:
+            continue
+        for need in tuple(course.prereqs) + tuple(course.coreqs):
+            if need not in by_code or canon(need) in have:
+                continue
+            have.add(canon(need))
+            added.add(need)
+            frontier.append(need)
+    if not added:
+        return codes
+    order = {course.code: index for index, course in enumerate(catalog)}
+    return sorted(added, key=lambda c: order.get(c, 0)) + codes
+
+
+def synthesize_scenarios(
+    program_name: str,
+    catalog: list[Course],
+    requirement_groups: list[dict[str, Any]],
+    *,
+    major_subject: str = "",
+    canonical: dict[str, str] | None = None,
+) -> list[Scenario]:
+    """The five students every program is evaluated against. See `_ARCHETYPES`.
+
+    Deterministic for a given database state: same program, same catalog order, same students,
+    so a re-run compares against the last one. Nothing here is hand-authored per program, which
+    is what makes `--major <anything in the catalog>` work.
+    """
+    subject = major_subject or dominant_subject(requirement_groups)
     by_code = {course.code: course for course in catalog}
-    groups = data["requirement_groups"]
 
     def credits_of(code: str) -> int:
         course = by_code.get(code)
         return course.credits if course else 0
 
-    # Major-course load caps: a program-level default every scenario inherits, so the rule is
-    # stated once and the eval cannot end up comparing models against different limits by
-    # accident. A scenario whose student asked for something lighter overrides it in its own
-    # `profile` block — see the mi-* scenarios.
-    program = data.get("program") or {}
-    default_subject = str(program.get("major_subject", "CS"))
-    default_hard = int(program.get("max_major_courses_per_semester", 3))
-    default_soft = int(program.get("preferred_major_courses_per_semester", 2))
-    # None/absent is meaningful here and must NOT be coerced to an int: it is what tells the
-    # planner to derive the target per term rather than pin it.
-    default_target = program.get("target_credits_per_semester")
-    # The registrar's ceiling, program-level for the same reason the major cap is: it is a rule
-    # about the university, not about any one student, so no scenario should be able to drift
-    # off it by accident. A scenario may still override it (a student on academic probation has
-    # a genuinely lower one), but none does today.
-    default_hard_credits = int(program.get("hard_credit_cap", 18))
-
     scenarios: list[Scenario] = []
-    for row in data.get("scenarios", []):
-        p = row["profile"]
-        completed = list(p.get("completed_courses") or [])
-        remaining = select_remaining_courses(groups, set(completed), credits_of)
-        scenarios.append(
-            Scenario(
-                id=row["id"],
-                label=row.get("label", row["id"]),
-                profile=Profile(
-                    name=p.get("name", "Student"),
-                    degree_program=p.get("degree_program", ""),
-                    completed_courses=completed,
-                    remaining_courses=remaining,
-                    start_term=p.get("start_term", "fall"),
-                    start_year=int(p.get("start_year", 2026)),
-                    semesters_to_plan=int(p.get("semesters_to_plan", 8)),
-                    max_credits_per_semester=int(p.get("max_credits_per_semester", 16)),
-                    hard_credit_cap=int(p.get("hard_credit_cap", default_hard_credits)),
-                    target_credits_per_semester=(
-                        int(t) if (t := p.get("target_credits_per_semester",
-                                              default_target)) is not None else None),
-                    major_subject=str(p.get("major_subject", default_subject)),
-                    max_major_courses_per_semester=int(
-                        p.get("max_major_courses_per_semester", default_hard)),
-                    preferred_major_courses_per_semester=int(
-                        p.get("preferred_major_courses_per_semester", default_soft)),
-                ),
-                feedback=(row.get("feedback") or "").strip(),
-                assertions=list(row.get("assertions") or []),
-                expect_unsatisfiable=bool(row.get("expect_unsatisfiable", False)),
-                gen_ed_preference=row.get("gen_ed_preference"),
-                world_language=(
-                    (str(row["world_language"]["subject"]).upper(),
-                     int(row["world_language"]["level"]))
-                    if row.get("world_language") else None
-                ),
-                additional_programs=tuple(
-                    (str(extra["poid"]), str(extra.get("kind") or "major"),
-                     str(extra.get("label") or extra["poid"]))
-                    for extra in (row.get("additional_programs") or [])
-                ),
-            )
-        )
-
-    return Fixture(
-        name=data["program"]["name"],
-        path=Path(path),
-        fixture_hash=hashlib.sha256(raw).hexdigest()[:16],
-        verified=bool(data["program"].get("verified", False)),
-        catalog=catalog,
-        requirement_groups=groups,
-        scenarios=scenarios,
-        slug=str(program.get("slug") or Path(path).stem),
-        real_db_program_id=str(program.get("real_db_program_id") or ""),
-        source=str(program.get("source") or "real_db"),
-        requirement_scope=str(program.get("requirement_scope") or ""),
-    )
+    for spec in _ARCHETYPES:
+        completed = _completed_prefix(catalog, requirement_groups,
+                                      int(spec["completed"]), canonical)
+        overrides = dict(spec["profile"])
+        scenarios.append(Scenario(
+            id=str(spec["id"]),
+            label=str(spec["label"]),
+            profile=Profile(
+                name="Student",
+                degree_program=program_name,
+                completed_courses=completed,
+                remaining_courses=_with_prereq_closure(
+                    select_remaining_courses(
+                        requirement_groups, set(completed), credits_of, canonical),
+                    catalog, set(completed), canonical),
+                start_term=str(overrides.pop("start_term", "fall")),
+                start_year=int(overrides.pop("start_year", 2026)),
+                major_subject=subject,
+                **overrides,
+            ),
+            feedback=str(spec["feedback"]),
+            assertions=[],
+        ))
+    return scenarios

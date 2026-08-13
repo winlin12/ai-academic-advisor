@@ -3,7 +3,7 @@
 Unlike faithfulness (a heuristic that needs your eyes), everything here is FULLY AUTOMATIC
 and decidable: a plan either schedules CS 38100 before its prerequisites or it doesn't. The
 only judgment call baked in is the fixture itself — see the provenance header in
-``plan_fixtures/cs_machine_intelligence.yaml``. Wrong fixture rows bias every model the same
+the program's own crawled database (`real_db.fixture_from_database`). Wrong rows bias every model the same
 direction, which keeps rankings usable and absolute numbers suspect.
 
 WHAT IS MEASURED

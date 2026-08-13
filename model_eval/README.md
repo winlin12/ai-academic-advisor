@@ -36,9 +36,10 @@ different tasks, different prompts, different hashes.
 cd model_eval
 
 python run.py doctor              # local llama-server setup: binary, models, GPU (once, first)
-python run.py refresh-offerings   # pull real term offerings into the fixture (see below)
-python run.py check               # fixture validity, prompt sizes, gguf files, GPU visible
-python run.py run        # every model, every task  (hours — see "Cost" below)
+python run.py check               # program data, prompt sizes, gguf files, GPU visible
+python run.py check --major "nursing"   # ...for any crawled program; --major works on `run` too
+python run.py run        # THE SWEEP: 2 curated majors per school + 2 random untested programs
+                         # (config.yaml `sweep:`) — every model, every task (hours)
 python run.py report     # results/report.md
 
 # narrower runs
@@ -122,9 +123,18 @@ planning lands.
 
 ## The plan-of-study eval
 
-The scoring authority is `plan_fixtures/cs_machine_intelligence.yaml`: a CS BS +
-Machine Intelligence catalog (43 courses with prereq edges, term offerings and credits),
-9 requirement groups, and 9 student scenarios. Nothing else decides a score.
+The scoring authority is **the crawled catalog itself** — whichever program `--major` (or the
+sweep) selected, read live from Postgres and turned into the harness's own types by
+`real_db.fixture_from_database`. Courses, prerequisite edges, credits and requirement groups are
+the catalog's; the five students are derived from that program's own required courses
+(`fixtures.synthesize_scenarios`). Nothing else decides a score.
+
+There used to be nineteen hand-authored `plan_fixtures/*.yaml` files here, one per school, each
+carrying a catalog, requirement groups and hand-written scenarios. They are gone (2026-08-12):
+they capped `--major` at the nineteen programs somebody had written a file for, and their
+hand-written halves drifted from the catalog (inventing gen-ed course codes that were then
+scored as missing requirements). Every crawled program is now evaluable, and all of them are
+described the same way.
 
 ### Two modes, kept separate on purpose
 
@@ -234,7 +244,11 @@ over the person it is planning for.
 
 **Locked slots.** A locked slot is a `(semester, course)` pair the student fixed. It is an input
 to every attempt and the model may never move it; only the slots the model fills itself are
-revisable. They live in `plan_fixtures/*.locked_slots.yaml` — deliberately **outside**
+revisable. **Student-authored locks were removed 2026-08-12** along with the last hand-authored
+files in the harness: Mode C now starts every case from an empty set and runs for every program,
+and the only slots that get pinned are the ones the repair variant has itself confirmed. The
+pinning mechanism below is unchanged; what is gone is the per-program file that seeded it, which
+was deliberately **outside**
 `fixture_hash`, because Mode A/B never see them and folding them in would invalidate those
 records for a change they did not observe. Each is lifted
 from the deterministic planner's own output, so the set is demonstrably satisfiable, and
@@ -492,14 +506,12 @@ the weights to page in from disk, which for the larger ggufs is minutes, not sec
 | File | Responsibility |
 |---|---|
 | `config.yaml` | Every knob that could pollute a comparison: context size, KV type, GPU layers, sampling, per-model gguf paths and `think`/`mlock` flags, decision thresholds. |
-| `plan_fixtures/cs_machine_intelligence.yaml` | **The scoring authority.** Catalog, requirement groups, scenarios. Read its provenance header before quoting any number. The one place to edit a course, a prerequisite or a requirement. |
-| `mock_db/*.json` | **What the model is shown.** A mock of the two real databases in their real table shapes, GENERATED from the fixture by `run.py build-mock-db` — never hand-edited. See *The database is the context* below. |
-| `harness/mock_db.py` | Loads the mock database, checks the referential integrity a real FK would enforce, and renders the whole thing as Mode B's context. The seam RAG replaces. |
+| `harness/real_db.py` | **The scoring authority's source.** Reads one program out of the crawled `catalog_ingestion`/`advisor` Postgres, scopes and budget-trims it, and builds both what the model is shown (`CatalogDatabase`) and what it is scored against (`fixture_from_database`). Also owns program lookup for `--major` and the sweep. |
 | `questions.yaml` | Grounded-QA items with their retrieved chunks **pinned in the file** — retrieval belongs to the embedding model, so letting it vary would smear a retrieval difference across every model's score. |
 | `harness/server.py` | llama-server lifecycle as a native local process: builds argv from config, waits for `/health`, parses per-layer offload from stderr, stops between models. |
 | `harness/llamacpp_client.py` | Streaming stdlib client for `/v1/chat/completions`. TTFT from the stream, token counts from `usage`, timings from llama.cpp's own `timings`. |
 | `harness/planner.py` | **Vendored copy** of the app's deterministic planner + `_apply_proposal`. Mode A can only measure production if these match — see the drift warning below. |
-| `harness/fixtures.py` | Loads the fixture; ports `planner_catalog.select_remaining_courses` so Mode A starts from production's baseline. |
+| `harness/fixtures.py` | The harness's own types (`Fixture`/`Scenario`), the five synthesized students every program is evaluated against, and the port of `planner_catalog.select_remaining_courses` so Mode A starts from production's baseline. No longer loads anything from disk. |
 | `harness/plan_scorers.py` | Viability, requirement coverage, scenario assertions, proposal groundedness — against the fixture. Scores Mode A (legal by construction, by design) and Mode C (see the known-gap note on `convergence.py`, below). Not used for Mode B any more. |
 | `harness/real_scoring.py` | Mode B's scorer, and the only one it uses: every check `plan_scorers.py` runs, against `ctx.database` (the real, live catalog Mode B was actually shown and grammar-constrained to) instead of the fixture. Exists because scoring Mode B against the fixture produced real courses flagged `hallucinated_course` and invented gen-ed groups counted as missing requirements — see its module docstring. |
 | `harness/prompts.py` | Static-first prompts for the app's four live call sites. sha256 of each static block **and its response schema** travels with every record. |
@@ -507,12 +519,11 @@ the weights to page in from disk, which for the larger ggufs is minutes, not sec
 | `harness/runner.py` | Orchestration: server lifecycle, warmup + discard, VRAM delta, N replicates, one request at a time. Plan tasks run **first** so a cut-short run keeps the data that matters. |
 | `harness/convergence.py` | **Mode C.** Locked slots, the retry loop, both variants, censoring. Computes convergence *from* `plan_scorers` output rather than reimplementing it, so D and B validate against one instrument. Own results file, own lock, and it refuses to start while any other run holds the GPU. **KNOWN GAP** (2026-08-04): Mode C shows the model `ctx.database` (real, grammar-constrained) exactly like Mode B does, but still scores it against the fixture, same class of bug `real_scoring.py` exists to fix for Mode B — not yet ported here because the retry/repair logic is coupled to `plan_scorers.score_plan`'s specific violation objects (the `repair` variant mutates them directly). Lower-risk in practice for the CS Machine Intelligence program specifically, because the convergence criterion is violations-only, not coverage (see `run.py run --tasks converge`'s report section) — the gen-ed-mismatch class of bug that hit Mode B's coverage number doesn't move this one. Still fixture-scored; treat accordingly. |
 | `harness/convergence_report.py` | Mode C's tables and Kaplan-Meier estimator over right-censored data; progress traces per attempt. Own module because the record schema is a survival observation, not pass/fail — but `report.py` imports `mode_c_lines()` and splices it into the one `results/report.md`, not a separate file. |
-| `plan_fixtures/*.locked_slots.yaml` | Mode C's locked slots. Prompt input, **not** scoring authority — recorded in `meta_convergence.json` and on each record, never folded into `fixture_hash`. |
 | `harness/report.py` | Plan tables first, validity guards, manual review queue. No composite score exists. |
 | `results/transcripts/` | One markdown file per (model, stage, item, replicate): system prompt, user prompt, raw output, verdict. The raw text is in the JSONL too, but a JSONL field is not something you can read — and reading what a model literally said is how you catch a metric measuring the wrong thing. Disable with `run.save_transcripts: false`. |
 | `setup/allow_wsl_llamacpp.ps1` | Leftover from the Windows-interop era; not needed now that llama-server runs natively in WSL. |
 
-Data flow: `plan_fixtures/*.yaml` + `questions.yaml` → `prompts.py` → `server.py` +
+Data flow: crawled Postgres → `real_db.py` (+ `questions.yaml`) → `prompts.py` → `server.py` +
 `llamacpp_client.py` → `plan_scorers.py` / `scorers.py` / `convergence.py` →
 `results/runs_*.jsonl` → `report.py` (pulling in `convergence_report.mode_c_lines()`) →
 `results/report.md` + `results/review_queue.jsonl`.

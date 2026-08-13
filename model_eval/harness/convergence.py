@@ -91,62 +91,27 @@ requirement coverage) and `degenerate` are recorded on every attempt so this is 
 than silently inflating the headline. Read them together."""
 
 
-# --- locked slots -------------------------------------------------------------------------
+# --- confirmed slots (the repair variant's ratchet) -----------------------------------------
+#
+# STUDENT-AUTHORED LOCKS ARE GONE (2026-08-12). A locked slot used to be a `(semester, course)`
+# pair the STUDENT had fixed, hand-authored per program in `locked_slots/<slug>.yaml` and loaded
+# here. Those files were the last hand-authored data in the harness and they could not survive
+# the move to synthesized students — their keys were per-program scenario ids that no longer
+# exist — so they were deleted rather than left to pin nothing while reporting success.
+#
+# The TYPE stays, because it is also the repair variant's own state: `working_locked` is every
+# placement that has survived validation so far, re-shown to the model as "keep these" on the
+# next attempt (see `run_case`'s ratchet and `freeze_placements`). Mode C now runs for every
+# program, starting from an empty set, with nothing to author first.
 
 
 @dataclass(frozen=True)
 class LockedSlot:
-    """A (semester, course) pair the student fixed. Never revisable."""
+    """A (semester, course) pair that must not move: a placement the harness has already
+    confirmed. Not revisable by the model on a later attempt."""
 
     semester_index: int
     course: str
-
-
-@dataclass
-class LockedSlots:
-    path: Path
-    slots_hash: str
-    by_scenario: dict[str, list[LockedSlot]]
-
-    def for_scenario(self, scenario_id: str) -> list[LockedSlot]:
-        return self.by_scenario.get(scenario_id, [])
-
-
-def locked_slots_path_for(fixture) -> Path | None:
-    """The `<fixture-stem>.locked_slots.yaml` sibling for `fixture`, if one exists.
-
-    BY CONVENTION, not config — `config.yaml`'s `convergence.locked_slots` used to name a
-    single, fixed path, which only ever worked because exactly one fixture was ever active at a
-    time. Multi-school support (`run.py run`'s default loop, `--major`) makes the active fixture
-    change per school, so Mode C now looks next to WHICHEVER fixture is loaded rather than at a
-    path that only ever matched `cs_machine_intelligence.yaml`. Only `cs_machine_intelligence.
-    yaml` and `mechanical_engineering.yaml` have a matching file today; every other fixture
-    returns `None` here, and callers must treat that as "skip Mode C for this fixture," not an
-    error to route around.
-    """
-    candidate = fixture.path.with_name(fixture.path.stem + ".locked_slots.yaml")
-    return candidate if candidate.exists() else None
-
-
-def load_locked_slots(path: Path) -> LockedSlots:
-    import hashlib
-
-    raw = Path(path).read_bytes()
-    data = yaml.safe_load(raw.decode("utf-8")) or {}
-    by_scenario: dict[str, list[LockedSlot]] = {}
-    for scenario_id, rows in (data.get("scenarios") or {}).items():
-        by_scenario[scenario_id] = [
-            LockedSlot(
-                semester_index=int(row["semester_index"]),
-                course=plan_scorers.normalize_code(str(row["course"])),
-            )
-            for row in rows or []
-        ]
-    return LockedSlots(
-        path=Path(path),
-        slots_hash=hashlib.sha256(raw).hexdigest()[:16],
-        by_scenario=by_scenario,
-    )
 
 
 def apply_locked_slots(
@@ -196,74 +161,6 @@ def apply_locked_slots(
     while len(out) > horizon and not out[-1]:
         out.pop()
     return out, alterations
-
-
-def locked_slot_problems(
-    fixture: Fixture, scenario: Scenario, locked: list[LockedSlot]
-) -> list[str]:
-    """Is this locked set even satisfiable? Run before spending a single GPU-minute.
-
-    An unreachable lock ("CS 38100 in semester 1, with nothing behind it") makes convergence
-    impossible for reasons that have nothing to do with the model — every model would time out
-    and the benchmark would report a capability difference that is really a fixture bug. This
-    is the same guard `run.py check` applies to the scenarios themselves.
-    """
-    problems: list[str] = []
-    known = set(fixture.by_code)
-    horizon = scenario.profile.semesters_to_plan
-    terms = plan_scorers._terms(scenario.profile, horizon)
-    canonical = fixture.canonical
-    completed = {canonical.get(plan_scorers.normalize_code(c), c)
-                 for c in scenario.profile.completed_courses}
-
-    seen: dict[str, int] = {}
-    for slot in locked:
-        if slot.course not in known:
-            problems.append(f"{scenario.id}: locked course {slot.course} is not in the catalog")
-            continue
-        if not 0 <= slot.semester_index < horizon:
-            problems.append(
-                f"{scenario.id}: {slot.course} is locked to semester "
-                f"{slot.semester_index + 1}, outside the {horizon}-semester horizon"
-            )
-            continue
-        if slot.course in seen:
-            problems.append(f"{scenario.id}: {slot.course} is locked twice")
-        seen[slot.course] = slot.semester_index
-
-        if canonical.get(slot.course, slot.course) in completed:
-            problems.append(
-                f"{scenario.id}: {slot.course} is locked but the student already completed it"
-            )
-        course = fixture.by_code[slot.course]
-        term = terms[slot.semester_index][0]
-        if course.offered_terms and term not in course.offered_terms:
-            problems.append(
-                f"{scenario.id}: {slot.course} is locked to {term} but is offered only in "
-                f"{'/'.join(course.offered_terms)}"
-            )
-
-    # A locked course whose prerequisite is ALSO locked, later or in the same term, can never
-    # be satisfied no matter what the model does with the free slots.
-    for slot in locked:
-        course = fixture.by_code.get(slot.course)
-        if course is None:
-            continue
-        for prereq in course.prereqs:
-            code = plan_scorers.normalize_code(prereq)
-            if canonical.get(code, code) in completed:
-                continue
-            if code in seen and seen[code] >= slot.semester_index:
-                problems.append(
-                    f"{scenario.id}: {slot.course} (semester {slot.semester_index + 1}) needs "
-                    f"{code}, which is locked to semester {seen[code] + 1} — unsatisfiable"
-                )
-            elif slot.semester_index == 0 and code not in completed:
-                problems.append(
-                    f"{scenario.id}: {slot.course} is locked to the FIRST semester but needs "
-                    f"{code}, which the student has not completed — unsatisfiable"
-                )
-    return problems
 
 
 # --- the convergence criterion ---------------------------------------------------------------
@@ -961,7 +858,6 @@ def run_case(
     client: LlamaCppClient,
     model_cfg: dict,
     scenario: Scenario,
-    locked: list[LockedSlot],
     *,
     variant: str,
     conv_cfg: dict[str, Any],
@@ -1005,10 +901,10 @@ def run_case(
     started = time.monotonic()
     censored, censor_reason = True, "max_attempts"
     static_hash = ""
-    # REPAIR's state. `working_locked` is the student's pins plus every placement that has
-    # survived validation so far — it only grows. `missing` is what the model is asked to add
-    # next. For the other two variants these stay at their initial values and nothing ratchets.
-    working_locked = list(locked)
+    # REPAIR's state. `working_locked` is every placement that has survived validation so far
+    # — it starts empty and only grows. `missing` is what the model is asked to add next. For
+    # the other two variants these stay at their initial values and nothing ratchets.
+    working_locked: list[LockedSlot] = []
     missing: list[str] = []
     hints: list[str] = []
     repair_removed: list[str] = []
@@ -1062,7 +958,12 @@ def run_case(
             "temperature": temperature,
             "top_p": ctx.cfg["run"].get("top_p", 0.9),
             "seed": seed,
-            "max_tokens": ctx.cfg["run"]["max_plan_tokens"],
+            # Same per-model allowance Mode A/B/explain get — see
+            # `runner.sampling_options`. Without it a model whose template always opens an
+            # analysis channel spends its whole budget there and every attempt is scored as an
+            # unparseable plan, which in Mode C compounds across the retry loop.
+            "max_tokens": (ctx.cfg["run"]["max_plan_tokens"]
+                           + int(model_cfg.get("reasoning_overhead_tokens") or 0)),
         }
         # The per-request timeout never outlives the case's remaining clock: a 600 s request
         # inside a 600 s case would let one attempt consume the whole window and report
@@ -1305,8 +1206,6 @@ def run_case(
         "expect_unsatisfiable": scenario.expect_unsatisfiable,
         "static_hash": static_hash,
         "fixture_hash": fixture.fixture_hash,
-        "locked_slots": [{"semester_index": s.semester_index, "course": s.course}
-                         for s in locked],
         "converged": converged_at is not None,
         "attempts_to_converge": converged_at,
         "attempts_used": len(attempts),
@@ -1360,22 +1259,21 @@ def _median(values: list[float]) -> float | None:
 # --- preflight ---------------------------------------------------------------------------------
 
 
-def preflight(ctx, locked_slots: LockedSlots, conv_cfg: dict[str, Any]) -> list[str]:
+def preflight(ctx, conv_cfg: dict[str, Any]) -> list[str]:
     """Everything checkable before a GPU-minute is spent. Returns the problems found.
 
     The prerequisite-risk report is the important half. Mode C COMPOUNDS a bad prereq edge:
     the same wrong edge is re-hit on every attempt, so it does not cost a model one violation,
     it costs it the whole run and turns into a fabricated convergence difference.
+
+    It used to also validate the student's locked slots (reachable, not already completed, not
+    pinned behind their own prerequisite). Those are gone — see the `LockedSlot` note above —
+    so what is left is the reachability check: with no pins at all, a scenario the deterministic
+    planner cannot solve is still a scenario no model can, and Mode C would be measuring the
+    program's data rather than the model.
     """
     problems: list[str] = []
     for scenario in ctx.fixture.scenarios:
-        problems += locked_slot_problems(
-            ctx.fixture, scenario, locked_slots.for_scenario(scenario.id)
-        )
-        # Can the deterministic planner still solve it with the locks in place? It cannot be
-        # asked to honour them directly (it has no notion of a pin), so this is the weaker but
-        # still useful check: the scenario itself must be reachable, exactly as `run.py check`
-        # requires, or convergence is impossible for reasons unrelated to the model.
         if scenario.expect_unsatisfiable:
             continue
         plan = generate_plan(scenario.profile, ctx.fixture.catalog)
@@ -1385,7 +1283,7 @@ def preflight(ctx, locked_slots: LockedSlots, conv_cfg: dict[str, Any]) -> list[
         if not score.viable:
             problems.append(
                 f"{scenario.id}: the deterministic planner cannot produce a viable plan — "
-                f"convergence would be measuring a fixture bug, not a model."
+                f"convergence would be measuring the program's data, not a model."
             )
     return problems
 
@@ -1409,16 +1307,6 @@ def run_convergence(
     if not conv_cfg:
         raise SystemExit("config.yaml has no `convergence:` block.")
 
-    slots_path = locked_slots_path_for(ctx.fixture)
-    if slots_path is None:
-        raise SystemExit(
-            f"no locked-slots file for {ctx.fixture.path.name} — Mode C needs "
-            f"{ctx.fixture.path.with_suffix('').name}.locked_slots.yaml next to the fixture. "
-            f"Only fixtures with one support `converge`; see `run.py`'s multi-school loop, "
-            f"which skips this task automatically for fixtures that don't have it."
-        )
-    locked_slots = load_locked_slots(slots_path)
-
     selected = [
         m for m in ctx.cfg["models"]
         if (not models or m["name"] in models)
@@ -1438,7 +1326,7 @@ def run_convergence(
         raise SystemExit("No scenarios matched the filter.")
 
     print(prereq_risk_note(ctx.fixture, conv_cfg))
-    problems = preflight(ctx, locked_slots, conv_cfg)
+    problems = preflight(ctx, conv_cfg)
     if problems:
         print(f"\n❌ preflight found {len(problems)} problem(s) — no GPU time spent:")
         for problem in problems:
@@ -1470,7 +1358,7 @@ def run_convergence(
 
     out_path = ctx.results_dir / "runs_convergence.jsonl"
     with _run_lock(ctx.results_dir, "convergence"):
-        _write_meta(ctx, conv_cfg, locked_slots, selected, variant_list, cases)
+        _write_meta(ctx, conv_cfg, selected, variant_list, cases)
         mode = "a" if out_path.exists() else "w"
         total = len(selected) * len(variant_list) * len(cases)
         print(f"[converge] {len(selected)} model(s) x {len(variant_list)} variant(s) x "
@@ -1505,7 +1393,6 @@ def run_convergence(
                         for scenario in cases:
                             rec = run_case(
                                 ctx, client, model_cfg, scenario,
-                                locked_slots.for_scenario(scenario.id),
                                 variant=variant, conv_cfg=conv_cfg, out=out,
                             )
                             status = (f"converged @ attempt {rec['attempts_to_converge']}"
@@ -1521,7 +1408,7 @@ def run_convergence(
     return out_path
 
 
-def _write_meta(ctx, conv_cfg, locked_slots: LockedSlots, selected, variants, cases) -> None:
+def _write_meta(ctx, conv_cfg, selected, variants, cases) -> None:
     meta = {
         "tag": "convergence",
         "mode": "D",
@@ -1545,19 +1432,9 @@ def _write_meta(ctx, conv_cfg, locked_slots: LockedSlots, selected, variants, ca
             s.id: {"path": (db := ctx.database_for(s)).path.name, "hash": db.db_hash}
             for s in cases
         },
-        # Locked slots are prompt input, not scoring authority — recorded here (and per record)
-        # rather than folded into fixture_hash, so adding them cannot invalidate a Mode A/B row.
-        "locked_slots": {
-            "path": locked_slots.path.name,
-            "hash": locked_slots.slots_hash,
-            "scenarios": {k: [{"semester_index": s.semester_index, "course": s.course}
-                              for s in v]
-                          for k, v in locked_slots.by_scenario.items()},
-        },
         "static_hashes": {
             "plan_mode_c_by_scenario": {
-                s.id: ctx.prompts_for(s).plan_convergence(
-                    s, locked_slots.for_scenario(s.id))[2]
+                s.id: ctx.prompts_for(s).plan_convergence(s, [])[2]
                 for s in cases
             },
         },

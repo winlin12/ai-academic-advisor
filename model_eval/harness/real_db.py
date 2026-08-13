@@ -59,14 +59,16 @@ WHAT ELSE DOES NOT SURVIVE THE TRIP:
 
   * Requirement groups that carry no course options AND no children — a credit target or a
     type like "university"/"core"/"world_language" stated in prose instead of as a course list
-    — have no rows to put in `requirement_groups`/`requirement_options`. In the real catalog
-    these are the MAJORITY (see `app/services/planner_db.py`'s `UnresolvedRequirement`
-    docstring: 749 of 928 crawled programs have at least one). `unresolved_groups()` below
-    reads them into their own table, `unresolved_requirement_groups` — MODEL-VISIBLE, same as
-    every other table `catalog_export.TABLES` names, so University Core, Civics Literacy, World
-    Language, and College of Science's own requirements are things Mode B is actually shown,
-    not silently dropped. It just has nothing to plan FROM them: no course list means nothing
-    to schedule, which is why the prompt tells the model not to invent one.
+    — have no rows to put in `requirement_groups`/`requirement_options`, and this loader now
+    DROPS them entirely. In the real catalog they are the MAJORITY (see
+    `app/services/planner_db.py`'s `UnresolvedRequirement` docstring: 749 of 928 crawled
+    programs have at least one). They used to be read into a model-visible
+    `unresolved_requirement_groups` table; that table came out 2026-08-12 (see
+    `catalog_export.TABLES` for why) because showing a model a requirement and then telling it
+    there is nothing to do about it was costing attention and buying nothing scorable. The one
+    prose requirement that DOES get shown is shown as coursework instead: University Core is
+    resolved into the synthesized per-competency `ucc-*` groups below, off each course's own
+    UCC attributes. Everything else waits for a representation that can be planned against.
 
   * `courses.attributes` is empty unless `attributes_raw` happens to hold a JSON tag list —
     true only for the handful of courses a prior eval fixture seeded; real crawled courses
@@ -100,13 +102,13 @@ import psycopg
 from psycopg.rows import dict_row
 
 from .catalog_export import TABLES, CatalogDatabase, chain_depths, render_context
-from .fixtures import Fixture
+from .fixtures import Fixture, synthesize_scenarios
 # `normalize_code` only — so a hand-written `manual_course_aliases` key is matched against the
 # crawl the same way a model's own course code is ("ma16500", "MA-16500" -> "MA 16500"), rather
 # than silently never matching over a spacing difference. plan_scorers imports fixtures/planner
 # and never real_db, so this direction adds no cycle.
 from .plan_scorers import normalize_code
-from .planner import Course
+from .planner import ALL_TERMS, Course
 
 logger = logging.getLogger(__name__)
 
@@ -116,15 +118,8 @@ logger = logging.getLogger(__name__)
 _SELECTIVE_TYPES = {"choose_credits", "choose", "selective", "elective", "free_elective"}
 _DEFAULT_OPTION_CREDITS = 3.0
 
-# Requirement types the crawler uses that are pure prose — never a menu, never worth reporting
-# as an unresolved requirement (they carry no credits and nothing to satisfy).
-_PROSE_TYPES = {
-    "overview", "disclaimer", "gpa", "policy", "learning_outcomes", "prerequisite_info",
-    "critical_course", "licensure", "plan_of_study",
-}
 _UNIVERSITY_REQUIREMENT_TYPES = {"university", "core", "world_language"}
 _COLLEGE_REQUIREMENT_TYPES = {"college"}
-_CREDITLESS_REQUIREMENT_TYPES = _UNIVERSITY_REQUIREMENT_TYPES | _COLLEGE_REQUIREMENT_TYPES
 
 # Purdue's "First-Year Engineering" program is the College of Engineering-wide gate every
 # engineering major clears before/while declaring — see `is_college_of_engineering` and
@@ -213,26 +208,21 @@ def _scope_for(requirement_type: str) -> str:
     return "program"
 
 
-# A fixture's `program.requirement_scope` ("major"/"college"/"university") -> `_scope_for`'s own
-# vocabulary ("program"/"college"/"university"), for `fetch_real_db_base`'s `scope_filter`. Two
-# names on purpose: the fixture author writes what a student would call it ("major"), `_scope_for`
-# classifies `requirement_groups.requirement_type` against the crawl's own "program" tier.
-# Shared between `harness.runner.load_context` and `run.py check` so both stay in sync.
+# SCOPE TIERS, for `fetch_real_db_base`'s `scope_filter`. A degree is nested — a major student
+# owes the major AND the college core AND the university core — so "program" alone is never the
+# right answer for a real major, and `scope_filter=None` (every tier, the default everywhere in
+# the harness today) is. Kept as a named capability for a caller that deliberately wants one
+# tier: `run.py`'s old per-fixture `requirement_scope` setting is gone with the fixture files,
+# and every real-major fixture set it to "major", i.e. exactly this default.
 #
-# CUMULATIVE, NOT EXCLUSIVE, as of 2026-08-11 — and this is the fix for "university, school and
-# world-language requirements never resolve". It used to map each fixture scope to exactly ONE
-# `_scope_for` tier and drop every group not in it, so `requirement_scope: major` (which every
-# real-major fixture uses) discarded all 12 of CS's college/university groups. The effect was
-# not that those requirements scored badly — they were not shown to the model or scored at all,
-# while the course MENUS that satisfy them survived, because those menus carry
+# It used to map each fixture scope to exactly ONE `_scope_for` tier and drop every group not in
+# it, so `requirement_scope: major` discarded all 12 of CS's college/university groups. The
+# effect was not that those requirements scored badly — they were not shown to the model or
+# scored at all, while the course MENUS that satisfy them survived, because those menus carry
 # `requirement_type = NULL` and `_scope_for` calls anything untyped "program". The model was
 # handed 619 culture courses and 103 history courses and never told it owed a world language or
 # a University Core.
-#
-# A degree is nested: a major student owes the major AND the college core AND the university
-# core. So "major" now means every tier, "college" means college + university, and "university"
-# means university alone — each scope is what a student at that level actually has to complete.
-REQUIREMENT_SCOPE_ALIASES = {
+SCOPE_TIERS = {
     "major": frozenset({"program", "college", "university"}),
     "college": frozenset({"college", "university"}),
     "university": frozenset({"university"}),
@@ -354,6 +344,179 @@ def _is_selective(requirement_type: str, credits_min: float | None,
     return bool(credits_min) and sum(option_credits) > float(credits_min) + 0.01
 
 
+# --- prerequisites ------------------------------------------------------------------------------
+#
+# TWO SOURCES, TRIED IN THAT ORDER, because the same fact lives in two shapes depending on how a
+# box was populated:
+#
+#   advisor.course_prerequisites   the pre-parsed table (migration 003), already AND-of-ORs.
+#                                  Absent on a box that never ran those migrations — this file
+#                                  swallows `UndefinedTable` rather than failing, which is how
+#                                  it can be missing and stay quiet.
+#   prerequisite_rules             `catalog_ingestion`'s own table, written by
+#                                  `ingest.courses.upsert_prerequisite_rule` from whatever text
+#                                  reached it. Holds an AND/OR TREE in `parsed_json`, which
+#                                  `_groups_from_tree` flattens to the same AND-of-ORs shape.
+#
+# WHY THIS MATTERS MORE THAN IT LOOKS. When neither has rows, every course exports with no
+# `prereq_groups` — and "no prerequisites" is not an error anywhere downstream, it is a legal,
+# quiet state. The whole harness then runs with prerequisite ordering unconstrained: the models
+# are never told the order, `prereq_violation` can never fire, and Mode C's repair loop has
+# nothing to repair. Measured 2026-08-12 on this box: 0 edges across every program. The prompt
+# still says PREREQUISITES COME FIRST, so a run in that state measures models against a rule
+# whose data is missing. `run.py check` prints the edge count for exactly this reason.
+_PREREQ_CODE_RE = re.compile(r"\b([A-Z]{2,6})\s+(\d{3,5}[A-Z]?)\b")
+
+
+# =================================================================================================
+# HARDCODED PREREQUISITES — TEMPORARY. PLANNED FOR REPLACEMENT.
+# =================================================================================================
+#
+# THIS TABLE IS HAND-TYPED, NOT CRAWLED, and it exists because there is currently no automated
+# way to get prerequisites into this database at all:
+#
+#   * Acalog (catalog.purdue.edu) publishes title, credits and description per course. No
+#     prerequisites. Verified 2026-08-12 against CS 18200's own course page.
+#   * PurdueIO (api.purdue.io) has no prerequisite field on the Course entity at all.
+#   * Banner self-service publishes them, per course, at
+#     `bwckctlg.p_disp_course_detail?cat_term_in=...&subj_code_in=CS&crse_numb_in=18200` — and
+#     that host's robots.txt is `User-agent: * / Disallow: /`.
+#
+# So this fills the gap for the ONE THING that cannot be measured without it: prerequisite
+# ordering is the largest Mode B failure class in every sweep recorded here, PREREQUISITES COME
+# FIRST is the top rule in the prompt, and with an empty prerequisite table `prereq_violation`
+# can never fire — the harness would be asking models to obey a rule it cannot score.
+#
+# WHAT REPLACES IT. Any of: a data extract from the Office of the Registrar (Banner stores these
+# as structured rules, not prose — the ask is a report, not a scrape); permission to fetch the
+# Banner pages directly, which `catalog-ingest import-prerequisites` already parses; or a
+# published Purdue API that carries them. Whichever lands, it writes `prerequisite_rules` and
+# `_prereq_rows` picks it up automatically — this table is a FALLBACK, consulted only for a
+# course the database has nothing for, so real data always wins and nothing here needs deleting
+# on the day it arrives.
+#
+# SCOPE: the required-course cores of the 16 curated sweep programs (config.yaml `sweep.curated`)
+# — 257 distinct required courses, of which the ones below are the ones that actually chain.
+#
+# RULES FOR EDITING THIS TABLE, and they matter more than the table:
+#
+#   1. NEVER GUESS. An invented edge is worse than a missing one: a missing edge under-charges
+#      every model equally, while a wrong edge charges a model for a schedule the registrar
+#      would have accepted, and Mode C re-hits it on every attempt (see `prereq_risk_note`).
+#      Everything outside the STEM cores below — NUR, CM, EDCI, COM, POL, AGEC, SOC, EDPS — is
+#      deliberately ABSENT rather than approximated. Those programs' plans are currently scored
+#      without prerequisite constraints, which is the honest state, not a silent one.
+#   2. Verify against the course's own Banner page before adding a row, and put the date in the
+#      comment for that subject block.
+#   3. AND-of-ORs, same shape as `courses.prereq_groups`: [["CS 25000"], ["CS 25100", "CS
+#      25300"]] is CS 25000 AND (CS 25100 OR CS 25300).
+#
+# Sourced from Purdue's published course descriptions and the department-published prerequisite
+# charts (e.g. cs.purdue.edu's own prereq chart) as of 2026-08-12.
+_HARDCODED_PREREQS: dict[str, list[list[str]]] = {
+    # --- Computer Science. The 18000->18200/24000->25000/25100->25200 spine is the whole
+    # reason Mode B's prerequisite rule exists; every CS scenario runs through it.
+    "CS 18200": [["CS 18000"], ["MA 16100", "MA 16500", "MA 16200", "MA 16600"]],
+    "CS 24000": [["CS 18000"]],
+    "CS 25000": [["CS 18200"], ["CS 24000"]],
+    "CS 25100": [["CS 18200"], ["CS 24000"]],
+    "CS 25200": [["CS 25000"], ["CS 25100"]],
+    "CS 37300": [["CS 25100"]],
+    "CS 38100": [["CS 25100"]],
+    "CS 47100": [["CS 25100"]],
+    # --- Mathematics. The calculus sequence, both the MA 161/162 and the MA 165/166 tracks,
+    # which are alternates of each other rather than a sequence.
+    "MA 16200": [["MA 16100"]],
+    "MA 16600": [["MA 16500"]],
+    "MA 16020": [["MA 16010"]],
+    "MA 26100": [["MA 16200", "MA 16600"]],
+    "MA 26500": [["MA 16200", "MA 16600"]],
+    "MA 26600": [["MA 26100"]],
+    "MA 41600": [["MA 26100"]],
+    # --- Statistics.
+    "STAT 35000": [["MA 16200", "MA 16600"]],
+    # --- Physics. PHYS 172/272 is the engineering/science sequence.
+    "PHYS 27200": [["PHYS 17200"], ["MA 16200", "MA 16600"]],
+    "PHYS 22100": [["PHYS 22000"]],
+    "PHYS 24100": [["PHYS 17200"]],
+    # --- Chemistry. The 255/256 organic sequence and its labs; the labs are corequisites of
+    # their lectures, which this table cannot express (see `_HARDCODED_COREQS`).
+    "CHM 11200": [["CHM 11100"]],
+    "CHM 11620": [["CHM 11610"]],
+    "CHM 25600": [["CHM 25500"]],
+    "CHM 33900": [["CHM 25600"]],
+    # --- Biology.
+    "BIOL 11100": [["BIOL 11000"]],
+    "BIOL 24200": [["BIOL 24100"]],
+    # --- Electrical & Computer Engineering. ECE 20001/20002 with their paired labs.
+    "ECE 20002": [["ECE 20001"]],
+    "ECE 20008": [["ECE 20007"]],
+    # --- Mechanical Engineering. Statics before mechanics of materials and dynamics.
+    "ME 27400": [["ME 27000"]],
+    "ME 32300": [["ME 27000"]],
+}
+
+# COREQUISITES — satisfied by the same semester OR earlier, unlike a prerequisite. Same
+# provenance, same rules, same fate as `_HARDCODED_PREREQS` above. The lab-with-lecture pairs
+# are the whole content: scoring a lab as needing its lecture STRICTLY earlier would charge
+# every model for the schedule the catalog itself prescribes.
+_HARDCODED_COREQS: dict[str, list[str]] = {
+    "CHM 25501": ["CHM 25500"],
+    "CHM 25601": ["CHM 25600"],
+    "CHM 33901": ["CHM 33900"],
+    "ECE 20007": ["ECE 20001"],
+    "ME 30801": ["ME 30800"],
+    "ME 32301": ["ME 32300"],
+}
+
+
+def _groups_from_tree(node: Any) -> list[list[str]]:
+    """An AND/OR prerequisite tree (`prerequisite_rules.parsed_json`) as AND-of-ORs.
+
+    `[["CS 25000"], ["CS 25100", "CS 25300"]]` means CS 25000 AND (CS 25100 OR CS 25300) — the
+    shape every consumer in this harness already speaks. A nested AND inside an OR cannot be
+    expressed in it and is flattened to the OR of every course underneath, which is the SAFE
+    direction: it can only ever accept a schedule the strict reading would reject, never charge
+    a model for a violation the catalog does not state.
+    """
+    if not isinstance(node, dict):
+        return []
+    kind = node.get("type")
+    if kind == "COURSE":
+        code = str(node.get("course") or "").upper().strip()
+        return [[code]] if code else []
+    if kind == "AND":
+        out: list[list[str]] = []
+        for child in node.get("children") or []:
+            out += _groups_from_tree(child)
+        return out
+    if kind == "OR":
+        options: list[str] = []
+        for child in node.get("children") or []:
+            for group in _groups_from_tree(child):
+                options += group
+        # Deduplicated, order preserved — the same course can appear twice under a hand-written
+        # "A or (A with a lab)" and an option list that repeats itself reads as a parser bug.
+        seen: set[str] = set()
+        deduped = [c for c in options if not (c in seen or seen.add(c))]
+        return [deduped] if deduped else []
+    return []
+
+
+def _codes_in(text: str | None) -> list[str]:
+    """Course codes named in a free-text field (`courses.corequisites_raw`), deduplicated."""
+    if not text:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for subject, number in _PREREQ_CODE_RE.findall(text.upper()):
+        code = f"{subject} {number}"
+        if code not in seen:
+            seen.add(code)
+            out.append(code)
+    return out
+
+
 def find_program_id(cur: psycopg.Cursor, name_ilike: str) -> list[dict[str, Any]]:
     """Programs whose name matches `name_ilike` (a SQL ILIKE pattern) — for picking a
     `program_id` by hand. Returns id/name/catalog_year/requirement group count so a caller can
@@ -414,70 +577,6 @@ def resolve_major_interactive(pg_url: str, search_text: str, *, limit: int = 10)
     return chosen["id"]
 
 
-def unresolved_groups(cur: psycopg.Cursor, program_id: str) -> list[dict[str, Any]]:
-    """Requirement groups this loader had to drop: no options, no children, and either a
-    stated credit minimum or a type that is a requirement even without one. Mirrors
-    `app/services/planner_db._fetch_unresolved` (kept standalone — see module docstring).
-
-    Shaped to the same four columns `plan_context.py` renders (name/scope/credits_min/raw_text)
-    rather than the raw `requirement_type` — this table is now MODEL-VISIBLE (see
-    `fetch_real_db_base`), and the vocabulary substitution matters here for the same reason it
-    does for `requirement_groups`: the model is told what `scope` means, nothing about the
-    crawler's own `requirement_type` strings.
-    """
-    cur.execute(
-        """
-        SELECT rg.name, rg.requirement_type, rg.credits_min, rg.raw_text
-        FROM requirement_groups rg
-        WHERE rg.program_id = %s
-          AND COALESCE(rg.requirement_type, '') <> ALL(%s)
-          AND NOT EXISTS (SELECT 1 FROM requirement_options ro
-                          WHERE ro.requirement_group_id = rg.id)
-          AND NOT EXISTS (SELECT 1 FROM requirement_groups child
-                          WHERE child.parent_group_id = rg.id)
-          AND (rg.credits_min IS NOT NULL
-               OR COALESCE(rg.requirement_type, '') = ANY(%s))
-        ORDER BY rg.display_order ASC
-        """,
-        (program_id, sorted(_PROSE_TYPES), sorted(_CREDITLESS_REQUIREMENT_TYPES)),
-    )
-    return [
-        {
-            "name": row["name"],
-            "scope": _scope_for(row["requirement_type"] or ""),
-            "credits_min": row["credits_min"],
-            "raw_text": row["raw_text"],
-        }
-        for row in cur.fetchall()
-    ]
-
-
-_UCC_CATEGORY_RE = re.compile(r"^.+\(UCC: [A-Z]+\)$")
-
-
-def _clean_ucc_row(row: dict[str, Any]) -> dict[str, Any]:
-    """"University Core Requirements"'s crawled `raw_text` is one prose blob — a "visit the
-    University Senate Website" filler line (broken across two lines by a crawled hyperlink)
-    followed by the actual 10 category names. Rebuilt here into the category names alone,
-    each on its own line, with the filler dropped — the same content, readably listed instead
-    of a wall of prose a model (or a human reading the export) has to parse for it, and
-    without spending tokens on a link nothing in this export can follow anyway.
-    """
-    lines = [ln.strip() for ln in (row.get("raw_text") or "").splitlines() if ln.strip()]
-    categories = [ln for ln in lines if _UCC_CATEGORY_RE.match(ln)]
-    if not categories:
-        return row
-    cleaned = dict(row)
-    cleaned["raw_text"] = (
-        "University Core Requirements — every student, every major, must complete ONE "
-        "course satisfying EACH of the following categories (these are university-wide, not "
-        "part of this program's own `requirement_groups`, and there is no course list here to "
-        "schedule against — never invent a course code for one):\n"
-        + "\n".join(f"  - {c}" for c in categories)
-    )
-    return cleaned
-
-
 def _course_number(code: str) -> int:
     match = _COURSE_NUMBER_RE.search(code)
     return int(match.group(1)) if match else 0
@@ -528,7 +627,6 @@ class RealDatabaseBase:
     broaden_subjects: tuple[str, ...]
     course_aliases_rows: list[dict[str, Any]]
     program_notes_rows: list[dict[str, Any]]
-    unresolved_rows: list[dict[str, Any]]
     courses_by_code: dict[str, dict[str, Any]]
     prereq_by_code: dict[str, dict[str, Any]]
     # See `is_college_of_engineering`/`_fye_course_codes` — False/empty for every other program,
@@ -702,7 +800,7 @@ def fetch_real_db_base(
         # group already did, so no downstream code needed to change. `scope_filter=None` (the
         # default) is a no-op: every existing caller's behaviour is untouched byte-for-byte.
         if scope_filter is not None:
-            # A SET OF TIERS, not one tier — see `REQUIREMENT_SCOPE_ALIASES`. A bare string is
+            # A SET OF TIERS, not one tier — see `SCOPE_TIERS`. A bare string is
             # still accepted (and still means exactly that one tier) so any caller passing
             # `_scope_for`'s own vocabulary directly keeps working unchanged.
             allowed = ({scope_filter} if isinstance(scope_filter, str) else frozenset(scope_filter))
@@ -750,7 +848,7 @@ def fetch_real_db_base(
             raise LookupError(
                 f"program {program_id!r} ({program['name']!r}) has zero requirement_options "
                 f"rows — every requirement group is either childless prose or a container. "
-                f"There is nothing for Mode B to plan from. See unresolved_groups()."
+                f"There is nothing for Mode B to plan from."
             )
 
         # STALE REQUIREMENT OPTIONS ARE DROPPED, NOT RAISED — see the module docstring's
@@ -1077,11 +1175,67 @@ def fetch_real_db_base(
                 return {}
             return {row["course_code"]: row for row in cur.fetchall()}
 
-        prereq_by_code = _advisor_rows(
-            codes,
-            "SELECT course_code, raw_text, prereq_groups, coreq_codes, confidence "
-            "FROM advisor.course_prerequisites WHERE course_code = ANY(%s)",
-        )
+        def _prereq_rows(fetch_codes: set[str]) -> dict[str, dict[str, Any]]:
+            """Prerequisites for `fetch_codes`, from whichever source this database has. See
+            the `_groups_from_tree` section above for the two shapes and why it matters."""
+            if not fetch_codes:
+                return {}
+            rows = _advisor_rows(
+                fetch_codes,
+                "SELECT course_code, raw_text, prereq_groups, coreq_codes, confidence "
+                "FROM advisor.course_prerequisites WHERE course_code = ANY(%s)",
+            )
+            if rows:
+                return rows
+            cur.execute(
+                """
+                SELECT DISTINCT ON (c.course_code)
+                       c.course_code, c.corequisites_raw,
+                       pr.raw_text, pr.parsed_json, pr.parse_confidence
+                FROM courses c
+                JOIN prerequisite_rules pr ON pr.course_id = c.id
+                WHERE c.course_code = ANY(%s) AND pr.parsed_json IS NOT NULL
+                ORDER BY c.course_code, pr.parse_confidence
+                """,
+                (sorted(fetch_codes),),
+            )
+            out: dict[str, dict[str, Any]] = {}
+            for row in cur.fetchall():
+                groups = _groups_from_tree(row["parsed_json"])
+                if not groups:
+                    continue
+                out[row["course_code"]] = {
+                    "course_code": row["course_code"],
+                    "raw_text": row["raw_text"],
+                    "prereq_groups": groups,
+                    "coreq_codes": _codes_in(row["corequisites_raw"]),
+                    "confidence": row["parse_confidence"] or "medium",
+                }
+
+            # LAST, AND ONLY FOR A COURSE NOTHING ABOVE ANSWERED — see `_HARDCODED_PREREQS`.
+            # Real data always wins: the day an extract or an authorised fetch lands in
+            # `prerequisite_rules`, that course stops reading this table with no code change
+            # and no row to delete here.
+            for code in sorted(fetch_codes):
+                if code in out:
+                    continue
+                groups = _HARDCODED_PREREQS.get(code)
+                coreqs = _HARDCODED_COREQS.get(code)
+                if not groups and not coreqs:
+                    continue
+                out[code] = {
+                    "course_code": code,
+                    "raw_text": "hand-entered (see real_db._HARDCODED_PREREQS)",
+                    "prereq_groups": groups or [],
+                    "coreq_codes": list(coreqs or []),
+                    # NOT "high", whatever the source. `confidence` is printed next to every
+                    # prerequisite in the export the model reads, and a hand-typed edge has not
+                    # been read off the registrar's own page the way a crawled one has.
+                    "confidence": "medium",
+                }
+            return out
+
+        prereq_by_code = _prereq_rows(codes)
 
         # CLOSE OVER PREREQUISITE/COREQUISITE REFERENCES across the WHOLE maximal universe —
         # see the module docstring. Bounded to 4 rounds — real prerequisite chains are shallow,
@@ -1114,11 +1268,7 @@ def fetch_real_db_base(
                 break
             courses_by_code.update(found)
             codes |= set(found)
-            prereq_by_code.update(_advisor_rows(
-                set(found),
-                "SELECT course_code, raw_text, prereq_groups, coreq_codes, confidence "
-                "FROM advisor.course_prerequisites WHERE course_code = ANY(%s)",
-            ))
+            prereq_by_code.update(_prereq_rows(set(found)))
 
         # Offering-term data (`advisor.course_planner_terms`) is deliberately NOT fetched here
         # — see `catalog_export.py`'s module docstring: Purdue's own published pattern is not
@@ -1135,20 +1285,6 @@ def fetch_real_db_base(
         program_notes_rows = [
             {"program_id": program_id, "note_type": row["note_type"], "note_text": row["note_text"]}
             for row in cur.fetchall()
-        ]
-
-        # TRIMMED TO "University Core Requirements" ONLY, as of 2026-08-06 — the other 7
-        # unresolved (prose-only, no course list) groups this program crawls (Civics Literacy,
-        # Upper Level Requirement, Electives, Other Departmental/Program Course Requirements,
-        # Computing (3-4 credits), College of Science Core Requirements, World Language
-        # Courses) add real prompt weight for content the model is explicitly told it can do
-        # nothing with ("never invent a course code to satisfy one"). University Core is kept
-        # as the one representative FYI that gen-ed exists at the university level, not just
-        # this program's own `requirement_groups`.
-        _UNRESOLVED_KEPT = {"University Core Requirements"}
-        unresolved_rows = [
-            _clean_ucc_row(row) if row["name"] == "University Core Requirements" else row
-            for row in unresolved_groups(cur, program_id) if row["name"] in _UNRESOLVED_KEPT
         ]
 
     # SUBTREE MERGES. `_is_elective`'s heuristics correctly flag every individual leaf below
@@ -1391,14 +1527,10 @@ def fetch_real_db_base(
         (r.get("name") or "") == "University Core Requirements" for r in tree_rows
     )
     if has_core_group and ucc_by_code:
-        # NO LONGER "UNRESOLVED", because it just got resolved. Leaving the prose row in place
-        # would have the export contradict itself: `unresolved_requirement_groups` tells the
-        # model "nothing to schedule here, never invent a code to satisfy one" about the very
-        # requirement the nine groups below make schedulable. It also stops paying prompt weight
-        # for a duplicate. (Civics Literacy is not in `_UNRESOLVED_KEPT` and so was already
-        # dropped — it is an advising hold, not coursework, and there is nothing to plan for it.)
-        unresolved_rows = [r for r in unresolved_rows
-                           if r.get("name") != "University Core Requirements"]
+        # These nine groups ARE the University Core in the export now — the prose row that used
+        # to announce it (and tell the model there was nothing to schedule for it) is gone with
+        # the rest of `unresolved_requirement_groups`, so what the model sees for gen-ed is a
+        # real menu of real course codes and nothing else.
         universe = set(courses_by_code)
         for order, (tag, label) in enumerate(UCC_COMPETENCIES.items()):
             tagged = sorted(c for c in universe if tag in ucc_by_code.get(c, ()))
@@ -1422,76 +1554,9 @@ def fetch_real_db_base(
         always_groups=always_groups, elective_groups=elective_groups,
         broadened_codes=broadened_codes, broaden_subjects=broaden_subjects,
         course_aliases_rows=course_aliases_rows, program_notes_rows=program_notes_rows,
-        unresolved_rows=unresolved_rows, courses_by_code=courses_by_code,
+        courses_by_code=courses_by_code,
         prereq_by_code=prereq_by_code,
         college_of_engineering=college_of_engineering, fye_course_codes=fye_codes,
-    )
-
-
-def real_db_base_from_fixture(fixture: Fixture) -> RealDatabaseBase:
-    """A `RealDatabaseBase` built entirely from a hand-authored YAML fixture — NO Postgres round
-    trip. For a `program.source: fixture` pseudo-major (the school-core/gen-ed+world-language
-    test cases): those fixtures' own `courses`/`requirement_groups` ARE the whole database
-    already, small and hand-curated on purpose (the same status the existing 16 majors' own
-    gen-ed groups already have today — see `plan_fixtures/*.yaml`'s own provenance headers),
-    so there is nothing further to fetch or broaden.
-
-    Feeds `build_scenario_database` exactly like a live-fetched base would — every existing
-    per-scenario narrowing/budget/world-language/caching path in that function is reused
-    unchanged. The budget-fit loop inside it still measures tokens with the FULL
-    `render_context`, not `render_context_lean` (the renderer these fixtures actually get
-    rendered with — see `prompts.PromptBuilder`); harmless here since these fixtures are far
-    under the token budget regardless of which renderer counts them, so the loop never trims
-    anything either way — it would need a pluggable renderer to be exact for a fixture large
-    enough to hit the budget, which none of these are.
-    """
-    always_groups: list[GroupMeta] = []
-    elective_groups: list[GroupMeta] = []
-    for order, group in enumerate(fixture.requirement_groups):
-        codes = list(group.get("courses") or [])
-        option_credits = {
-            code: (fixture.credits(code) or _DEFAULT_OPTION_CREDITS) for code in codes
-        }
-        is_elective = group.get("kind") == "choose"
-        credits_min = group.get("choose_credits")
-        if is_elective and credits_min is None:
-            # Same default `select_remaining_courses` (fixtures.py) uses: no explicit target
-            # means "at least the cheapest option" — never an unsatisfiable menu.
-            credits_min = min(option_credits.values()) if option_credits else None
-        gm = GroupMeta(
-            group_id=group["id"], name=group.get("name", group["id"]),
-            requirement_type=("choose_credits" if is_elective else "all_of"),
-            credits_min=credits_min, display_order=order,
-            option_codes=codes, option_credits=option_credits, language_subject=None,
-        )
-        (elective_groups if is_elective else always_groups).append(gm)
-
-    courses_by_code = {
-        # `ucc_tags` empty: a `source: fixture` pseudo-major has no crawled option text to parse
-        # competencies out of, and inventing them would be fabricating a catalog claim.
-        c.code: {"title": c.title, "credit_hours_min": c.credits, "attributes_raw": None,
-                 "ucc_tags": []}
-        for c in fixture.catalog
-    }
-    prereq_by_code = {
-        c.code: {
-            "prereq_groups": [[p] for p in c.prereqs], "coreq_codes": list(c.coreqs),
-            "confidence": "high",
-        }
-        for c in fixture.catalog if c.prereqs or c.coreqs
-    }
-    program_row = {
-        "id": fixture.slug, "name": fixture.name,
-        "catalog_year": "N/A", "start_year": 0, "end_year": 0, "is_archived": False,
-        "degree_type": "", "program_type": "", "campus": "", "total_credits_min": None,
-    }
-    return RealDatabaseBase(
-        program_id=fixture.slug, program_row=program_row,
-        always_groups=always_groups, elective_groups=elective_groups,
-        broadened_codes=[], broaden_subjects=(),
-        course_aliases_rows=[], program_notes_rows=[], unresolved_rows=[],
-        courses_by_code=courses_by_code, prereq_by_code=prereq_by_code,
-        college_of_engineering=False, fye_course_codes=frozenset(),
     )
 
 
@@ -1717,7 +1782,6 @@ def _partial_database(
         }],
         "requirement_groups": requirement_groups_rows,
         "requirement_options": requirement_options_rows,
-        "unresolved_requirement_groups": base.unresolved_rows,
         # BOTH sides must survive the trim — an alias whose PRIMARY course got left out (e.g.
         # it was only a candidate in an elective menu that lost the budget cut) is a dangling
         # `alias_of` reference, the same class of integrity bug a broadened course's own
@@ -1996,7 +2060,6 @@ def merge_real_db_bases(
     prereqs = dict(primary.prereq_by_code)
     aliases = list(primary.course_aliases_rows)
     notes = list(primary.program_notes_rows)
-    unresolved = list(primary.unresolved_rows)
 
     seen_aliases = {(r["course_code"], r["alias_of"]) for r in aliases}
     # THE UNIVERSITY CORE IS THE UNIVERSITY'S, NOT EACH PROGRAM'S. Every program this loader
@@ -2054,12 +2117,10 @@ def merge_real_db_bases(
             if key not in seen_aliases:
                 seen_aliases.add(key)
                 aliases.append(row)
-        unresolved += [dict(r, name=f"{prefix}: {r['name']}") for r in base.unresolved_rows]
 
     return replace(
         primary, always_groups=always, elective_groups=elective, courses_by_code=courses,
         prereq_by_code=prereqs, course_aliases_rows=aliases, program_notes_rows=notes,
-        unresolved_rows=unresolved,
     )
 
 
@@ -2091,10 +2152,15 @@ def load_real_db(
     )
 
 
-def fixture_from_database(database: CatalogDatabase) -> Fixture:
-    """A `Fixture` built from a live `CatalogDatabase` instead of a hand-authored YAML file —
-    so Mode C (`convergence.py`) can score against the same real program it shows the model,
-    the way Mode B already does via `real_scoring.score_against_real_db`.
+def fixture_from_database(database: CatalogDatabase, *, slug: str = "") -> Fixture:
+    """A `Fixture` built from a live `CatalogDatabase` — THE ONLY WAY ONE IS BUILT as of
+    2026-08-12, when `plan_fixtures/*.yaml` was deleted (see `fixtures.py`'s module docstring).
+    Courses and requirement groups come off the same database the model is shown; the students
+    come from `fixtures.synthesize_scenarios`, derived from this program's own required courses.
+
+    It started narrower — Mode C (`convergence.py`) scoring against the real program instead of
+    a hand-authored file, the way Mode B already did via `real_scoring.score_against_real_db` —
+    and the rest of the harness has since moved onto the same path.
 
     WHY A FIXTURE OBJECT, NOT A `RealScore`-NATIVE REWRITE. Every helper in `convergence.py`
     (`legal_slots`, `auto_repair`, `unmet_candidates`, `placement_hints`, `release_blockers`,
@@ -2120,9 +2186,16 @@ def fixture_from_database(database: CatalogDatabase) -> Fixture:
     stops being true would need `plan_scorers`/`Course` to understand AND-of-OR directly; out
     of scope here.
 
-    `offered_terms` is always empty — there is no term-offering data in this export at all as
-    of 2026-08-06 (see `catalog_export.py`'s module docstring), which `Course`'s own consumers
-    already treat as "no restriction" rather than "unknown".
+    `offered_terms` is EVERY term, not empty. There is no term-offering data in this export at
+    all as of 2026-08-06 (see `catalog_export.py`'s module docstring) and the prompt tells the
+    model so in as many words — "place courses by prerequisite order only; do not assume or
+    invent a term restriction for any course". The deterministic planner does not read a field
+    defensively the way the scorers do: `planner.generate_plan` selects a course only when
+    `term in course.offered_terms`, so an empty tuple there means EVERY course is unschedulable
+    in every term and Mode A produces an empty plan for every student (measured: 14% coverage,
+    zero violations, on a program whose requirements are entirely satisfiable). Stating "any
+    term" is what the rest of the harness already asserts; leaving it empty states "no term",
+    which is a different claim and a false one.
     """
     alias_of = {row["course_code"]: row["alias_of"] for row in database.rows("course_aliases")}
 
@@ -2137,15 +2210,15 @@ def fixture_from_database(database: CatalogDatabase) -> Fixture:
                 group[0] for group in (row.get("prereq_groups") or []) if group
             ),
             coreqs=tuple(row.get("coreq_codes") or ()),
-            offered_terms=(),
+            offered_terms=tuple(ALL_TERMS),
             equivalent_to=alias_of.get(code, ""),
         ))
 
     # Same "skip groups with zero options" filter `real_scoring._groups_from_tables` uses —
     # this is what makes the science/gen-ed-core/gen-ed-selective ceiling disappear even
     # before any crawler work lands: those groups simply have no `requirement_options` rows
-    # today, so they are never scored, exactly matching what the prompt already tells the
-    # model ("unresolved_requirement_groups... never invent a course code to satisfy one").
+    # today, so they are never scored, and (since 2026-08-12) never shown either — a group with
+    # no options is not in the export at all.
     # Once a category is resolved (see `parse.requirements.resolve_requirement_links`), it
     # gains real options and starts counting automatically — no further change needed here.
     options_by_group: dict[str, list[dict[str, Any]]] = {}
@@ -2173,13 +2246,125 @@ def fixture_from_database(database: CatalogDatabase) -> Fixture:
             group["choose_credits"] = row.get("credits_min") or 0
         requirement_groups.append(group)
 
+    program_row = database.rows("programs")[0] if database.rows("programs") else {}
+    name = program_row.get("name") or "(unknown program)"
     return Fixture(
-        name=(database.rows("programs")[0]["name"] if database.rows("programs")
-              else "(unknown program)"),
+        name=name,
         path=database.path,
         fixture_hash=database.db_hash,
-        verified=False,
+        # TRUE, unlike the hand-authored fixtures this replaced. `verified: false` meant "the
+        # prerequisite edges in this file were typed in by hand" — every edge here is crawled
+        # (Banner course-detail pages, carrying a `confidence`), and every course, credit and
+        # requirement group is the catalog's own.
+        verified=True,
         catalog=catalog,
         requirement_groups=requirement_groups,
-        scenarios=[],
+        scenarios=synthesize_scenarios(name, catalog, requirement_groups,
+                                       canonical=_canonical_map(alias_of)),
+        slug=slug or program_slug(name),
+        real_db_program_id=str(program_row.get("id") or ""),
     )
+
+
+_SLUG_STRIP = re.compile(r"[^a-z0-9]+")
+
+
+def _canonical_map(alias_of: dict[str, str]) -> dict[str, str]:
+    """code -> the PRIMARY course it counts as, following alias chains, same rule as
+    `Fixture.canonical`. Needed BEFORE the `Fixture` exists, because the students are
+    synthesized as part of building it — see `select_remaining_courses`'s `canonical`."""
+    out: dict[str, str] = {}
+    for code in alias_of:
+        target, seen = code, {code}
+        while alias_of.get(target) and alias_of[target] not in seen:
+            target = alias_of[target]
+            seen.add(target)
+        out[code] = target
+    return out
+
+
+def program_slug(name: str) -> str:
+    """A short, filesystem-safe name for `results/results_<slug>/`.
+
+    Derived from the program's own catalog name rather than authored, so a program nobody has
+    ever run before still gets a stable directory: "Computer Science, BS - Machine Intelligence
+    concentration" -> `computer-science-bs-machine-intelligence`. Truncated on a word boundary,
+    because these become directory names a human reads in a listing.
+    """
+    words = [w for w in _SLUG_STRIP.sub("-", name.lower()).split("-") if w]
+    out: list[str] = []
+    for word in words:
+        if sum(len(w) + 1 for w in out) + len(word) > 48:
+            break
+        out.append(word)
+    return "-".join(out) or "program"
+
+
+def list_programs(pg_url: str, *, plannable_only: bool = True) -> list[dict[str, Any]]:
+    """Every program in the catalog, newest catalog year first, with its requirement-option
+    count — the pool `run.py`'s sweep draws its random picks from.
+
+    `plannable_only` drops the programs Mode B cannot run at all: a program whose requirement
+    groups are all prose or all containers has zero `requirement_options` rows, and
+    `fetch_real_db_base` raises `LookupError` on it by design ("there is nothing for Mode B to
+    plan from"). Picking one at random would spend a sweep slot on a guaranteed failure.
+    """
+    with psycopg.connect(pg_url, row_factory=dict_row) as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT p.id::text AS id, p.name, p.degree_type, cy.label AS catalog_year,
+                   (SELECT count(*) FROM requirement_options ro
+                     JOIN requirement_groups rg ON rg.id = ro.requirement_group_id
+                    WHERE rg.program_id = p.id) AS n_options
+            FROM programs p
+            JOIN catalog_years cy ON cy.id = p.catalog_year_id
+            ORDER BY cy.label DESC, p.name ASC
+            """
+        )
+        rows = list(cur.fetchall())
+    return [r for r in rows if r["n_options"] > 0] if plannable_only else rows
+
+
+def resolve_program(pg_url: str, search_text: str) -> dict[str, Any]:
+    """`--major <text>` -> exactly one program row, or a SystemExit-worthy LookupError listing
+    the candidates. The non-interactive counterpart to `resolve_major_interactive`: a sweep runs
+    unattended, so an ambiguous match must fail loudly rather than block on stdin.
+
+    Matching, in order: exact name, exact slug (`program_slug`), then case-insensitive
+    substring over both. Exactness wins outright so that a full program name is never reported
+    ambiguous against the longer names that contain it ("Biology" vs "Biology: Ecology,
+    Evolution and Environmental Science Concentration").
+
+    SEVERAL ROWS CAN SHARE A NAME — the same program in two catalog years, and sometimes two
+    rows in one year where the crawl caught a stub page as well as the real one ("Mechanical
+    Engineering" exists with 87 requirement options and with 1). The widest one wins, then the
+    newest: a stub with a single option is not the program anybody means, and picking it would
+    hand every model an empty degree to plan.
+    """
+    search = search_text.strip()
+    lowered = search.lower()
+    programs = list_programs(pg_url)
+    if not programs:
+        raise LookupError("no plannable programs in the catalog — has the crawl run?")
+
+    exact = [row for row in programs
+             if row["name"].lower() == lowered or program_slug(row["name"]) == lowered]
+    if exact:
+        return max(exact, key=lambda r: (r["n_options"], r["catalog_year"]))
+    matches = [r for r in programs
+               if lowered in r["name"].lower() or lowered in program_slug(r["name"])]
+    # Same collapse for a substring match that landed on one program duplicated across catalog
+    # years: several rows, one program, no real ambiguity to report.
+    if len({r["name"] for r in matches}) == 1:
+        return max(matches, key=lambda r: (r["n_options"], r["catalog_year"]))
+    if not matches:
+        raise LookupError(f"--major {search_text!r} matched none of the {len(programs)} "
+                          f"plannable programs in the catalog")
+    if len(matches) > 1:
+        listing = "\n".join(f"  - {r['name']}  [{program_slug(r['name'])}]"
+                             for r in matches[:20])
+        more = f"\n  ... and {len(matches) - 20} more" if len(matches) > 20 else ""
+        raise LookupError(
+            f"--major {search_text!r} matched {len(matches)} programs — be more specific "
+            f"(the slug in brackets is always unique):\n{listing}{more}")
+    return matches[0]

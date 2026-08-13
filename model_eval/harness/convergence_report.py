@@ -400,8 +400,8 @@ def mode_c_cross_school_lines(
     wrote (same discovery `report._discover_school_dirs` uses for Mode A/B), tags each record
     with `_school`, and reports both an OVERALL table (every school pooled, same shape as
     `mode_c_lines`'s per-variant table) and a PER-SCHOOL grid — because a school with no
-    `<fixture-stem>.locked_slots.yaml` sibling silently has no Mode C data at all (see
-    `harness.convergence.locked_slots_path_for`), and that has to be visible here rather than
+    a school that has not been run with `--tasks converge` silently has no Mode C data at all,
+    and that has to be visible here rather than
     just making the pooled numbers quietly rest on fewer schools than Mode A/B's tables above
     them.
 
@@ -438,11 +438,8 @@ def mode_c_cross_school_lines(
 
     if not pooled:
         out += [
-            "_No Mode C records found for any school. Mode C only runs for a school with a "
-            "`<fixture-stem>.locked_slots.yaml` sibling next to its plan fixture — see "
-            "`plan_fixtures/*.locked_slots.yaml` — and only after `python run.py run --tasks "
-            "converge` (or a full `run.py run`, which includes it automatically for schools "
-            "that have one)._",
+            "_No Mode C records found for any school. It runs on `python run.py run --tasks "
+            "converge`, or as part of a full `run.py run`._",
             "",
         ]
         return out
@@ -454,9 +451,8 @@ def mode_c_cross_school_lines(
     ]
     if missing:
         out += [
-            "_No Mode C data yet for: " + ", ".join(f"`{s}`" for s in missing) + " — either no "
-            "`.locked_slots.yaml` sibling for that fixture, or `--tasks converge` hasn't been "
-            "run for it._",
+            "_No Mode C data yet for: " + ", ".join(f"`{s}`" for s in missing)
+            + " — `--tasks converge` has not been run for it._",
             "",
         ]
     for slug, hashes in sorted(mixed_hash_schools.items()):

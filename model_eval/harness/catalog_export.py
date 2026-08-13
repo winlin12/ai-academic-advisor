@@ -62,6 +62,38 @@ from typing import Any
 # ...`), so simply not populating it here is what turns the constraint off everywhere at once,
 # without touching any scoring code.
 #
+# `requirement_options` is still FETCHED (real_db reads this dict to know what to query, and
+# `real_scoring._groups_from_tables` scores off the flat rows) but as of 2026-08-12 it is no
+# longer PRINTED as its own section: `_export_rows` folds each group's options into the
+# `requirement_groups` row that owns them. This is a rendering change only — `.tables` keeps the
+# flat rows exactly as before, so every scorer, `integrity_problems`, and `real_db`'s
+# `_partial_database` are untouched.
+#
+# WHAT IT BUYS: the join column was a uuid repeated on every option row, and the group ids it
+# pointed at were uuids too (some of them composite, `<uuid>:<uuid>`, for merged second-major and
+# minor groups). Measured on the mi-fresh-start export with qwen3.6-27b's own tokenizer, uuids
+# were 5,468 of the export's 12,077 tokens — 45% of the whole thing, spent on identifiers the
+# model never reads back and never emits: plans are lists of course codes. Nesting removes the
+# foreign key and the primary key together and takes the export to 5,472 tokens. Group ids that
+# were readable slugs (`ucc-wc`, `merged-lab-science`) go too — a group is identified by its
+# `name`, which is what the prompt and the scoring reports already call it by.
+#
+# `parent_group_id` goes with them, but is rendered as the parent's NAME when it is set, rather
+# than dropped: the column is null on all 3,610 group rows across the recorded corpus, so this
+# path is untested by construction and must not silently lose a tree if one ever appears.
+#
+# `unresolved_requirement_groups` is REMOVED, 2026-08-12, the same way and for a related
+# reason: it was the one section of the export the model was shown and then told it could do
+# NOTHING with ("never invent a course code to satisfy one", "cover every requirement group
+# does not refer to these"), and the transcripts read like models trying to act on it anyway —
+# prose requirements sitting next to schedulable ones is a distinction a small model is being
+# asked to hold for no payoff. Nothing scored against it either (`real_scoring` only listed the
+# rows back in the report). Dropping the table here turns it off in the export; the paired
+# explanations in `render_context` and `prompts.PLAN_SYSTEM` came out with it, and `real_db` no
+# longer fetches the rows. University requirements need a representation the model can act on —
+# the resolved `ucc-*` groups `real_db` synthesizes are the shape that works — and that is the
+# open piece of work this removal makes room for.
+#
 # `course_workload` is REMOVED entirely, 2026-08-07 — same class of problem as
 # `course_planner_terms`, one step further along: it was never even an OBSERVATION, just a
 # single advisor-assigned 1-5 number with no upstream source at all, presented next to real
@@ -75,7 +107,6 @@ TABLES: dict[str, str] = {
     "programs": "catalog_ingestion",
     "requirement_groups": "catalog_ingestion",
     "requirement_options": "catalog_ingestion",
-    "unresolved_requirement_groups": "catalog_ingestion",
     "courses": "catalog_ingestion",
     "course_aliases": "catalog_ingestion",
     "program_notes": "catalog_ingestion",
@@ -85,8 +116,10 @@ TABLES: dict[str, str] = {
 # export so the omission is visible to the reader (and to anyone diffing this against the real
 # schema) rather than looking like the export is the whole truth.
 OMITTED_COLUMNS = (
-    "uuid primary keys and foreign keys (natural keys — course_code, program id — are used "
-    "instead); provenance columns (source_page_id, sync_run_id, updated_at, term_code); "
+    "uuid primary keys and foreign keys — the tables that referenced each other are printed "
+    "already joined, so nothing here needs them (a course is named by course_code, a "
+    "requirement group by its name); provenance columns (source_page_id, sync_run_id, "
+    "updated_at, term_code); "
     "columns whose value is derivable from course_code (subject, number); "
     "courses.description, which holds Purdue's catalog prose; and courses.prerequisites_raw / "
     "corequisites_raw, which Acalog does not publish — the entire reason a separately-crawled "
@@ -101,6 +134,11 @@ OMITTED_COLUMNS = (
 # ensure_ascii=False everywhere: program names carry em-dashes, and — is three tokens of
 # nothing. The model reads UTF-8 fine.
 _ROW_SEPARATORS = (",", ":")
+
+# Fetched into `CatalogDatabase.tables` and read by the scorers, but never printed as its own
+# `## <table>` section — `_export_rows` folds it into the table that owns it. See the TABLES
+# comment above for why.
+NESTED_TABLES = frozenset({"requirement_options"})
 
 
 @dataclass
@@ -250,11 +288,35 @@ def _export_rows(db: CatalogDatabase, table: str, depths: dict[str, int]) -> lis
     as any other) — `prereq_groups`/`coreq_codes`/`confidence` were already merged into the row
     by `real_db.py` and are simply absent for a course with neither, not zeroed out, so a
     prereq-less course's line stays exactly as short as `courses`-only fields would make it.
+
+    `requirement_groups` gets its `requirement_options` rows nested in as `options` and loses
+    every uuid: its own `id`, the `program_id` naming the one program this whole export is for,
+    and the `requirement_group_id` that was repeated on every option row. A group is identified
+    by `name` from here on. `db.tables` is not touched — these are copies.
     """
     rows = [dict(row) for row in db.rows(table)]
     if table == "courses":
         for row in rows:
             row["chain_depth"] = depths.get(row["course_code"], 0)
+    elif table == "programs":
+        for row in rows:
+            row.pop("id", None)
+    elif table == "requirement_groups":
+        options: dict[str, list[dict[str, Any]]] = {}
+        for option in db.rows("requirement_options"):
+            options.setdefault(option["requirement_group_id"], []).append(
+                {k: v for k, v in option.items() if k != "requirement_group_id"}
+            )
+        names = {row["id"]: row.get("name") for row in rows}
+        for row in rows:
+            parent = row.pop("parent_group_id", None)
+            row.pop("program_id", None)
+            row["options"] = options.get(row["id"], [])
+            # Name, not id, and only when set — see the TABLES comment: null everywhere in the
+            # recorded corpus, so losing it silently is the failure mode to avoid.
+            if parent is not None:
+                row["parent"] = names.get(parent)
+            row.pop("id", None)
     return rows
 
 
@@ -301,74 +363,23 @@ def render_context(db: CatalogDatabase) -> str:
         "  - There is no offering-term data in this export — Purdue's published pattern is not "
         "always a reliable predictor of a future term, so place courses by prerequisite order "
         "only; do not assume or invent a term restriction for any course.",
-        "  - Every requirement_options row requires a minimum grade of C; join it to `courses` "
-        "on course_code for the title and credits.",
-        "  - Courses in `courses` that are not named in any `requirement_options` row are "
+        "  - Each `requirement_groups` row carries its own `options`: the courses that satisfy "
+        "that group, each with the catalog's credit figure for it. Every option requires a "
+        "minimum grade of C; look its course_code up in `courses` for the title. A group is "
+        "referred to by its `name`.",
+        "  - Courses in `courses` that are not named in any group's `options` are "
         "ELECTIVES: real courses in this department, not tied to a specific requirement. They "
         "count toward a selective/elective group's credit target same as any listed option.",
         "  - course_aliases.alias_of names an approved substitute: the two codes satisfy the "
         "same requirement and the same prerequisites, so take one, never both.",
-        "  - unresolved_requirement_groups are real degree requirements — university-wide "
-        "gen-ed, college/school core, world language — that the catalog states in prose "
-        "instead of as a course list. There is nothing to schedule for them: never invent a "
-        "course code to satisfy one, and \"cover every requirement group\" refers only to "
-        "`requirement_groups`, not to these. `scope` says whose requirement it is — "
-        "`university` (every student), `college` (every student in that school), or `program` "
-        "(this degree only).",
         "",
     ]
     for table, source in TABLES.items():
+        if table in NESTED_TABLES:
+            continue
         rows = _export_rows(db, table, depths)
         parts.append(f"## {table}  ({source}, {len(rows)} rows)")
         parts += [json.dumps(row, sort_keys=True, separators=_ROW_SEPARATORS,
                              ensure_ascii=False) for row in rows]
         parts.append("")
-    return "\n".join(parts).rstrip() + "\n"
-
-
-def render_context_lean(db: CatalogDatabase) -> str:
-    """The stripped-down export for a `program.source: fixture` pseudo-major (school-core /
-    gen-ed+world-language test cases) — see `real_db.real_db_base_from_fixture`'s docstring for
-    why those fixtures exist. Shows ONLY `requirement_groups`, each with its options joined
-    inline as (code, credits) pairs — no separate `courses` table, no title, no prerequisites,
-    no confidence, no chain_depth.
-
-    Deliberately, not an oversight: these domains (gen-ed, world language, a college's own
-    first-year orientation gate) have no meaningful prerequisite chains to model, and the whole
-    point of splitting them out of the full major fixtures is to stop asking a model to do
-    catalog-scale course selection AND real prerequisite sequencing in the same call — see the
-    duplicate-course investigation that led here. `render_context`'s full per-course metadata
-    would just be noise for a requirement domain that is, by construction, shallow.
-
-    Deterministic for a given database state, same as `render_context` — lands in the static
-    prompt hash the same way.
-    """
-    options_by_group: dict[str, list[dict[str, Any]]] = {}
-    for row in db.rows("requirement_options"):
-        options_by_group.setdefault(row["requirement_group_id"], []).append(
-            {"code": row["course_code"], "credits": row.get("credits")}
-        )
-    parts = [
-        "REQUIREMENT GROUPS — this student's remaining degree requirements for this test case. "
-        "One JSON row per group; no separate course catalog.",
-        "",
-        "This is the complete set of requirement groups here; nothing outside this export "
-        "exists — never invent a course code to satisfy a requirement.",
-        "",
-        "How to read a row:",
-        "  - kind \"all\": every listed option is required.",
-        "  - kind \"choose\": pick options totaling at least `credits_min` credits from the "
-        "listed options.",
-        "  - `options` is a list of (course code, credits) pairs. Nothing else about a course "
-        "(title, prerequisites) is shown here on purpose — these requirements have no "
-        "meaningful prerequisite chain to sequence.",
-        "",
-    ]
-    for row in db.rows("requirement_groups"):
-        parts.append(json.dumps({
-            "name": row.get("name"),
-            "kind": "all" if row.get("requirement_type") == "all_of" else "choose",
-            "credits_min": row.get("credits_min"),
-            "options": options_by_group.get(row.get("id"), []),
-        }, sort_keys=True, separators=_ROW_SEPARATORS, ensure_ascii=False))
     return "\n".join(parts).rstrip() + "\n"

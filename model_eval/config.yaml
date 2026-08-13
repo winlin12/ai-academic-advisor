@@ -40,6 +40,14 @@ run:
   seed: 67
   top_p: 0.9
   max_output_tokens: 1048
+  # EXPLAIN GETS ITS OWN CEILING. Measured 2026-08-12 on the recorded corpus: at
+  # `max_output_tokens` the explain stage truncated on 80-100% of qwen3.5-9b / qwen3.6-27b /
+  # qwen3.6-35b-a3b records, every one of them stopping at exactly 1048 tokens. A cut-off
+  # explanation is not a worse explanation, it is an unscorable one — the faithfulness and
+  # plan-contradiction checks both read a sentence that never finished — so those models were
+  # being marked down for a budget rather than for their writing. QA answers are short and
+  # stay on `max_output_tokens`.
+  max_explain_tokens: 2048
   max_plan_tokens: 2048
   runs_per_pair: 1            # N replicates per (model x item) — variance, not luck
   warmup_discard: 2           # generations per model discarded before measurement
@@ -152,15 +160,98 @@ models:
     bracket: 12gb
     think: false
     extra_args: ["--split-mode", "none", "--main-gpu", "0"]
-  - name: "muse-glimmer-30b"
-    gguf: "muse-glimmer-30b/Muse-Glimmer-30B-UD-Q4_K_XL.gguf"
+
+  # muse-glimmer-30b REMOVED 2026-08-12. Its Harmony-style template always opens an analysis
+  # channel that `--reasoning off --reasoning-budget 0` does not suppress, and under that chat
+  # format llama.cpp reports `"grammar": ""` — the JSON schema is never compiled into a
+  # decoding grammar, so its structured output was unconstrained while every other model here
+  # was grammar-bound. The token starvation was fixable (a per-model allowance got it writing
+  # real explanations again); the grammar gap is not, and it means its Mode A/B/C numbers were
+  # never comparable to the rest of this table. Dropped rather than reported with an asterisk.
+  # The gguf is still on disk — re-add an entry with `reasoning_overhead_tokens: 1200` to
+  # revisit it if llama.cpp gains grammar support for this chat format.
+
+  # NVIDIA Nemotron 3.5 Lightning, 30B A3B (unsloth GGUF). Hybrid Mamba/Transformer MoE
+  # (`nemotron_h_moe`) — supported by this llama.cpp build (arch present in llama-arch.cpp as
+  # of 4801e3c, 2026-08-10). A3B = ~3B active parameters per token, so it decodes like a small
+  # model while holding a 30B parameter budget, which is the same bet `qwen3.6-35b-a3b` makes.
+  #
+  # NO DRAFT: its vocabulary is its own, and a mismatched draft aborts the server at load (see
+  # the `speculative:` block above).
+  #
+  # `think`/`reasoning_overhead_tokens` are UNVERIFIED until the first run — if it turns out to
+  # have a reasoning channel it cannot switch off, it will show the muse-glimmer signature
+  # above (empty `content`, `finish_reason: length`) and wants the same allowance.
+  - name: "nemotron3.5-lightning-30b-a3b"
+    gguf: "nemotron3.5-lightning-30b-a3b/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-UD-Q4_K_M.gguf"
     bracket: server
     think: false
-    extra_args: ["--tensor-split", "0.60,0.40"]
+    # 25.2 GB of weights against 20 GB of VRAM (12 + 8), so more of the expert stack lives in
+    # CPU RAM than any other model here — at n_cpu_moe 7 (the global default) the load died
+    # with `cudaMalloc failed` trying to put 9.5 GB on the 8 GB card. Pinning n_cpu_moe means
+    # hand-sizing the split too; see the auto-fit note in server.build_argv.
+    n_cpu_moe: 15
+    extra_args: ["--tensor-split", "0.70,0.30"]
 paths:
-  plan_fixture: "plan_fixtures/cs_machine_intelligence.yaml"
   questions: "questions.yaml"
   results_dir: "results"
+
+# WHAT `run.py run` (no --major) EVALUATES.
+#
+# TWO CURATED MAJORS PER SCHOOL. These are the rows whose history means something — the same
+# programs, sweep after sweep — spread across schools so no one college's quirks stand in for
+# the university. They are NAMED here rather than derived because the crawl carries no college:
+# every `programs.college_id` is NULL, so which school a program belongs to is knowledge that
+# exists in this file and nowhere else. Add a school by adding a key; two entries each is a
+# convention, not a limit.
+#
+# Matched the same way `--major` is (`real_db.resolve_program`: exact name, exact slug, then
+# substring), so a name here survives a re-crawl reassigning program UUIDs — which is exactly
+# what stranded the old fixture files, every one of which pinned a UUID.
+#
+# PLUS `random_untested` PROGRAMS DRAWN FRESH EACH SWEEP from everything with no
+# `results/results_<slug>/` yet. The curated set was chosen back when each one cost somebody a
+# hand-written fixture file, which selects for tidy, well-crawled programs; the random draw is
+# the only part of the sweep that puts the harness in front of a program nobody groomed. A
+# failure there is a finding, not a broken sweep — `_run_sweep` catches it and carries on.
+sweep:
+  # PAUSED AT 0, 2026-08-12, pending the registrar conversation about data access and
+  # publication. The random draw is the half of the sweep that puts the harness in front of a
+  # program nobody groomed, and it is the right default — but until prerequisites exist for
+  # more than the curated set (see `real_db._HARDCODED_PREREQS`), a random program would be
+  # evaluated with no prerequisite constraints at all and its numbers would not mean what the
+  # curated ones mean. Set it back to 2 the moment prerequisite coverage stops being hand-fed.
+  random_untested: 0
+  curated:
+    agriculture:
+      - "Animal Sciences: Pre-Veterinary Medicine Concentration"
+      - "Agricultural Economics: Applied Agricultural Economics Concentration"
+    business:
+      - "Accounting"
+      - "Finance"
+    education:
+      - "Elementary Education"
+      - "English Education"
+    engineering:
+      - "Electrical Engineering"
+      - "Mechanical Engineering"
+    health_human_sciences:
+      - "Nursing"
+      - "Psychological Sciences"
+    liberal_arts:
+      # THE CONCENTRATION NAMES, not the bare ones. "Communication" and "Political Science" as
+      # exact names are Purdue's GRADUATE programs (MS/PhD/MA); the undergraduate degrees are
+      # only ever named by concentration. Resolving the bare name picked the MS and quietly
+      # evaluated models against a graduate course list — COM 5xxxx/6xxxx and POL 5xxxx/6xxxx
+      # showed up as "required courses" for a student with no bachelor's degree.
+      - "Communication: General Communication Concentration"
+      - "Political Science: American Politics Concentration"
+    polytechnic:
+      - "Computer and Information Technology"
+      - "Construction Management"
+    science:
+      - "Computer Science: Machine Intelligence"
+      - "Biology"
 
 # Mode B's context: the REAL catalog_ingestion/advisor Postgres DB, read live — no JSON mock
 # any more (see harness/real_db.py, harness/catalog_export.py). `program_id` is the real,
@@ -319,12 +410,11 @@ convergence:
   # the report header and stored in meta_convergence.json.
   excluded_prereq_edges: []
 
-  # NO LONGER A CONFIG KEY, as of 2026-08-08 (was a single fixed path here, e.g.
-  # "plan_fixtures/cs_machine_intelligence.locked_slots.yaml"). Multi-school support means the
-  # active fixture changes per school, so a single hard-coded path stopped making sense — Mode C
-  # now looks BY CONVENTION for a "<fixture-stem>.locked_slots.yaml" sibling of whichever fixture
-  # is currently loaded (see `harness/convergence.locked_slots_path_for`), and skips the task
-  # entirely for a fixture that doesn't have one rather than erroring.
+  # NO LONGER A CONFIG KEY, as of 2026-08-08 (was a single fixed path here). The active
+  # program changes per `--major`/per sweep entry, so a single hard-coded path stopped making
+  # sense — Mode C looks BY CONVENTION for `locked_slots/<program-slug>.yaml` (see
+  # `harness/convergence.locked_slots_path_for`) and skips the task entirely for a program that
+  # doesn't have one rather than erroring. Those files are the last hand-authored data here.
 
 decision:
   mode_b_viable_floor: 0.90

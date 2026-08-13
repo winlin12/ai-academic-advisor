@@ -16,8 +16,9 @@ up as a correctness bug, not just a display quirk:
     `hallucinated_course`, and a same-program CS run still showed `gen-ed-core`/`science` as
     "missing" because the FIXTURE invented specific gen-ed course codes (SCLA 10100, PHYS
     17200, ...) that were never real, enumerable requirements — the real catalog correctly
-    states these in prose (`unresolved_requirement_groups`), and the fixture's guess at turning
-    prose into a course list is exactly the kind of hardcoding this module replaces.
+    states these in prose (at the time, in an `unresolved_requirement_groups` table; removed
+    2026-08-12, see `catalog_export.TABLES`), and the fixture's guess at turning prose into a
+    course list is exactly the kind of hardcoding this module replaces.
   * `missing_requirements` read back labels (`cs-elective`, `gen-ed-selective`) that describe
     the FIXTURE's invented taxonomy, not the real program's actual `requirement_groups` names —
     misleading regardless of which program real_db.program_id names.
@@ -36,8 +37,14 @@ so `runner._score_detail` and `plan_scorers.check_assertions` — both written a
 `PlanScore` — work on a `RealScore` UNCHANGED; duck typing, not a shared base class, because a
 shared base class would tempt someone into making the two interchangeable in the other
 direction too, and Mode A must never silently start reading real-DB data it was never shown.
-`groups`/`unresolved` are the one real addition: per-group detail a flat `PlanScore` has no
-slot for, used by `runner._real_score_detail` for the "every checkable requirement group" table.
+`groups` is the one real addition: per-group detail a flat `PlanScore` has no slot for, used by
+`runner._real_score_detail` for the "every requirement group" table.
+
+PROSE-ONLY REQUIREMENTS ARE NOT SCORED AND NOT REPORTED, 2026-08-12. They never counted toward
+`requirement_coverage` (nothing to check), but the export showed them to the model and this
+scorer listed them back in the report as "cannot be checked at all". Both are gone: the table is
+no longer in `catalog_export.TABLES` and the prompt no longer describes it. Every group this
+module scores is one with a real course list. See `catalog_export.TABLES` for the removal.
 """
 
 from __future__ import annotations
@@ -62,26 +69,18 @@ class RealGroupResult:
 
 
 @dataclass
-class RealUnresolved:
-    name: str
-    raw_text: str | None
-    scope: str = "program"
-
-
-@dataclass
 class RealScore:
     """Everything `plan_scorers.PlanScore` tracks, computed from the real database instead of
-    the fixture, plus per-group detail (`groups`, `unresolved`) the flat original has no slot
-    for. See the module docstring for why the field names match `PlanScore` exactly."""
+    the fixture, plus per-group detail (`groups`) the flat original has no slot for. See the
+    module docstring for why the field names match `PlanScore` exactly."""
 
     structure_ok: bool = True
     viable: bool = False
     violations: list[str] = field(default_factory=list)
     violation_counts: dict[str, int] = field(default_factory=dict)
-    # Over CHECKABLE groups only (`groups`, below) — `unresolved` cannot be decided either way,
-    # and counting it against coverage would tell a student they are behind when the honest
-    # answer is "we do not know". See `UnresolvedRequirement`'s docstring in the app for the
-    # same call made the same way in production.
+    # Over the groups that carry a course list (`groups`, below) and nothing else — a
+    # requirement the catalog states only in prose is not represented here at all any more (see
+    # the module docstring), so nothing uncheckable can push this number down.
     requirement_coverage: float = 0.0
     missing_requirements: list[str] = field(default_factory=list)
     planned_credits: int = 0
@@ -112,7 +111,6 @@ class RealScore:
 
     # Real-DB-specific detail, absent from `PlanScore`.
     groups: list[RealGroupResult] = field(default_factory=list)
-    unresolved: list[RealUnresolved] = field(default_factory=list)
 
     @property
     def groups_satisfied(self) -> int:
@@ -131,9 +129,9 @@ class RealScore:
     def as_record(self) -> dict[str, Any]:
         """`PlanScore.as_record()`'s exact key surface, so `rec.update(real_score.as_record())`
         in `runner._run_freeform_plan` IS Mode B's primary, unprefixed score — no translation
-        layer, and report.py needs no changes to read it. `real_groups`/`real_unresolved` are
-        additive: the per-group breakdown `PlanScore` cannot express, kept under a distinct
-        name so it never collides with anything `plan_scorers` writes."""
+        layer, and report.py needs no changes to read it. `real_groups` is additive: the
+        per-group breakdown `PlanScore` cannot express, kept under a distinct name so it never
+        collides with anything `plan_scorers` writes."""
         return {
             "structure_ok": self.structure_ok,
             "plan_viable": self.viable,
@@ -169,10 +167,6 @@ class RealScore:
                 }
                 for g in self.groups
             ],
-            "real_unresolved": [
-                {"name": u.name, "raw_text": u.raw_text, "scope": u.scope}
-                for u in self.unresolved
-            ],
         }
 
 
@@ -201,7 +195,8 @@ def _terms(profile: Profile, count: int) -> list[tuple[str, int]]:
 def _groups_from_tables(database: CatalogDatabase) -> list[dict[str, Any]]:
     """Reconstruct each requirement group's courses and selective/take-all flag from
     `requirement_groups`/`requirement_options` — the same two tables `catalog_export
-    .render_context` prints, so this scores exactly what the model was shown, nothing else."""
+    .render_context` renders (as one nested section since 2026-08-12; the flat rows read here
+    are unchanged), so this scores exactly what the model was shown, nothing else."""
     options_by_group: dict[str, list[str]] = {}
     for row in database.rows("requirement_options"):
         options_by_group.setdefault(row["requirement_group_id"], []).append(row["course_code"])
@@ -429,12 +424,6 @@ def score_against_real_db(
         horizon = max(profile.semesters_to_plan, len(score.semester_credits))
         padded = score.semester_credits + [0] * (horizon - len(score.semester_credits))
         score.idle_credits = sum(max(cap - c, 0) for c in padded[:horizon])
-
-    score.unresolved = [
-        RealUnresolved(name=row["name"], raw_text=row.get("raw_text"),
-                       scope=row.get("scope", "program"))
-        for row in database.rows("unresolved_requirement_groups")
-    ]
 
     if assertions:
         # Duck-typed: `check_assertions` only reads `.semester_credits` and

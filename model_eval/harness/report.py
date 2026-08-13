@@ -419,17 +419,45 @@ def _qa_section(records: list[dict]) -> list[str]:
              "only, not the embedding model. `Faith-flagged` and `Recall-flagged` are "
              "HEURISTICS: entity-level triage, not verdicts. Grade the review queue before "
              "quoting a faithfulness number.", "",
-             "| Model | Behavior OK | Auto-pass | Faith-flagged | Recall-flagged | Median s |",
-             "|---|---|---|---|---|---|"]
+             "**Read the two behaviour columns separately.** `Answered OK` is over the items "
+             "whose context supports an answer; `Abstained OK` is over the items where it does "
+             "not and declining IS the correct output. A model that never abstains scores well "
+             "on the first and zero on the second, and the average of the two hides exactly "
+             "the failure that matters for an advising bot.", "",
+             "| Model | Answered OK | Abstained OK | Auto-pass | Faith-flagged | "
+             "Recall-flagged | Median s |",
+             "|---|---|---|---|---|---|---|"]
     for model, recs in groups.items():
+        answer_recs = [r for r in recs if r.get("expected_behavior") == "answer"]
+        abstain_recs = [r for r in recs if r.get("expected_behavior") == "abstain"]
         lines.append(
-            f"| `{model}` | {_rate_with_range(_by_run(recs, 'behavior_ok'))} "
+            f"| `{model}` "
+            f"| {_rate([bool(r.get('behavior_ok')) for r in answer_recs])} "
+            f"| {_rate([bool(r.get('behavior_ok')) for r in abstain_recs])} "
             f"| {_rate([bool(r.get('qa_auto_pass')) for r in recs])} "
             f"| {_rate([bool(r.get('faithfulness_flags')) for r in recs])} "
             f"| {_rate([bool(r.get('recall_flags')) for r in recs])} "
             f"| {_median([r.get('total_s') for r in recs])} |"
         )
-    return lines + [""]
+    lines.append("")
+
+    # BY TOPIC. `questions.yaml` carries `topic` (course | policy | process) because a bot can
+    # be fluent about prerequisites and useless about how to CODO — those questions retrieve
+    # different corpora and fail differently, and a single QA percentage averages the two into
+    # a number that describes neither.
+    topics = sorted({r.get("topic") for r in records
+                     if r.get("stage") == "qa" and r.get("topic")})
+    if len(topics) > 1:
+        lines += ["**Behaviour by topic** (share of items handled correctly, answer and "
+                  "abstain pooled — the split above is the one to read for safety):", "",
+                  "| Model | " + " | ".join(f"`{t}`" for t in topics) + " |",
+                  "|---|" + "---|" * len(topics)]
+        for model, recs in groups.items():
+            cells = [_rate([bool(r.get("behavior_ok")) for r in recs if r.get("topic") == t])
+                     for t in topics]
+            lines.append(f"| `{model}` | " + " | ".join(cells) + " |")
+        lines.append("")
+    return lines
 
 
 def _explain_section(records: list[dict]) -> list[str]:
@@ -438,17 +466,40 @@ def _explain_section(records: list[dict]) -> list[str]:
         return []
     lines = ["### Explain-plan", "",
              "Every model explains the SAME deterministic baseline plan, which isolates "
-             "explanation quality from planning quality. Faith-flagged is a heuristic.", "",
-             "| Model | Faith-flagged | Truncated | Median output tokens | Median s |",
-             "|---|---|---|---|---|"]
+             "explanation quality from planning quality.", "",
+             "`Contradicts plan` counts explanations making a claim the plan itself refutes — "
+             "a course placed in the wrong semester, an ordering the plan reverses, or a plan "
+             "described as complete while the planner is reporting courses it could not fit "
+             "(see `scorers.explain_flags`). Unlike the faithfulness heuristic next to it, "
+             "these are checked against structured data the harness generated, so a flag here "
+             "is a real disagreement rather than triage. `Auto-pass` requires both clean.", "",
+             "| Model | Auto-pass | Contradicts plan | Faith-flagged | Truncated | "
+             "Median output tokens | Median s |",
+             "|---|---|---|---|---|---|---|"]
     for model, recs in groups.items():
         lines.append(
-            f"| `{model}` | {_rate([bool(r.get('faithfulness_flags')) for r in recs])} "
+            f"| `{model}` "
+            f"| {_rate([bool(r.get('explain_auto_pass')) for r in recs])} "
+            f"| {_rate([bool(r.get('explain_flags')) for r in recs])} "
+            f"| {_rate([bool(r.get('faithfulness_flags')) for r in recs])} "
             f"| {_rate([bool(r.get('truncated')) for r in recs])} "
             f"| {_median([r.get('eval_count') for r in recs])} "
             f"| {_median([r.get('total_s') for r in recs])} |"
         )
-    return lines + [""]
+    lines.append("")
+
+    # WHAT THE FLAGS ACTUALLY SAID. A percentage tells you an explanation contradicted the
+    # plan; only the text tells you whether it moved a course or claimed a short plan was
+    # finished, and those are different severities.
+    flagged = [(r.get("model"), flag) for r in records if r.get("stage") == "explain"
+               for flag in (r.get("explain_flags") or [])]
+    if flagged:
+        lines += ["Every contradiction found, verbatim:", ""]
+        lines += [f"- `{model}` — {flag}" for model, flag in flagged[:20]]
+        if len(flagged) > 20:
+            lines.append(f"- _...and {len(flagged) - 20} more; see the review queue._")
+        lines.append("")
+    return lines
 
 
 def _env_section(records: list[dict]) -> list[str]:
@@ -512,7 +563,7 @@ def _guards(records: list[dict], cfg: dict, fixture_meta: dict, database_meta: d
     if len(fixture_hashes) > 1:
         ok = False
         lines.append(f"- ⚠️ **mixed fixture hashes** ({sorted(fixture_hashes)}) — the scoring "
-                     "authority (`plan_fixtures/*.yaml`) changed partway through.")
+                     "authority (the program's own database export) changed partway through.")
 
     if fixture_meta and not fixture_meta.get("verified", False):
         ok = False
@@ -874,7 +925,7 @@ def generate_summary(root: Path) -> Path:
 
     Schools that never ran (no `results/results_<slug>/runs_baseline.jsonl`) are silently
     absent from both views — this reports what exists, it does not claim the sweep was
-    complete. Cross-reference against `plan_fixtures/*.yaml` if you need to know what's
+    complete. Cross-reference against the program's own database export if you need to know what's
     missing.
     """
     school_dirs = _discover_school_dirs(root)
@@ -897,18 +948,14 @@ def generate_summary(root: Path) -> Path:
         per_school[slug] = recs
         pooled.extend(recs)
         meta_path = d / "meta_baseline.json"
-        fixture_rel = None
+        # The program's display name comes off the meta itself now — `write_meta` records
+        # `fixture.name`/`slug`/`program_id`. It used to be read back out of the fixture YAML
+        # `fixture.path` pointed at; there is no such file any more (see `fixtures.py`), and a
+        # meta written before this change simply falls back to the directory slug.
+        fixture_names[slug] = slug
         if meta_path.exists():
             meta = json.loads(meta_path.read_text())
-            fixture_rel = meta.get("fixture", {}).get("path")
-        # `meta.fixture` only carries `path`/`hash`/etc, not the program's own display name (see
-        # `runner.write_meta`) — read it straight off the fixture YAML `path` points at.
-        fixture_names[slug] = slug
-        if fixture_rel:
-            fixture_path = root / "plan_fixtures" / fixture_rel
-            if fixture_path.exists():
-                program = (yaml.safe_load(fixture_path.read_text()) or {}).get("program") or {}
-                fixture_names[slug] = program.get("name", slug)
+            fixture_names[slug] = meta.get("fixture", {}).get("name") or slug
 
     if not pooled:
         raise SystemExit(
@@ -967,7 +1014,56 @@ def generate_summary(root: Path) -> Path:
             lines.append(f"| `{slug}` | {program} | " + " | ".join(cells) + " |")
         lines.append("")
 
-    lines += ["## 3. Mode C — retry to convergence, across schools", ""]
+    # QA AND EXPLAIN, which this file reported on for the single-school view and never here —
+    # so the cross-school summary described a planner and stayed silent about the half of the
+    # product that answers questions.
+    #
+    # THE TWO POOL DIFFERENTLY, and saying so matters more than the tables:
+    #
+    #   QA      `questions.yaml` is ONE fixed bank, identical for every program. Pooling it
+    #           across schools does not broaden coverage — it re-runs the same items once per
+    #           school, so the pooled number is the same questions with more replicates. Read
+    #           it as a stability check on those items, never as "tested on N programs".
+    #   EXPLAIN genuinely varies by school: each program produces its own deterministic plan,
+    #           so a model is explaining a different artefact every time. This one IS a
+    #           cross-program measurement, and the per-school grid below is where a model that
+    #           only explains CS well shows up.
+    lines += ["## 3. Question answering and explanation", "",
+              "Pooled across every school. Note the asymmetry: the QA bank is one fixed set of "
+              "questions repeated per school (more replicates, not more coverage), while "
+              "explain runs against each program's own plan and therefore does widen with "
+              "every school added.", ""]
+    qa_lines = _qa_section(pooled)
+    explain_lines = _explain_section(pooled)
+    lines += qa_lines or ["_No QA records in any school's results._", ""]
+    lines += explain_lines or ["_No explain records in any school's results._", ""]
+
+    if explain_lines:
+        explain_models = sorted({r["model"] for r in pooled if r.get("stage") == "explain"})
+        lines += ["### Explain — per school", "",
+                  "A model explaining a different program's plan every row. `Auto-pass` is "
+                  "clean on both checks (no claim the plan contradicts, no unsupported "
+                  "entity); the parenthesised count is contradictions found.", "",
+                  "| School | Program | " + " | ".join(f"`{m}`" for m in explain_models) + " |",
+                  "|---|---|" + "---|" * len(explain_models)]
+        for slug, recs in sorted(per_school.items()):
+            cells = []
+            for model in explain_models:
+                model_recs = [r for r in recs if r.get("stage") == "explain"
+                              and r.get("model") == model and not r.get("error")]
+                if not model_recs:
+                    cells.append("—")
+                    continue
+                contradictions = sum(len(r.get("explain_flags") or []) for r in model_recs)
+                cells.append(
+                    f"{_rate([bool(r.get('explain_auto_pass')) for r in model_recs])} "
+                    f"({contradictions})"
+                )
+            lines.append(
+                f"| `{slug}` | {fixture_names.get(slug, slug)} | " + " | ".join(cells) + " |")
+        lines.append("")
+
+    lines += ["## 4. Mode C — retry to convergence, across schools", ""]
     lines += mode_c_cross_school_lines(school_dirs)
 
     summary_path = root / "results" / "summary.md"
