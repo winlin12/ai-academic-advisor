@@ -61,9 +61,12 @@ class GenerationResult:
 
 
 class LlamaCppClient:
-    def __init__(self, base_url: str, timeout_s: float = 600.0):
+    def __init__(self, base_url: str, timeout_s: float = 600.0,
+                 search_provider: Any = None):
         self.base_url = base_url.rstrip("/")
         self.timeout_s = timeout_s
+        # A callable `(query) -> str`, or None. See `_dispatch_tool` for why none ships here.
+        self.search_provider = search_provider
 
     def _request(self, method: str, path: str, payload: dict | None = None, timeout: float | None = None):
         req = urllib.request.Request(
@@ -129,6 +132,54 @@ class LlamaCppClient:
 
     # --- generation -----------------------------------------------------------------------
 
+    # --- tools ---------------------------------------------------------------------------
+    #
+    # WHY THE QA/EXPLAIN STAGES GET TOOLS AND THE PLAN STAGES DO NOT. A plan is built from one
+    # program's requirement rows, and the harness already knows exactly which rows those are —
+    # there is nothing for the model to go looking for, and a tool call would only add round
+    # trips to a stage whose latency is already the complaint. An advising QUESTION is the
+    # opposite: what the answer needs depends on what was asked, which is precisely the case
+    # where letting the model fetch beats guessing what to stuff in the prompt.
+    #
+    # THE SEARCH BACKEND IS NOT INCLUDED, and that is deliberate rather than unfinished. The
+    # obvious free endpoints (DuckDuckGo's HTML view, Bing's) disallow automated clients in
+    # robots.txt, which is the same line this project already declined to cross for Banner
+    # prerequisites. So `web_search` dispatches to whatever provider `config.yaml`'s
+    # `tools.web_search` names, and with none configured it returns a plain "search is
+    # unavailable" result — the model is told, in band, that the tool did not work, which is
+    # exactly what it would need to hear if a real provider timed out. Add a key and the
+    # capability is live with no code change.
+    WEB_SEARCH_TOOL: dict[str, Any] = {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": (
+                "Search the web for current information this system does not hold — "
+                "university policy pages, deadlines, department announcements. Use it when "
+                "the provided context does not answer the question. Do not use it for the "
+                "student's own record, which is private and not on the web."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "The search query."},
+                },
+                "required": ["query"],
+            },
+        },
+    }
+
+    def _dispatch_tool(self, name: str, arguments: dict[str, Any]) -> str:
+        if name != "web_search":
+            return f"error: no tool named {name!r}"
+        query = str(arguments.get("query") or "").strip()
+        if not query:
+            return "error: web_search needs a non-empty query"
+        return self.search_provider(query) if self.search_provider else (
+            "Search is unavailable: no provider is configured for this deployment. "
+            "Answer from the context you were given, and say plainly if it is not enough."
+        )
+
     def chat(
         self,
         system_prompt: str,
@@ -138,13 +189,48 @@ class LlamaCppClient:
         think: bool | None = None,
         response_format: dict | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        max_tool_calls: int = 3,
     ) -> GenerationResult:
-        """One streamed chat completion. Same message shape the app sends."""
+        """One streamed chat completion. Same message shape the app sends.
+
+        `tools`, when given, turns this into a bounded tool loop: the model may call a tool,
+        read its result and answer, up to `max_tool_calls` times. Streaming is kept for the
+        final answer so TTFT still means what it means everywhere else in this harness; the
+        tool-call turns are not streamed, because a tool call is not something a student is
+        watching arrive.
+        """
+        start_tools = time.perf_counter()
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        tool_calls_made: list[dict[str, Any]] = []
+        if tools:
+            messages, tool_calls_made, direct = self._run_tool_loop(
+                messages, tools, options, max_tool_calls)
+            # NO SECOND GENERATION WHEN NO TOOL WAS CALLED. The tool loop's first turn already
+            # produced a complete answer in that case, and re-asking for it streamed cost a
+            # whole extra generation per question — measured on gemma4-e4b's 39-item QA bank,
+            # median 1.1 s -> 7.6 s purely from offering tools nobody used. TTFT is unavailable
+            # for this path (the answer did not arrive as a stream) and is reported as None
+            # rather than as a fabricated number.
+            if direct is not None:
+                return GenerationResult(
+                    text=direct.get("text", "").strip(),
+                    ttft_s=None,
+                    total_s=time.perf_counter() - start_tools,
+                    eval_count=direct.get("completion_tokens"),
+                    prompt_eval_count=direct.get("prompt_tokens"),
+                    prompt_ms=None,
+                    predicted_ms=None,
+                    finish_reason=direct.get("finish_reason"),
+                    raw_final={"usage": direct.get("usage") or {}, "timings": {},
+                               "tool_calls": tool_calls_made},
+                    reasoning_text=direct.get("reasoning", "").strip(),
+                )
         payload: dict[str, Any] = {
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
+            "messages": messages,
             "stream": True,
             "stream_options": {"include_usage": True},
             "timings_per_token": True,
@@ -219,6 +305,65 @@ class LlamaCppClient:
             prompt_ms=timings.get("prompt_ms"),
             predicted_ms=timings.get("predicted_ms"),
             finish_reason=finish_reason,
-            raw_final={"usage": usage, "timings": timings},
+            raw_final={"usage": usage, "timings": timings,
+                       "tool_calls": tool_calls_made},
             reasoning_text="".join(reasoning_parts).strip(),
         )
+
+    def _run_tool_loop(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]],
+        options: dict[str, Any], max_tool_calls: int,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any] | None]:
+        """Let the model call tools until it stops asking or hits the cap.
+
+        NON-STREAMING, and bounded twice over: `max_tool_calls` turns, and every tool result is
+        appended as a normal `tool` message so the final streamed answer is generated from a
+        conversation the model can see in full. A model that loops asking for the same thing
+        runs out of turns and then answers with whatever it has, which is the behaviour a
+        student-facing deployment wants — never an unbounded agent.
+        """
+        made: list[dict[str, Any]] = []
+        for turn in range(max_tool_calls):
+            payload = {
+                "messages": messages,
+                "tools": tools,
+                "tool_choice": "auto",
+                "stream": False,
+                **{k: v for k, v in options.items() if k != "max_tokens"},
+                "max_tokens": options.get("max_tokens"),
+            }
+            with self._request("POST", "/v1/chat/completions", payload) as resp:
+                body = json.loads(resp.read().decode(errors="replace"))
+            choice = (body.get("choices") or [{}])[0]
+            message = choice.get("message") or {}
+            calls = message.get("tool_calls") or []
+            if not calls:
+                # Answered outright. Hand the text back so the caller can skip the streamed
+                # turn entirely — see `chat`'s `direct` branch.
+                usage = body.get("usage") or {}
+                return messages, made, {
+                    "text": message.get("content") or "",
+                    "reasoning": message.get("reasoning_content") or "",
+                    "finish_reason": choice.get("finish_reason"),
+                    "completion_tokens": usage.get("completion_tokens"),
+                    "prompt_tokens": usage.get("prompt_tokens"),
+                    "usage": usage,
+                }
+            messages.append({k: v for k, v in message.items() if k in
+                             ("role", "content", "tool_calls")})
+            for call in calls:
+                function = call.get("function") or {}
+                name = str(function.get("name") or "")
+                try:
+                    arguments = json.loads(function.get("arguments") or "{}")
+                except json.JSONDecodeError:
+                    arguments = {}
+                result = self._dispatch_tool(name, arguments)
+                made.append({"name": name, "arguments": arguments,
+                             "result_chars": len(result)})
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.get("id") or name,
+                    "content": result,
+                })
+        return messages, made, None

@@ -33,7 +33,7 @@ run:
   # `parallel > 1` includes queue time and is not comparable to a serial run's.
   parallel: 1
   n_gpu_layers: 999
-  n_cpu_moe: 7
+  n_cpu_moe: 0
   cache_type_k: "q8_0"
   cache_type_v: "q8_0"
   temperature: 0.15
@@ -48,7 +48,37 @@ run:
   # being marked down for a budget rather than for their writing. QA answers are short and
   # stay on `max_output_tokens`.
   max_explain_tokens: 2048
-  max_plan_tokens: 2048
+  # STAGE 1 of Mode B/C (course selection). Its output is one line per requirement group with
+  # a handful of codes — far shorter than a schedule — but a program with 35 groups still needs
+  # room to name them all, and a selection truncated halfway through is scored as a coverage
+  # failure that is really a budget failure.
+  # How many semantic matches Mode B/C's retrieval adds on top of the exact per-course lookup.
+  # 12 keeps the retrieved block to roughly a tenth of the catalog dump it replaced; the exact
+  # half is unbounded because every course being placed must appear.
+  rag_top_k: 12
+  # REASONING BUDGET for the advising stages (QA, explain). 0 = servers launch with
+  # `--reasoning off` exactly as before and the stages ask for nothing. Above 0 = every server
+  # launches with that budget and QA/explain request reasoning per call, while the plan stages
+  # keep asking for it OFF (they are grammar-constrained JSON and a reasoning channel there
+  # only starves the output — the muse-glimmer failure, see that entry's history).
+  # This is a launch-time switch because a per-request kwarg cannot undo `--reasoning off`.
+  #
+  # BACK TO 0, 2026-08-14, on wall clock. At 1024 the QA stage went from ~1.1 s to ~8.2 s per
+  # question on gemma4-e4b (~568 output tokens for a ~520-character answer), and QA is 39
+  # questions x 7 models x 16 programs. Reasoning is worth re-enabling for a targeted
+  # experiment on the advising stages — it is not worth paying for on every question of a full
+  # sweep before there is any evidence it changes the answers.
+  # ABOVE 0 AGAIN, because Mode C needs it: reasoning has to be enabled at LAUNCH for any
+  # stage to request it, and Mode C is defined as "Mode B with thinking forced on". The
+  # advising stages do NOT ride along — see `advising_thinking` below — so this costs nothing
+  # outside Mode C.
+  reasoning_budget: 1024
+  # Whether QA and explain also request reasoning. Off: at 1024 the QA stage went from ~1.1 s
+  # to ~8.2 s per question on gemma4-e4b for 39 questions x 7 models x 16 programs, with no
+  # evidence yet that the answers improved. Turn it on for a targeted advising experiment,
+  # not for a full sweep.
+  advising_thinking: false
+  max_plan_tokens: 4096
   runs_per_pair: 1            # N replicates per (model x item) — variance, not luck
   warmup_discard: 2           # generations per model discarded before measurement
   request_timeout_s: 600
@@ -56,7 +86,19 @@ run:
   explain_question: "Why is my plan sequenced this way, and where is it risky?"
   planning_terms: [fall, spring]
   save_transcripts: true
-  default_tasks: [plan_a, plan_b, qa, explain, converge]
+  # `plan_b` PRODUCES BOTH MODE B AND MODE C (2026-08-17). Mode B is the model's first,
+  # unaided attempt; Mode C is where that same attempt ends up after the validator's findings
+  # and `repair_passes` more tries. One generation serves both, so there is no separate task
+  # for the retry loop and no `converge` arm any more.
+  # `plan_b_thinking` IS BACK OUT of the default sweep (2026-08-21) — MEASURED AND IT DID NOT
+  # PAY. See the `thinking:` block for the numbers. It remains available as
+  # `--tasks plan_b_thinking` for a targeted re-test; it is simply not worth 3-4x wall clock
+  # on every program of every sweep.
+  default_tasks: [plan_a, plan_b, qa, explain]
+  # EXTRA attempts after the first. 2 gives three total, which is the ceiling worth paying for:
+  # measured on the old retry loop, coverage moved on attempts 2 and 3 (0.44 -> 0.67 -> 0.89)
+  # and flattened after.
+  repair_passes: 2
 
 # --- SPECULATIVE DECODING ------------------------------------------------------------------
 # A 0.8B draft model proposes tokens and the model under test verifies them in one batched pass
@@ -103,8 +145,8 @@ speculative:
   n_max: 4          # tokens drafted per verification pass
   n_min: 0
   p_min: 0.75       # stop drafting when the draft model's own confidence drops below this
-  cache_type_k: "q8_0"
-  cache_type_v: "q8_0"
+  cache_type_k: "f16"
+  cache_type_v: "f16"
 
   # ALL 24 DRAFT LAYERS ON ONE CARD. The draft is worthless if it is itself slow — a partially
   # offloaded draft would add CPU-speed latency to every verification pass. Pinned to CUDA0 so
@@ -113,6 +155,25 @@ speculative:
   device_draft: "CUDA0"
 
 models:
+  # ORDER IS RUN ORDER. `runner.run_model` walks this list top to bottom within every program,
+  # so the first entry is the one that produces results soonest — which is what you want for a
+  # model you are actively evaluating, on a sweep that may be cut short.
+  # Qwen 3.8 27B (unsloth GGUF, Q4_K_M). A SEPARATE ENTRY FROM qwen3.6-27b, deliberately — the
+  # two are different weights at the same size and the head-to-head is the point. Nothing in
+  # this harness infers a model's identity from its name, so both simply coexist and every
+  # table gets a row for each.
+  #
+  # `draft` is UNSET until the vocabulary is verified. The 3.5/3.6 dense entries share the
+  # qwen3.5-0.8b draft (vocab 248320); if 3.8 kept that vocabulary it can draft too, and
+  # `run.py check` prints the comparison without launching a server. A mismatched draft does
+  # not degrade gracefully — llama.cpp aborts at load — so it is opt-in after the check rather
+  # than assumed from the family name.
+  - name: "qwen3.8-27b"
+    gguf: "qwen3.8-27b/Qwen3.8-27B-UD-Q6_K_M.gguf"
+    bracket: server
+    think: false
+    draft: true
+
 
   - name: "qwen3.6-27b"
     gguf: "qwen3.6-27b/Qwen3.6-27B-Q4_K_M.gguf"
@@ -146,7 +207,7 @@ models:
     gguf: "qwen3.6-35b-a3b/Qwen_Qwen3.6-35B-A3B-Q4_K_M.gguf"
     bracket: server
     think: false
-    n_cpu_moe: 9
+    n_cpu_moe: 0
     # Same Qwen3.5/3.6 vocabulary as the dense entries above. This is the model that stands to
     # gain most from drafting: its experts are split across CPU RAM, so each verified token is
     # unusually expensive and amortizing four of them over one pass is worth more here.
@@ -171,27 +232,15 @@ models:
   # The gguf is still on disk — re-add an entry with `reasoning_overhead_tokens: 1200` to
   # revisit it if llama.cpp gains grammar support for this chat format.
 
-  # NVIDIA Nemotron 3.5 Lightning, 30B A3B (unsloth GGUF). Hybrid Mamba/Transformer MoE
-  # (`nemotron_h_moe`) — supported by this llama.cpp build (arch present in llama-arch.cpp as
-  # of 4801e3c, 2026-08-10). A3B = ~3B active parameters per token, so it decodes like a small
-  # model while holding a 30B parameter budget, which is the same bet `qwen3.6-35b-a3b` makes.
-  #
-  # NO DRAFT: its vocabulary is its own, and a mismatched draft aborts the server at load (see
-  # the `speculative:` block above).
-  #
-  # `think`/`reasoning_overhead_tokens` are UNVERIFIED until the first run — if it turns out to
-  # have a reasoning channel it cannot switch off, it will show the muse-glimmer signature
-  # above (empty `content`, `finish_reason: length`) and wants the same allowance.
-  - name: "nemotron3.5-lightning-30b-a3b"
-    gguf: "nemotron3.5-lightning-30b-a3b/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-UD-Q4_K_M.gguf"
-    bracket: server
-    think: false
-    # 25.2 GB of weights against 20 GB of VRAM (12 + 8), so more of the expert stack lives in
-    # CPU RAM than any other model here — at n_cpu_moe 7 (the global default) the load died
-    # with `cudaMalloc failed` trying to put 9.5 GB on the 8 GB card. Pinning n_cpu_moe means
-    # hand-sizing the split too; see the auto-fit note in server.build_argv.
-    n_cpu_moe: 15
-    extra_args: ["--tensor-split", "0.70,0.30"]
+  # nemotron3.5-lightning-30b-a3b REMOVED 2026-08-14, after one sweep. It loaded and ran
+  # (25.2 GB with `n_cpu_moe: 42`, ~76 tok/s despite most of its expert stack in system RAM —
+  # the A3B design working as advertised), so this is not a compatibility removal. It was
+  # simply last or near-last on the numbers that matter: 11% Mode B viable and 63% requirement
+  # coverage on the fused-prompt sweep, against 34%/86% for the best model in the same run.
+  # Carrying it costs ~25 GB of disk and a model's worth of wall clock per sweep for a row
+  # nobody reads. The gguf stays on disk; re-add an entry with the same `n_cpu_moe`/
+  # `--tensor-split` to revisit it.
+
 paths:
   questions: "questions.yaml"
   results_dir: "results"
@@ -340,7 +389,13 @@ convergence:
   # all (see `harness/convergence.locked_slots_path_for`), keeping a variant that measures a
   # non-shippable behavior stopped being worth the added fixture-authoring cost per school.
   # feedback/blind remain — both mirror something a real revise-plan turn can actually do.
-  enabled_variants: [feedback, blind]
+  # ONE ARM, 2026-08-13. `blind` / `feedback` / `repair` were three ways of nudging a single
+  # fused call that had to choose and sequence at once; with selection split into its own stage,
+  # every Mode C pass is the same thing — show the validator's findings, let the model add,
+  # remove or move courses. Two arms that behave identically would just buy the same number
+  # twice. The field stays so the record shape and the report's per-variant tables are
+  # unchanged.
+  enabled_variants: [repair]
 
   # PER TEST CASE, not shared across the batch. A shared budget makes each case's result depend
   # on how slow the previous ones were, which is not a property of the model. 600 s sits in the
@@ -398,7 +453,7 @@ convergence:
   # estimate how often a good plan appears by luck, so identical draws are expected and
   # early-stopping on them would truncate the distribution being measured. `repair` dropped
   # 2026-08-08 with the variant itself — see `enabled_variants` above.
-  plateau_variants: [feedback]
+  plateau_variants: [repair]
 
   seed_stride: 1000
   temperature_step: 0.05
@@ -445,4 +500,31 @@ decision:
 # truncated plan would be an artifact of too-small a token ceiling, not a finding about
 # reasoning itself.
 thinking:
+  # ===========================================================================================
+  # MEASURED 2026-08-21 AT budget_tokens 2048, 4 programs x 7 models x 5 scenarios (140
+  # model-scenarios per arm), thinking ON vs OFF on the identical prompt/schema/scorer.
+  # Every model DID reason (3686-4782 chars average), so none of this is a model ignoring the
+  # instruction. Reverted to 512 and out of `default_tasks` on the result:
+  #
+  #   REASONING DOES NOT PRODUCE A MORE BALANCED SCHEDULE. Mean credit spread got WORSE on 5 of
+  #   7 models. On qwen3.8-27b — the model the hypothesis was about, which front-loads early
+  #   terms and empties the late ones — spread went 7.5 -> 11.0 across 20 scenarios. One
+  #   scenario improved dramatically (fresh-start 12 -> 5) and did not survive aggregation.
+  #   This REPLICATES the earlier finding at a smaller budget (see `runner._run_staged_plan`),
+  #   so it is now measured twice, at 512 and at 2048.
+  #
+  #   WHAT IT DID BUY was viability, 65 -> 86 of 140 — but almost entirely on two models that
+  #   were failing at baseline: qwen3.6-27b (3 -> 16 of 20) and qwen3.6-35b-a3b (7 -> 13).
+  #   The three gemma entries gained exactly ZERO, and no model that was already succeeding
+  #   improved. That is a rescue mechanism for a weak baseline, not a planning improvement,
+  #   and the repair loop already buys more of it for less (0.44 -> 0.89 coverage).
+  #
+  #   COST: 3-4x wall clock, every program, every model.
+  #
+  #   ⚠ CAVEAT ON RE-READING THESE NUMBERS: `credit_spread` is max-min across NON-EMPTY
+  #   semesters, and thinking frequently emptied the final term (semesters_used dropped on 5 of
+  #   the first 10 model-programs). Compressing into fewer terms IMPROVES the spread metric
+  #   while making the tail worse — so the balance numbers above, unflattering as they are,
+  #   still flatter the thinking arm. Fix the metric before re-running this experiment.
+  # ===========================================================================================
   budget_tokens: 512

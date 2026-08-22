@@ -193,7 +193,7 @@ def search(
     that states it — "University Core Requirements" is close to identical in ~295 programs'
     chunks. A caller wanting only courses back who post-filtered a plain top-k would find
     those ~295 near-duplicates crowding out every course chunk before ranking ever reached
-    one — see ``plan_suggestions.py``, which hit exactly that.
+    one — the since-removed prose-requirement course suggester hit exactly that.
 
     A second, sharper version of the same trap survives even with the filter IN the query:
     pgvector's HNSW index answers ``ORDER BY <=>`` by walking the graph and examining only

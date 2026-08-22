@@ -1,41 +1,38 @@
-"""MODE C's tables and estimator, folded into ``report.py``'s single ``results/report.md``.
+"""Mode C's report: what the repair passes bought over the model's first attempt.
 
-Kept in its own MODULE because the record schema is different — Mode A/B records are pass/fail
-per plan, a Mode C record is a SURVIVAL OBSERVATION: a case either converged at attempt k /
-second t, or it is right-censored at the point the clock or the attempt budget ran out. Pooling
-those into the same "% viable" table would either throw away the censored cases or count them
-as failures, and both distort the answer in the same direction. So this module has its own
-tables and its own estimator. It does NOT get its own report file: `mode_c_section()` returns
-lines for `report.generate_report` to splice in as one more numbered section, at `###` nesting,
-because the user should not have to open two documents to read one evaluation run.
+MODE C IS MODE B PLUS FEEDBACK (2026-08-17), and both come out of ONE generation pass —
+`plan_mode_b` is attempt 1 exactly as the model produced it unaided, `plan_mode_c` is where
+that same plan ended up after the validator reported what was wrong and the model had up to
+`run.repair_passes` more tries. So every arrow in these tables is one plan before and after,
+not two independent samples of the same prompt, which is what makes the delta an effect.
 
-THE ESTIMATOR. `median attempts to converge` over censored data is not `median(observed
-values)`. A case censored at attempt 7 is evidence that the model needed MORE than 7, and
-dropping it biases the median down (the slow cases are exactly the ones that get censored),
-while scoring it as 7 biases it up in a different way. The Kaplan-Meier product-limit estimator
-is the standard instrument for this and it is about twenty lines with no dependencies, so it is
-implemented here rather than approximated. When too few cases converge for the survival curve
-to reach 0.5, the median is genuinely UNDEFINED and is printed as `>N` rather than invented.
+WHAT THE VALIDATOR REPORTS, and the third item is new: hard violations, unmet requirements,
+and uneven credit spread. Spread was invisible to the loop until now, which made the repair
+passes unable to fix the one defect they were most often needed for — a plan can be legal and
+fully covered while handing the student eighteen credits one term and three the next.
 
-THROUGHPUT IS PRINTED, AND FENCED. `tok/s` sits in its own column with a warning above the
-table, because wall-clock convergence time is the product of reasoning quality and hardware
-speed and this box's numbers are specific to one card. A model that converges in fewer attempts
-but more seconds is a better planner on a slower path; the two columns must never be collapsed.
+TWO EXPERIMENTS THIS FILE HAS OUTLIVED, both worth remembering:
+
+  * A RETRY-TO-CONVERGENCE mode with its own prompt variants (blind / feedback / repair) on
+    top of a deterministic auto-repair pass. That was the right instrument when a single fused
+    call had to choose courses AND sequence them and usually failed at both; with selection
+    deterministic it had nothing left to repair. Its Kaplan-Meier estimator survives below,
+    because censoring is still the correct statistics for "attempts until an event, when some
+    cases never reach it".
+  * A REASONING ARM — Mode B with thinking forced on. Measured on qwen3.8-27b: ~2x latency for
+    mean credit spread 13.8 -> 14.4, over-ask 1.4 -> 1.6 and viability 5/5 -> 3/5. Feedback
+    earns its tokens on the same model and the same program; thinking did not.
 """
-
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from .convergence import CONVERGENCE_CRITERION_CAVEAT
 
-# This arm was briefly called Mode D while it was being built, and records written in that
-# window carry `plan_mode_d`. Both are read so a rename does not orphan a completed run. Note
-# `results_old8` also holds `plan_mode_c` rows from the REMOVED reference arm — they are a
-# different experiment entirely, and what keeps them out is the FILE, not the stage string:
-# this report only ever opens `runs_convergence.jsonl`.
+# Stage names the survival helpers accept. `plan_mode_d` is here only so an archived run from
+# the two days the retry loop had its own mode still renders rather than raising.
 _STAGES = ("plan_mode_c", "plan_mode_d")
 
 
@@ -44,9 +41,6 @@ def _load(path: Path) -> list[dict[str, Any]]:
         return []
     out = []
     for line in path.read_text().splitlines():
-        line = line.strip()
-        if not line:
-            continue
         try:
             out.append(json.loads(line))
         except json.JSONDecodeError:
@@ -54,7 +48,150 @@ def _load(path: Path) -> list[dict[str, Any]]:
     return out
 
 
-# --- Kaplan-Meier ------------------------------------------------------------------------------
+def _rate(values: list[bool]) -> str:
+    return f"{(sum(1 for v in values if v) / len(values)):.0%}" if values else "—"
+
+
+def _mean(values: list[Any]) -> float | None:
+    nums = [float(v) for v in values if isinstance(v, (int, float))]
+    return sum(nums) / len(nums) if nums else None
+
+
+def _pairs(baseline: list[dict], mode_c: list[dict]) -> dict[str, dict[str, list[dict]]]:
+    """(model -> {"b": rows, "c": rows}) over the (model, scenario) pairs present in BOTH.
+
+    Restricted to pairs on purpose: a model whose Mode C run errored and whose Mode B run did
+    not would otherwise shift its own delta by dropping its hardest scenario from one side.
+    """
+    keyed_b = {(r.get("model"), r.get("scenario")): r for r in baseline
+               if r.get("stage") == "plan_mode_b" and not r.get("error")}
+    keyed_c = {(r.get("model"), r.get("scenario")): r for r in mode_c
+               if r.get("stage") == "plan_mode_c" and not r.get("error")}
+    shared = sorted(set(keyed_b) & set(keyed_c))
+    out: dict[str, dict[str, list[dict]]] = {}
+    for key in shared:
+        bucket = out.setdefault(key[0], {"b": [], "c": []})
+        bucket["b"].append(keyed_b[key])
+        bucket["c"].append(keyed_c[key])
+    return out
+
+
+def _delta_table(pairs: dict[str, dict[str, list[dict]]]) -> list[str]:
+    lines = [
+        "| Model | Fixed by feedback | PLAN_VIABLE 1st → final | Coverage 1st → final | "
+        "Violations 1st → final | Spread 1st → final |",
+        "|---|---|---|---|---|---|",
+    ]
+    for model, sides in sorted(pairs.items()):
+        b, c = sides["b"], sides["c"]
+        # "Fixed by feedback" means a LATER attempt is the one that reached the report —
+        # which is `best_attempt`, not `converged_at`. Convergence is the strict bar (nothing
+        # left to report at all) and a plan can improve a great deal without reaching it.
+        improved = _rate([bool((r.get("best_attempt") or 1) > 1) for r in c])
+        vb, vc = _rate([bool(r.get("plan_viable")) for r in b]), _rate(
+            [bool(r.get("plan_viable")) for r in c])
+        cb, cc = _mean([r.get("requirement_coverage") for r in b]), _mean(
+            [r.get("requirement_coverage") for r in c])
+        nb, nc = _mean([len(r.get("violations") or []) for r in b]), _mean(
+            [len(r.get("violations") or []) for r in c])
+        sb, sc = _mean([r.get("credit_spread") for r in b]), _mean(
+            [r.get("credit_spread") for r in c])
+        cov = (f"{cb:.0%} → {cc:.0%}" if cb is not None and cc is not None else "—")
+        vio = (f"{nb:.1f} → {nc:.1f}" if nb is not None and nc is not None else "—")
+        sec = (f"{sb:.1f} → {sc:.1f}" if sb is not None and sc is not None else "—")
+        lines.append(f"| `{model}` | {improved} | {vb} → {vc} | {cov} | {vio} | {sec} |")
+    return lines
+
+
+def mode_c_lines(results: Path, tag: str = "convergence") -> list[str]:
+    """Mode C's section: what the repair passes bought over the model's first attempt.
+
+    BOTH SIDES COME OUT OF ONE FILE AND ONE GENERATION now — `plan_mode_b` is attempt 1 and
+    `plan_mode_c` is where it finished, so every pair below is literally the same plan before
+    and after feedback rather than two independent samples of the same prompt.
+    """
+    baseline = _load(results / "runs_baseline.jsonl")
+    mode_c = baseline
+    if not mode_c:
+        return ["_No Mode C records. Mode C is produced by the `plan_b` task — one pass "
+                "writes both — so a run with plan_b in its tasks has it._", ""]
+    pairs = _pairs(baseline, mode_c)
+    out = [
+        "Mode C is Mode B plus up to `run.repair_passes` revisions, each shown what the "
+        "validator found wrong — violations, unmet requirements, and now uneven credit spread. "
+        "Mode B is the first attempt of the same run, so each arrow is one plan before and "
+        "after feedback.",
+        "",
+    ]
+    if not pairs:
+        return out + ["_Mode C records exist but no (model, scenario) pair has both halves "
+                      "yet, so there is nothing to compare._", ""]
+    out += _delta_table(pairs)
+
+    cases = [r for r in mode_c if r.get("stage") == "plan_mode_c" and not r.get("error")]
+    if cases:
+        by_model: dict[str, list[dict]] = {}
+        for case in cases:
+            by_model.setdefault(case["model"], []).append(case)
+        out += ["", "**What the loop cost.** `Clean` is the share of cases the validator ran "
+                "out of complaints about — legal, fully covered AND evenly spread, which is a "
+                "stricter bar than PLAN_VIABLE above. `Kept attempt` is which attempt actually "
+                "reached this report, since the loop keeps its best state rather than its "
+                "last.", ""]
+        out += _effort_table(by_model)
+        out += _attempt_progress(cases)
+    out += ["", CONVERGENCE_CRITERION_CAVEAT, ""]
+    return out
+
+
+def mode_c_cross_school_lines(
+    school_dirs: list[tuple[str, Path]], tag: str = "convergence"
+) -> list[str]:
+    """The same paired comparison, pooled across every school in the sweep."""
+    baseline: list[dict] = []
+    for slug, directory in school_dirs:
+        for rec in _load(directory / "runs_baseline.jsonl"):
+            rec["scenario"] = f"{slug}:{rec.get('scenario')}"
+            baseline.append(rec)
+    mode_c = baseline
+    if not mode_c:
+        return ["_No Mode C records for any school._", ""]
+    pairs = _pairs(baseline, mode_c)
+    out = [
+        "First attempt vs. final, pooled across every school. Scenario keys are prefixed with "
+        "the "
+        "school so a pair is only ever matched within its own program.",
+        "",
+    ]
+    if not pairs:
+        return out + ["_No (model, scenario) pair has both halves yet._", ""]
+    out += _delta_table(pairs)
+    cases = [r for r in mode_c if r.get("stage") == "plan_mode_c" and not r.get("error")]
+    if cases:
+        by_model: dict[str, list[dict]] = {}
+        for case in cases:
+            by_model.setdefault(case["model"], []).append(case)
+        out += ["", "**What the loop cost, pooled.** Same columns as a single program's "
+                "report; `Clean` is the strict bar (no findings left at all).", ""]
+        out += _effort_table(by_model)
+    return out + ["", CONVERGENCE_CRITERION_CAVEAT, ""]
+
+# =============================================================================================
+# EFFORT — what the repair loop cost, and which attempt actually paid
+# =============================================================================================
+#
+# CENSORING IS STILL THE STATISTICS. A case that used its whole budget without going clean has
+# not shown that it needs `repair_passes + 1` attempts; it has shown it needs MORE than that.
+# Dropping those cases biases the median down (the stubborn ones are exactly the ones that get
+# censored) and scoring them at the budget biases it up, so `attempts to clean` is a
+# Kaplan-Meier quantile over right-censored observations and prints as `>3` when the estimator
+# is undefined past the budget. This machinery is inherited from the retry experiment that used
+# to be its own mode; only what it reads changed.
+#
+# `KEPT ATTEMPT` IS THE NEW COLUMN AND THE MOST DIAGNOSTIC ONE. The loop reports its BEST state,
+# not its last (see `runner._run_staged_plan`'s guard), so this is the attempt whose plan
+# actually reached the report. Mean 1.0 means every revision was a waste of tokens; a mean
+# above 1 with a low clean rate means the passes are helping without finishing the job.
 
 
 def km_quantile(
@@ -87,485 +224,47 @@ def km_quantile(
     return None, False
 
 
-def _fmt_quantile(value: float | None, defined: bool, cases: list[dict], key: str,
-                  unit: str = "") -> str:
-    """A number when the estimator has one, an honest lower bound when it does not."""
-    if defined and value is not None:
-        return f"{value:g}{unit}"
-    if not cases:
-        return "—"
-    # Undefined: report the largest thing we actually observed, marked as a bound.
-    bound = max(c[key] for c in cases)
-    return f">{bound:g}{unit}"
-
-
-# --- tables -------------------------------------------------------------------------------------
-
-
-def _variant_rows(records: list[dict], variant: str) -> dict[str, list[dict]]:
-    by_model: dict[str, list[dict]] = {}
-    for rec in records:
-        if rec.get("stage") not in _STAGES or rec.get("variant") != variant:
-            continue
-        by_model.setdefault(rec["model"], []).append(rec)
-    return by_model
-
-
-def _model_stats(cases: list[dict]) -> dict[str, Any]:
-    # `expect_unsatisfiable` scenarios are excluded from the headline exactly as in Mode A/B:
-    # mi-tight-horizon cannot cover its requirements, and while it CAN converge under this
-    # mode's looser criterion, mixing a scenario with a different ceiling into the same median
-    # describes neither.
-    scored = [c for c in cases if not c.get("expect_unsatisfiable")]
-    attempts_obs = [
-        (float(c["attempts_to_converge"] if c["converged"] else c["attempts_used"]),
-         bool(c["converged"]))
-        for c in scored
-    ]
-    wall_obs = [(float(c["wall_clock_s"]), bool(c["converged"])) for c in scored]
-
-    a50, a50ok = km_quantile(attempts_obs, 0.5)
-    a90, a90ok = km_quantile(attempts_obs, 0.9)
-    w50, w50ok = km_quantile(wall_obs, 0.5)
-    w90, w90ok = km_quantile(wall_obs, 0.9)
-
-    timeouts = [c for c in scored if c.get("censored")]
-    tok = [c["tokens_per_s"] for c in scored if c.get("tokens_per_s")]
-    return {
-        "n": len(scored),
-        "converged": sum(1 for c in scored if c["converged"]),
-        "attempts_p50": _fmt_quantile(a50, a50ok, scored, "attempts_used"),
-        "attempts_p90": _fmt_quantile(a90, a90ok, scored, "attempts_used"),
-        "wall_p50": _fmt_quantile(w50, w50ok, scored, "wall_clock_s", "s"),
-        "wall_p90": _fmt_quantile(w90, w90ok, scored, "wall_clock_s", "s"),
-        "timeouts": len(timeouts),
-        "timeout_rate": (len(timeouts) / len(scored)) if scored else 0.0,
-        "censor_reasons": {
-            reason: sum(1 for c in timeouts if c.get("censor_reason") == reason)
-            for reason in sorted({c.get("censor_reason") for c in timeouts} - {None})
-        },
-        # TOTAL WALL-CLOCK OVER EVERY CASE, including the censored ones and including the
-        # by-design-unsatisfiable scenario. This is the apples-to-apples number: "what does it
-        # cost to put this model through the whole suite." A median hides the cases that ran to
-        # the attempt cap, and those are exactly where a weak model spends its time — a model
-        # that converges fast on six scenarios and grinds ten attempts on two can look quicker
-        # on the median while costing more end to end.
-        "total_wall_s": sum(c["wall_clock_s"] for c in cases),
-        "total_attempts": sum(c["attempts_used"] for c in cases),
-        "s_per_attempt": (
-            round(sum(c["wall_clock_s"] for c in cases)
-                  / max(1, sum(c["attempts_used"] for c in cases)), 1)),
-        "tok_s": round(sum(tok) / len(tok), 1) if tok else None,
-        "strict": sum(1 for c in scored if c.get("converged_strict")),
-        "degenerate": sum(1 for c in scored if c.get("degenerate_convergence")),
-        "locked_alterations": sum(c.get("locked_alterations_total", 0) for c in scored),
-    }
-
-
-def _table(by_model: dict[str, list[dict]]) -> list[str]:
-    if not by_model:
-        return ["_No cases recorded for this variant._", ""]
+def _effort_table(by_model: dict[str, list[dict]]) -> list[str]:
     lines = [
-        "| model | n | converged | attempts p50 | attempts p90 | wall p50 | wall p90 | "
-        "timeouts | tok/s | strict | degenerate |",
-        "|---|---|---|---|---|---|---|---|---|---|---|",
+        "| Model | Cases | Clean | Attempts to clean (p50 / p90) | Kept attempt | "
+        "Improved by feedback | Median s | Tokens/s |",
+        "|---|---|---|---|---|---|---|---|",
     ]
-    rows = []
-    for model, cases in by_model.items():
-        stats = _model_stats(cases)
-        rows.append((stats, model))
-
-    # Ranked by how often they converge at all, then by median attempts. Not by wall clock —
-    # that is the hardware-confounded axis and it must not decide the ordering.
-    #
-    # Sorting on `attempts_p50` DIRECTLY would sort its formatted string, putting "10" ahead of
-    # "4" and ">6" last regardless of magnitude. The sort key is numeric, and an undefined
-    # median (">N") sorts after every real one, which is correct: not knowing the median because
-    # too few cases converged is worse than any median you could actually measure.
-    def rank(stats: dict[str, Any]) -> tuple:
-        text = str(stats["attempts_p50"])
-        undefined = text.startswith(">")
-        try:
-            value = float(text.lstrip(">"))
-        except ValueError:
-            value, undefined = float("inf"), True
-        return (-stats["converged"], undefined, value)
-
-    rows.sort(key=lambda pair: rank(pair[0]))
-    for stats, model in rows:
+    for model, cases in sorted(by_model.items()):
+        obs = [(float(c.get("attempts_used") or 0), bool(c.get("converged_at"))) for c in cases]
+        p50, ok50 = km_quantile(obs, 0.5)
+        p90, ok90 = km_quantile(obs, 0.9)
+        budget = max((c.get("attempts_used") or 0) for c in cases)
+        kept = [c.get("best_attempt") for c in cases if c.get("best_attempt")]
+        improved = [bool((c.get("best_attempt") or 1) > 1) for c in cases]
+        secs = [c.get("total_s") for c in cases if c.get("total_s")]
+        tps = [c["eval_count"] / c["total_s"] for c in cases
+               if c.get("eval_count") and c.get("total_s")]
         lines.append(
-            f"| {model} | {stats['n']} | {stats['converged']}/{stats['n']} | "
-            f"{stats['attempts_p50']} | {stats['attempts_p90']} | "
-            f"{stats['wall_p50']} | {stats['wall_p90']} | "
-            # The BREAKDOWN, not just the count: "plateau x5" and "timeout x5" are different
-            # findings — one is a model that stopped improving, the other a model too slow to
-            # finish — and a single "censored" number cannot tell them apart.
-            f"{stats['timeouts']} ({stats['timeout_rate']:.0%})"
-            + (" " + ", ".join(f"{k} x{v}" for k, v in stats["censor_reasons"].items())
-               if stats["censor_reasons"] else "")
-            + " | "
-            f"{stats['tok_s'] if stats['tok_s'] is not None else '—'} | "
-            f"{stats['strict']}/{stats['n']} | {stats['degenerate']} |"
+            f"| `{model}` | {len(cases)} "
+            f"| {_rate([bool(c.get('converged_at')) for c in cases])} "
+            f"| {(f'{p50:.0f}' if ok50 else f'>{budget:.0f}')} / "
+            f"{(f'{p90:.0f}' if ok90 else f'>{budget:.0f}')} "
+            f"| {(f'{_mean(kept):.1f}' if kept else '—')} "
+            f"| {_rate(improved)} "
+            f"| {(f'{_mean(secs):.0f}' if secs else '—')} "
+            f"| {(f'{_mean(tps):.1f}' if tps else '—')} |"
         )
-    lines.append("")
     return lines
 
 
-def _total_time_table(records: list[dict]) -> list[str]:
-    """END-TO-END COST PER MODEL. The apples-to-apples column.
-
-    Every other timing number here is conditional on something — a median is over the cases
-    that converged, a p90 is over a censored distribution. This one is not: it is the total
-    wall-clock to put a model through the entire suite, censored cases and all. It is the
-    number that answers "what does running this model actually cost", and it is the honest way
-    to compare two models of the same family (gemma4-26b against gemma4-e4b) because both sat
-    on the same card, ran the same scenarios and were held to the same criterion.
-
-    It still is NOT a quality ranking, and the two columns beside it say why: a model that
-    converges on every scenario in two attempts can lose this column to one that gives up
-    early. Read `converged` first, `total` second.
-    """
-    by_model: dict[str, list[dict]] = {}
-    for rec in records:
-        if rec.get("stage") not in _STAGES:
-            continue
-        by_model.setdefault(rec["model"], []).append(rec)
-    if not by_model:
+def _attempt_progress(cases: list[dict]) -> list[str]:
+    """Per-attempt coverage and spread, so a loop that is making progress is distinguishable
+    from one resampling noise. Truncated — this is a trace, not a table to read end to end."""
+    rows = [c for c in cases if (c.get("attempts") or [])][:12]
+    if not rows:
         return []
-
-    rows = []
-    for model, cases in by_model.items():
-        stats = _model_stats(cases)
-        rows.append((stats["total_wall_s"], model, stats, len(cases)))
-    rows.sort()
-
-    out = [
-        "### Total time to run every case",
-        "",
-        "**The apples-to-apples number.** Total wall-clock for the whole suite per model — "
-        "every scenario, every attempt, censored cases included. Same card, same scenarios, "
-        "same criterion, so two models of one family are directly comparable here.",
-        "",
-        "| model | cases | converged | total time | total attempts | s/attempt | tok/s |",
-        "|---|---|---|---|---|---|---|",
-    ]
-    for total, model, stats, n in rows:
-        mins = total / 60.0
-        out.append(
-            f"| {model} | {n} | {stats['converged']}/{stats['n']} | "
-            f"**{total:.0f}s** ({mins:.1f} min) | {stats['total_attempts']} | "
-            f"{stats['s_per_attempt']}s | "
-            f"{stats['tok_s'] if stats['tok_s'] is not None else '—'} |"
-        )
-    grand = sum(r[0] for r in rows)
-    out += [
-        "",
-        f"Whole run: **{grand:.0f}s ({grand / 60:.1f} min)** across "
-        f"{sum(r[3] for r in rows)} case(s).",
-        "",
-        "> `total time` is cost, not quality. A model that gives up early can post a lower "
-        "total than one that converges on everything — read it next to `converged`, and read "
-        "`s/attempt` to separate 'fewer attempts' from 'faster attempts'.",
-        "",
-    ]
-    return out
-
-
-def _ratchet_guard(by_model: dict[str, list[dict]]) -> list[str]:
-    """The repair variant's core claim, checked rather than asserted.
-
-    `frozen_by_attempt` is the count of validated placements carried into the next attempt. It
-    must never DECREASE — that is what "good work is never lost" means, and it is the whole
-    difference between this variant and the other two. If it falls, the freeze has a bug and
-    every number in the table above is describing something other than a ratchet. Printing the
-    check is cheaper than trusting it.
-    """
-    violations: list[str] = []
-    removed = frozen = cases = 0
-    unrepairable: list[str] = []
-    for model, records in by_model.items():
-        for rec in records:
-            trace = rec.get("frozen_by_attempt") or []
-            releases = rec.get("released_by_attempt") or []
-            cases += 1
-            removed += rec.get("repair_removed_total", 0)
-            if trace:
-                frozen = max(frozen, trace[-1])
-            # A fall is legitimate exactly when a deadlock release happened on that step.
-            # Anything else means the freeze lost validated work, which is the one thing this
-            # variant promises not to do.
-            # INDEX i+1, NOT i. Both lists are appended once per attempt, and within an attempt
-            # the release happens BEFORE the freeze — so the drop from trace[i] to trace[i+1] is
-            # explained by the release recorded on attempt i+1. Reading releases[i] here flagged
-            # every legitimate deadlock break as lost work.
-            for i, (a, b) in enumerate(zip(trace, trace[1:])):
-                if b < a and not (i + 1 < len(releases) and releases[i + 1]):
-                    violations.append(
-                        f"{model}/{rec['scenario']}: frozen fell {a} -> {b} "
-                        f"with no deadlock release")
-            for item in rec.get("repair_unrepairable") or []:
-                unrepairable.append(f"{model}/{rec['scenario']}: {item}")
-
-    out = ["**Ratchet check.** "]
-    if violations:
-        out = [
-            f"> ❌ **The ratchet broke in {len(violations)} case(s)** — validated placements "
-            f"were lost between attempts, so this variant is not doing what it claims:", "",
-        ] + [f"> - {v}" for v in violations[:10]] + [""]
-    else:
-        released = sum(r.get("repair_released_total", 0)
-                       for rs in by_model.values() for r in rs)
-        out = [
-            f"**Ratchet holds:** validated placements never decreased across any of {cases} "
-            f"case(s) except where a deadlock release explains it. {removed} placement(s) were "
-            f"removed deterministically by the harness rather than by a model round trip; "
-            f"{released} were released after coverage stalled (legal-but-too-late placements "
-            f"that were blocking the unmet requirements).", "",
-        ]
-    if unrepairable:
-        out += [
-            f"**{len(unrepairable)} violation(s) could not be repaired** — the only fix would "
-            f"have been to move a course the STUDENT locked, which the harness refuses to do:",
-            "",
-        ] + [f"- {u}" for u in unrepairable[:10]] + [""]
-    return out
-
-
-def _progress_table(records: list[dict]) -> list[str]:
-    """Is a model making progress, or just resampling?
-
-    The single most diagnostic thing this mode produces, and it needs the per-attempt log to
-    exist. A violation trace of 7 -> 4 -> 1 is a model reading the feedback; 7 -> 6 -> 8 -> 7 is
-    a model rerolling dice with extra steps. The blind variant is expected to look like the
-    second — that is its purpose — so the comparison to make is feedback against blind for the
-    SAME model.
-    """
-    lines = [
-        "| model | variant | scenario | violations by attempt | coverage by attempt | outcome |",
-        "|---|---|---|---|---|---|",
-    ]
-    any_row = False
-    for rec in records:
-        if rec.get("stage") not in _STAGES:
-            continue
-        trace = rec.get("violations_by_attempt") or []
-        if len(trace) < 2:
-            continue  # converged first try, or never got off the ground — nothing to trace
-        any_row = True
-        cov = " -> ".join(f"{c:.0%}" for c in (rec.get("coverage_by_attempt") or []))
-        outcome = (f"converged @ {rec['attempts_to_converge']}" if rec["converged"]
-                   else f"censored ({rec.get('censor_reason')})")
-        lines.append(
-            f"| {rec['model']} | {rec['variant']} | {rec['scenario']} | "
-            f"{' -> '.join(str(v) for v in trace)} | {cov} | {outcome} |"
-        )
-    if not any_row:
-        return ["_Every case converged or failed on its first attempt — no traces to show._", ""]
-    lines.append("")
+    lines = ["", "**Attempt traces** (coverage / outstanding findings, per attempt):", "",
+             "| Model | Scenario | Trace | Kept |", "|---|---|---|---|"]
+    for case in rows:
+        trace = " → ".join(
+            f"{(a.get('coverage') or 0):.0%}/{a.get('findings', '?')}"
+            for a in case["attempts"])
+        lines.append(f"| `{case.get('model')}` | {case.get('scenario')} | {trace} "
+                     f"| {case.get('best_attempt') or '—'} |")
     return lines
-
-
-def _school_model_grid(records: list[dict], variant: str) -> list[str]:
-    """school x model grid for one variant: converged/n and median attempts, compact enough to
-    sit next to the pooled table without repeating the whole `_table` output per school."""
-    scoped = [r for r in records if r.get("stage") in _STAGES and r.get("variant") == variant]
-    schools = sorted({r["_school"] for r in scoped})
-    models = sorted({r["model"] for r in scoped})
-    if not schools or not models:
-        return []
-    lines = [
-        "| school | " + " | ".join(f"`{m}` converged / attempts p50" for m in models) + " |",
-        "|---|" + "---|" * len(models),
-    ]
-    for school in schools:
-        cells = []
-        for model in models:
-            cases = [r for r in scoped if r["_school"] == school and r["model"] == model]
-            if not cases:
-                cells.append("—")
-                continue
-            stats = _model_stats(cases)
-            cells.append(f"{stats['converged']}/{stats['n']} ({stats['attempts_p50']})")
-        lines.append(f"| `{school}` | " + " | ".join(cells) + " |")
-    lines.append("")
-    return lines
-
-
-def mode_c_cross_school_lines(
-    school_dirs: list[tuple[str, Path]], tag: str = "convergence"
-) -> list[str]:
-    """Mode C's section of `results/summary.md` — the cross-school counterpart to `mode_c_lines`.
-
-    Pools `runs_convergence.jsonl` from every `results/results_<slug>/` the multi-school loop
-    wrote (same discovery `report._discover_school_dirs` uses for Mode A/B), tags each record
-    with `_school`, and reports both an OVERALL table (every school pooled, same shape as
-    `mode_c_lines`'s per-variant table) and a PER-SCHOOL grid — because a school with no
-    a school that has not been run with `--tasks converge` silently has no Mode C data at all,
-    and that has to be visible here rather than
-    just making the pooled numbers quietly rest on fewer schools than Mode A/B's tables above
-    them.
-
-    THE FIXTURE-HASH GUARD IN `mode_c_lines` DOES NOT APPLY HERE UNCHANGED: multiple schools
-    are SUPPOSED to have different fixture hashes (`cs` and `me` are different programs by
-    design), so warning about that would just be noise on every multi-school run. What still
-    needs the warning is a SINGLE school's own file containing more than one hash — that is
-    the actual config-drift bug the guard exists to catch — so it is re-checked per school
-    instead of across the whole pool.
-    """
-    pooled: list[dict[str, Any]] = []
-    mixed_hash_schools: dict[str, set[str]] = {}
-    for slug, d in school_dirs:
-        recs = _load(d / f"runs_{tag}.jsonl")
-        if not recs:
-            continue
-        hashes = {r.get("fixture_hash") for r in recs if r.get("fixture_hash")}
-        if len(hashes) > 1:
-            mixed_hash_schools[slug] = hashes
-        for rec in recs:
-            rec = dict(rec)
-            rec["_school"] = slug
-            pooled.append(rec)
-
-    out: list[str] = [
-        "How many attempts, and how long, until a model lands a plan with no errors in it — "
-        "pooled across every school that ran Mode C.",
-        "",
-    ]
-
-    schools_with_data = sorted({r["_school"] for r in pooled})
-    all_schools = sorted(slug for slug, _ in school_dirs)
-    missing = sorted(set(all_schools) - set(schools_with_data))
-
-    if not pooled:
-        out += [
-            "_No Mode C records found for any school. It runs on `python run.py run --tasks "
-            "converge`, or as part of a full `run.py run`._",
-            "",
-        ]
-        return out
-
-    out += [
-        f"{len(schools_with_data)}/{len(all_schools)} school(s) with Mode C data: "
-        + ", ".join(f"`{s}`" for s in schools_with_data),
-        "",
-    ]
-    if missing:
-        out += [
-            "_No Mode C data yet for: " + ", ".join(f"`{s}`" for s in missing)
-            + " — `--tasks converge` has not been run for it._",
-            "",
-        ]
-    for slug, hashes in sorted(mixed_hash_schools.items()):
-        out += [
-            f"> ⚠️ **`{slug}` has {len(hashes)} different fixture hashes within its own "
-            f"`runs_{tag}.jsonl`** ({', '.join(sorted(h[:8] for h in hashes))}). That school's "
-            f"own Mode C records describe different experiments and should not be pooled even "
-            f"with each other, let alone with the rest of this table.",
-            "",
-        ]
-
-    variants_present = sorted({r["variant"] for r in pooled if r.get("variant")})
-    for variant in variants_present:
-        rows = _variant_rows(pooled, variant)
-        out += [f"### Variant: {variant} — overall (every school pooled)", ""]
-        out += _table(rows)
-        out += [f"### Variant: {variant} — per school", ""]
-        out += _school_model_grid(pooled, variant)
-
-    out += _total_time_table(pooled)
-    return out
-
-
-def mode_c_lines(results: Path, tag: str = "convergence") -> list[str]:
-    """Mode C's section of `report.md`, at `###` nesting under whatever `##` heading the caller
-    gives it. Returns lines only — no file I/O, no numbering, no top-level heading; that is
-    `report.generate_report`'s job, the same as every other section in that file."""
-    records = _load(results / f"runs_{tag}.jsonl")
-    meta_path = results / f"meta_{tag}.json"
-    meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
-
-    out: list[str] = [
-        "How many attempts, and how long, until a model lands a plan with no errors in it.",
-        "",
-    ]
-
-    if not records:
-        out += ["_No Mode C records found. Run `python run.py run --tasks converge`._", ""]
-        return out
-
-    conv = meta.get("convergence", {})
-    out += [
-        "### Run settings",
-        "",
-        f"- timeout: **{conv.get('timeout_s')} s per case**, "
-        f"max attempts: **{conv.get('max_attempts')}**",
-        f"- convergence criterion: `{', '.join(conv.get('violation_classes') or [])}` "
-        f"= 0, over filled slots, no coverage condition",
-        f"- feedback list: "
-        + (f"top {conv['feedback_top_n']}" if conv.get("feedback_top_n")
-           else "full (every violation shown)"),
-        f"- plateau stop: after **{conv.get('plateau_patience')}** attempts with no change in "
-        f"(violations, coverage), for {', '.join(conv.get('plateau_variants') or []) or 'no'} "
-        f"variant(s) — recorded as censored, never as a failure",
-        f"- excluded prereq edges: "
-        f"{', '.join(conv.get('excluded_prereq_edges') or []) or 'none'}",
-        f"- fixture: `{meta.get('fixture', {}).get('hash')}` "
-        f"(verified: {meta.get('fixture', {}).get('verified')})",
-        "",
-        "> **Read `converged` next to `strict` and `degenerate`.**",
-        "",
-    ] + [f"> {line}" for line in CONVERGENCE_CRITERION_CAVEAT.splitlines()] + [""]
-
-    hashes = {r.get("static_hash") for r in records if r.get("static_hash")}
-    if len(hashes) > 1:
-        out += [
-            f"> ⚠️ **{len(hashes)} different static prompt hashes in this file "
-            f"({', '.join(sorted(h[:8] for h in hashes))}). These records describe different "
-            f"experiments and must not be pooled.**", "",
-        ]
-    fixtures = {r.get("fixture_hash") for r in records if r.get("fixture_hash")}
-    if len(fixtures) > 1:
-        out += [
-            f"> ⚠️ **{len(fixtures)} different fixture hashes. The scoring authority changed "
-            f"mid-file; these rows are not comparable.**", "",
-        ]
-
-    for variant, blurb in (
-        ("repair", "The harness deletes violating placements itself and freezes everything "
-                   "that validates; the model only fills what is missing. **Scored STRICTLY** "
-                   "(clean AND fully covered) — the repair step makes 'clean' free, so the "
-                   "loose criterion would score every model as converging on attempt 1. "
-                   "`converged` and `strict` are therefore the same column here."),
-        ("feedback", "Validator violations are fed back into the next attempt. "
-                     "**Self-correction.**"),
-        ("blind", "Same prompt, new sample, no information about what went wrong. "
-                  "**Raw variance.**"),
-    ):
-        rows = _variant_rows(records, variant)
-        out += [f"### Variant: {variant}", "", blurb, ""]
-        out += _table(rows)
-        if variant == "repair" and rows:
-            out += _ratchet_guard(rows)
-
-    out += _total_time_table(records)
-    out += [
-        "### Throughput is not quality",
-        "",
-        "`tok/s` above is generation throughput on **this box only** (see the env rows in the "
-        "baseline run). A model needing 3 attempts at 23 tok/s can beat a model needing 1 "
-        "attempt at 6 tok/s on wall-clock while being the worse planner. `attempts p50` is the "
-        "reasoning column; `wall p50` is the reasoning column multiplied by this card. Rank on "
-        "attempts; quote wall-clock only about this hardware.",
-        "",
-        "### Progress traces",
-        "",
-        "Violations per attempt, in order. A descending trace is self-correction; a flat or "
-        "bouncing one is resampling.",
-        "",
-    ]
-    out += _progress_table(records)
-    return out
-
-    path = results / "convergence_report.md"
-    path.write_text("\n".join(out))
-    return path

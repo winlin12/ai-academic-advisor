@@ -625,6 +625,13 @@ def build_argv(
     # different `argv`s built at different times.
     if thinking_budget is not None:
         argv += ["--reasoning-budget", str(thinking_budget)]
+    elif int(run.get("reasoning_budget") or 0) > 0:
+        # RUN-WIDE BUDGET, 2026-08-13. The advising stages (QA, explain) are allowed to reason;
+        # the plan stages still ask for `enable_thinking: false` per request. Reasoning has to
+        # be enabled at LAUNCH for either to be possible — `--reasoning off` cannot be undone
+        # per request — so the switch lives here and the per-stage choice lives in
+        # `runner._stage_thinking`.
+        argv += ["--reasoning-budget", str(int(run["reasoning_budget"]))]
     elif model_cfg.get("think") is False:
         argv += ["--reasoning", "off", "--reasoning-budget", "0"]
     # --mlock OOMs on models larger than this box's RAM; see config's mlock_max_gb.

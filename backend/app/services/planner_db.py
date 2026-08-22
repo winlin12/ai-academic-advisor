@@ -118,67 +118,32 @@ PROSE_TYPES = {
 
 # Types that ARE requirements even when the catalog states no credit minimum for them —
 # "University Core Requirements", "Civics Literacy Proficiency Requirement", "Upper Level
-# Requirement". Leaving these out would drop the university-wide half of every degree.
-#
-# These are also where a requirement's SCOPE lives. The crawler already tells us "University
-# Core Requirements" is identical across all 295 programs that carry it, and "College of
-# Science Core Requirements" is identical across all 65 College of Science programs — the
-# catalog files them under a type, not a program. Splitting the two lets the checklist say so
-# instead of repeating the same paragraph under every major as if it were that major's own.
-UNIVERSITY_REQUIREMENT_TYPES = {"university", "core", "world_language"}
-# "college" was missing from the old CREDITLESS_REQUIREMENT_TYPES entirely, which silently
-# dropped 183 of 303 college-level groups — "Curriculum and Degree Requirements for College of
-# Science", "College of Agriculture Core Requirements" — anywhere the catalog stated no credit
-# minimum for them. Not shown as unresolved; not shown at all.
-COLLEGE_REQUIREMENT_TYPES = {"college"}
-CREDITLESS_REQUIREMENT_TYPES = UNIVERSITY_REQUIREMENT_TYPES | COLLEGE_REQUIREMENT_TYPES
-
-
-def _scope_for(requirement_type: str) -> Literal["university", "college", "program"]:
-    if requirement_type in UNIVERSITY_REQUIREMENT_TYPES:
-        return "university"
-    if requirement_type in COLLEGE_REQUIREMENT_TYPES:
-        return "college"
-    return "program"
+# Requirement". This is what `_fetch_prose_rules` scans for a computable rule.
+CREDITLESS_REQUIREMENT_TYPES = {"university", "core", "world_language", "college"}
 
 
 @dataclass
-class UnresolvedRequirement:
-    """A requirement the catalog states but does not express as a list of courses.
+class ProseRule:
+    """A requirement group the catalog states in prose, with no course list under it.
 
-    THESE ARE THE MAJORITY, and hiding them was this app's worst bug. 749 of 928 crawled
-    programs have at least one, averaging 2.6 per program against 3.8 that do carry courses —
-    so a Women's, Gender & Sexuality Studies student saw two requirement groups, both from the
-    major, and a coverage figure of 100% while 24 of their ~120 credits were accounted for.
+    ONE CONSUMER, ONE PURPOSE: `plan_requirements` scans `raw_text` for a rule it can actually
+    COMPUTE — "at least 32 semester hours ... at least junior-level (30000+)" — and turns those
+    into `ComputedRequirementView`. Anything whose prose states no such rule is dropped on the
+    floor and never reaches the student, the API, or a model prompt.
 
-    They are not a crawler failure. The catalog genuinely does not enumerate them:
-
-        "Choose 1 course in 6 different disciplines within the College of Liberal Arts"
-            — a rule over disciplines; there is no list to parse.
-        "For a complete listing of University Core Course Selectives, visit the University
-         Senate Website"
-            — the list is on a different site.
-        "Completion of 10100, 10200, 20100 and 20200 -or- 10500 and 20500 in one world language"
-            — course numbers with no subject, because the subject is "any world language".
-
-    So they cannot be planned and cannot be checked, and the honest thing is to say exactly
-    that: show the requirement, show the catalog's own words, and never count it as satisfied.
-    NOT DECIDABLE is a different fact from NOT MET, and rendering one as the other would tell a
-    student they are behind when the truth is that we do not know.
-
-    ``scope`` is the other half of being honest: "University Core Requirements" is not this
-    program's problem, it is every Purdue undergraduate's, and a checklist that files it under
-    Women's, Gender & Sexuality Studies as if the department wrote it is misleading in the
-    other direction. See ``_scope_for``.
+    THIS USED TO BE `UnresolvedRequirement`, a first-class thing the app showed students and
+    put in every model prompt: "here is a real requirement, in the catalog's own words, that
+    nobody can check". Removed 2026-08-12. It was the majority of rows (749 of 928 crawled
+    programs carry at least one) and it was honest, but it was also a requirement with nothing
+    actionable attached, and both the models and the UI did worse for carrying it. The plan is
+    to represent university requirements as something schedulable instead — the way the model
+    eval harness resolves University Core into per-competency course menus off each course's
+    own UCC attributes — and until that exists the app plans the major and says so.
     """
 
     id: str
     name: str
-    requirement_type: str
     credits_min: float | None
-    scope: Literal["university", "college", "program"]
-    # The catalog's own prose. It is the only thing we can honestly show, and it is usually
-    # enough for a student to act on.
     raw_text: str | None = None
 
 
@@ -202,11 +167,10 @@ class ProgramCatalog:
     # rather than as interpreted — see plan_context.
     prereq_rows: dict[str, dict[str, Any]] = field(default_factory=dict)
     offering_rows: dict[str, dict[str, Any]] = field(default_factory=dict)
-    # Requirements the catalog states but does not enumerate. Kept OUT of `groups` on purpose:
-    # they have no courses, so nothing can plan them, schedule them or check them — and letting
-    # them into the planning path would only produce requirements the planner silently fails.
-    # They are reported instead. See UnresolvedRequirement.
-    unresolved: list[UnresolvedRequirement] = field(default_factory=list)
+    # Prose-only requirement groups, kept for ONE downstream reader: `plan_requirements` mines
+    # them for a computable credit-threshold rule and discards the rest. Never planned, never
+    # rendered as a requirement, never put in a model prompt. See ProseRule.
+    prose_rules: list[ProseRule] = field(default_factory=list)
     # Subject code -> display name (e.g. "SPAN" -> "Spanish") for every language-sequence
     # requirement group this program has, computed BEFORE narrowing so it always lists every
     # choice regardless of what (if anything) the student already picked. See
@@ -514,8 +478,9 @@ def _fetch_groups(cur: psycopg.Cursor, program_id: str) -> list[RequirementGroup
     return list(groups.values())
 
 
-def _fetch_unresolved(cur: psycopg.Cursor, program_id: str) -> list[UnresolvedRequirement]:
-    """Requirements the catalog states but does not enumerate. See UnresolvedRequirement.
+def _fetch_prose_rules(cur: psycopg.Cursor, program_id: str) -> list[ProseRule]:
+    """Requirement groups stated in prose, with no course list. See ProseRule for the one thing
+    that reads them.
 
     Three filters, and each one is load-bearing:
 
@@ -529,7 +494,7 @@ def _fetch_unresolved(cur: psycopg.Cursor, program_id: str) -> list[UnresolvedRe
     """
     cur.execute(
         """
-        SELECT rg.id::text AS id, rg.name, rg.requirement_type, rg.credits_min, rg.raw_text
+        SELECT rg.id::text AS id, rg.name, rg.credits_min, rg.raw_text
         FROM requirement_groups rg
         WHERE rg.program_id = %s
           AND COALESCE(rg.requirement_type, '') <> ALL(%s)
@@ -544,12 +509,10 @@ def _fetch_unresolved(cur: psycopg.Cursor, program_id: str) -> list[UnresolvedRe
         (program_id, sorted(PROSE_TYPES), sorted(CREDITLESS_REQUIREMENT_TYPES)),
     )
     return [
-        UnresolvedRequirement(
+        ProseRule(
             id=row["id"],
             name=(row["name"] or "Requirement").strip(),
-            requirement_type=row["requirement_type"] or "",
             credits_min=row["credits_min"],
-            scope=_scope_for(row["requirement_type"] or ""),
             raw_text=(row["raw_text"] or "").strip() or None,
         )
         for row in cur.fetchall()
@@ -657,7 +620,7 @@ def load_program_catalog(program_id: str, *, extra_codes: set[str] | None = None
             raise ProgramNotFoundError(program_id)
 
         groups = _fetch_groups(cur, program_id)
-        unresolved = _fetch_unresolved(cur, program_id)
+        prose_rules = _fetch_prose_rules(cur, program_id)
         cur.execute(
             "SELECT note_text FROM program_notes WHERE program_id = %s ORDER BY note_type",
             (program_id,),
@@ -753,7 +716,7 @@ def load_program_catalog(program_id: str, *, extra_codes: set[str] | None = None
         aliases=aliases,
         prereq_rows=prereq_rows,
         offering_rows=offering_rows,
-        unresolved=unresolved,
+        prose_rules=prose_rules,
         available_languages=available_languages,
     )
 

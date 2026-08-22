@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from typing import Any
 
 from .fixtures import Fixture, Scenario
@@ -292,9 +293,9 @@ Rules, all hard:
 SPREAD THE WORK EVENLY. Balance CREDIT HOURS, not course count, across ALL the semesters the
 student has — courses are not the same size, so an equal number of courses per semester can
 still leave credits badly uneven. Add up the credits in each semester as you place courses and
-keep that sum near the target every semester, including the last ones. Do not fill the early
-terms to the limit and leave the later ones light on credits, and do not leave a term light on
-credits when something legal could go in it. Selective groups usually offer more options than
+keep those sums CLOSE TO EACH OTHER, including the last ones. Do not fill the early terms to
+the limit and leave the later ones light on credits, and do not leave a term light on credits
+when something legal could go in it. Selective groups usually offer more options than
 the student needs: when a term has room, pick an option whose prerequisites are already
 satisfied."""
 
@@ -363,6 +364,132 @@ def plan_schema(planning_terms: list[str],
     semester["term"]["enum"] = list(planning_terms)
     if catalog_codes:
         semester["courses"]["items"] = {"type": "string", "enum": sorted(catalog_codes)}
+    return schema
+
+
+# =============================================================================================
+# STAGE 1 — COURSE SELECTION (Mode B/C's first pass)
+# =============================================================================================
+#
+# WHY THIS STAGE EXISTS AT ALL, as of 2026-08-13. Mode B used to be one call that asked a model
+# to choose ~40 courses out of the ~130 the budget trim leaves in the export AND sequence them
+# AND balance credits AND respect prerequisites. The measured result across 14 programs and 7
+# models: the best model produced a legal plan 34% of the time, the worst 11%, with 5-30
+# prerequisite violations each and up to 169 duplicate courses silently deleted before scoring.
+# Both halves failed independently — coverage (selection) ran 52-86% while violations
+# (ordering) were a separate failure — which is the signature of two tasks fused into one call.
+#
+# Split, each half gets a prompt it can actually hold: this one sees requirement groups and
+# answers "which courses", knowing nothing about semesters; the ordering stage sees ~40 chosen
+# codes and answers "in what order", never having to search a catalog. The ordering prompt is
+# an order of magnitude smaller than the old fused one, which is where the latency goes.
+SELECTION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "selections": {
+            "type": "array",
+            "description": "One entry per requirement group you are filling.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "group": {"type": "string",
+                              "description": "The requirement group's name, copied exactly."},
+                    "courses": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Course codes from THIS group's options that the "
+                                       "student should take. Omit courses already completed.",
+                    },
+                },
+                "required": ["group", "courses"],
+            },
+        },
+    },
+    "required": ["selections"],
+}
+
+
+def selection_schema(option_codes: list[str], group_names: list[str]) -> dict[str, Any]:
+    """`SELECTION_SCHEMA` with both enums bound to this program's own rows.
+
+    Same reasoning as `plan_schema`'s course enum, applied one stage earlier: a code the
+    catalog does not contain cannot be selected, and a group name the program does not have
+    cannot be invented. What the grammar CANNOT enforce is the part that matters — picking
+    enough credits from the right group — which is what the scorer measures.
+    """
+    schema = json.loads(json.dumps(SELECTION_SCHEMA))
+    item = schema["properties"]["selections"]["items"]["properties"]
+    if group_names:
+        item["group"]["enum"] = sorted(set(group_names))
+    if option_codes:
+        item["courses"]["items"] = {"type": "string", "enum": sorted(set(option_codes))}
+    return schema
+
+
+# =============================================================================================
+# MODE A — AUDIT AN EXISTING SCHEDULE
+# =============================================================================================
+#
+# The task the app actually has to do most often: a student arrives WITH a plan (their own
+# draft, an advisor's sheet, last year's plan) and wants to know what is wrong with it. Mode A
+# used to be the app's revise-plan path — the model expressed preferences (reorder/defer) and a
+# deterministic planner rebuilt the schedule, which made every Mode A plan legal by
+# construction and every model's numbers identical (79% viable, 0 violations, all seven models,
+# measured 2026-08-12). Identical numbers are not a measurement.
+#
+# So the model now answers the question directly and its answer is what gets scored: which
+# required courses are absent, and which placements have to move. Ordering stage 2 of Mode B is
+# the same call with an empty starting schedule — one prompt, two entry points, so a fix to
+# either lands in both.
+AUDIT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "semesters": {
+            "type": "array",
+            "description": "The COMPLETE corrected schedule, every semester in order — not a "
+                           "diff. Include courses that were already in the right place.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "term": {"type": "string", "enum": ["fall", "spring", "summer"]},
+                    "year": {"type": "integer"},
+                    "courses": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["term", "year", "courses"],
+            },
+        },
+        # NEITHER `missing` NOR `problems` SURVIVES (2026-08-15, 2026-08-16). Both asked the
+        # model to narrate alongside the plan, and both cost more than they returned.
+        #
+        # `missing` — which required courses are absent — has no content once the ordering
+        # stage is handed the exact set to place: nothing can be absent that was not given.
+        # What it produced was enumeration, up to 36 entries, and repetition loops that ran to
+        # the token ceiling (qwen3.8-27b alternating "ENGL 32800"/"ENGL 32700" until
+        # truncation). 7% of plan records in that sweep were truncated.
+        #
+        # `problems` — a prose account of what could not be balanced — read well and was never
+        # scored. Its cost is generation time on every single plan, and a model that stops to
+        # explain its own compromises is a model not spending those tokens on the schedule.
+        # The harness computes every problem worth knowing about (`real_scoring`'s violations,
+        # coverage and spread) from the plan itself, against the real database, which is both
+        # cheaper and not subject to the model's own account of itself.
+        #
+        # WHAT IS LOST, and it is worth naming: qwen3.8-27b used this field to explain that it
+        # front-loaded "to satisfy prerequisite chains", which was a genuinely interesting
+        # claim about its own reasoning. That belongs in a targeted experiment, not on the
+        # critical path of every plan in a sweep.
+    },
+    "required": ["semesters"],
+}
+
+
+def audit_schema(planning_terms: list[str], course_codes: list[str]) -> dict[str, Any]:
+    """`AUDIT_SCHEMA` with the term and course enums bound, same as `plan_schema`."""
+    schema = json.loads(json.dumps(AUDIT_SCHEMA))
+    semester = schema["properties"]["semesters"]["items"]["properties"]
+    semester["term"]["enum"] = list(planning_terms)
+    if course_codes:
+        semester["courses"]["items"] = {"type": "string", "enum": sorted(set(course_codes))}
     return schema
 
 
@@ -538,7 +665,8 @@ def _full_program_line(scenario: Scenario | None, primary: str) -> str:
 
 
 def _profile_block(profile: Profile, scenario: Scenario | None = None,
-                   database: CatalogDatabase | None = None) -> str:
+                   database: CatalogDatabase | None = None,
+                   credits_remaining: float | None = None) -> str:
     """The student, and — explicitly — the boundary of what they have already done.
 
     THE COMPLETED LIST IS STATED AS EXHAUSTIVE, which it was not before. Students describe
@@ -574,7 +702,7 @@ def _profile_block(profile: Profile, scenario: Scenario | None = None,
     return (
         f"STUDENT: {profile.name} — {degree_program}\n"
         f"{label}: {completed}\n"
-        f"{credit_load_line(profile)}\n"
+        f"{credit_load_line(profile, credits_remaining)}\n"
         f"{major_load_line(profile)}\n"
         + (f"{preference_line}\n" if preference_line else "")
         + (f"{fye_line}\n" if fye_line else "")
@@ -627,36 +755,180 @@ def _fye_deadline_line(profile: Profile, database: CatalogDatabase | None) -> st
     )
 
 
-def credit_load_line(profile: Profile) -> str:
-    """The shape to place the work in. No credit figures at all.
+# How far either side of the even split still counts as evenly spread. One lab course wide.
+# Kept for `real_scoring._CREDIT_BAND`'s cross-reference and for the fallback line below; the
+# main credit instruction no longer states a band, because it no longer states a target.
+_CREDIT_BAND = 2
 
-    The line used to name a per-semester target — the same even split
-    ``planner.semester_credit_target`` computes at semester 0 — because an earlier version named
-    only the LIMIT, and models drifted downward under it: results_old9, 162 Mode B plans, mean
-    credits by semester position 13.7, 12.3, 12.0, 11.1, 11.0, 8.5, 7.9, 7.1, with
-    `gen-ed-selective: 0/6 credits` the single most common unmet requirement (57 plans).
 
-    BOTH NUMBERS CAME OUT ON 2026-08-12. The per-semester quota went first: a quota is not the
-    objective — finishing the requirements is, evenly spread — and stating one invites the model
-    to satisfy it and stop, the same failure the number was added to fix, one level up. The
-    credits-outstanding total followed, and Mode B is why. That total was
-    `sum(fixture.credits(c) for c in profile.remaining_courses)` — the FIXTURE's nine
-    requirement groups — while a Mode B model plans against the real crawled database's twenty-
-    odd. The prompt was stating a finishing condition for a different degree than the one it
-    handed the model, precise enough to be believed and wrong. The requirement lists in the
-    database are the finishing condition; they are already in front of the model, and the
-    scorers count against them.
+def credit_load_line(profile: Profile, credits_remaining: float | None = None) -> str:
+    """The per-semester load: what to aim for, and what never to exceed.
+
+    THE TARGET IS DERIVED, NOT DECREED — `ceil(credits still to place / semesters available)`,
+    the even split that finishes the degree exactly on time. That distinction is the whole
+    reason it is safe to state a number again.
+
+    HISTORY, because this line has been wrong in both directions. Naming only the LIMIT made
+    models drift downward: results_old9, 162 Mode B plans, mean credits by semester position
+    13.7, 12.3, 12.0, 11.1, 11.0, 8.5, 7.9, 7.1 — they treated the ceiling as a target and
+    then undershot it. Naming a fixed per-semester QUOTA made them satisfy the quota and stop,
+    leaving `gen-ed-selective: 0/6` as the single most common unmet requirement (57 of those
+    162 plans). So on 2026-08-06 both numbers came out entirely, as an experiment: would models
+    self-limit with no figure at all?
+
+    THE EXPERIMENT ANSWERED, 2026-08-16, and the answer is no. With no number stated, every
+    model exceeded the student's (unstated) ceiling — qwen3.8-27b on 2.40 semesters per plan,
+    gemma4-26b on 0.32, an eightfold spread that is about the prompt rather than about
+    planning. qwen3.8 filled to ~18 credits a term, exhausted the course list in six semesters
+    and left three empty: `[12, 18, 17, 16, 17, 16, 8, 0, 0, 0]` for a student who asked for
+    twelve or thirteen. Meanwhile `ORDER_SYSTEM` instructed it to "respect the student's stated
+    credit ceiling", which the prompt had never stated.
+
+    AND THE RULES THEMSELVES WERE TESTED, 2026-08-21 — the "these constraints are confusing
+    the model" hypothesis, run as a throwaway arm that replaced ORDER_SYSTEM's whole rule list
+    with "Give the student a balanced schedule." and dropped this line and `major_load_line`
+    from the profile. qwen3.8-27b, construction-management, 5 scenarios, everything else
+    identical: viable 5/5 -> 1/5, coverage 100% -> 91%, mean credit spread 12.6 -> 14.0. It
+    got WORSE at the balance the rules were suspected of harming. Two rules turned out to be
+    load-bearing — "place every course" (without it the model silently dropped 2-3 courses per
+    plan; the enum grammar stops additions, nothing but the prompt compels placement) and the
+    credit ceiling (spring-start came back `[24, 21, 20, 22, 8, 0, 0, 0]`, unregistrable, and
+    still emptied three terms). The arm was deleted; this paragraph is what it bought.
+
+    WHY THE OLD QUOTA FAILURE DOES NOT RETURN. That failure needed a model that could stop
+    early — it was choosing courses as well as placing them, so hitting the number and halting
+    silently dropped requirements. The ordering stage is handed a fixed set and must place all
+    of it, and a course left out is now visible as a dropped course rather than an invisible
+    coverage gap. The number can only shape the SHAPE of the plan, not its contents.
+
+    `credits_remaining` comes from the courses actually being placed, computed against the same
+    database the model is shown — not from a fixture's own credit table, which is how the
+    previous version came to state a finishing condition for a different degree than the one in
+    the prompt.
     """
-    # NO CAP LANGUAGE AT ALL, as of 2026-08-06 — an explicit experiment, not a fixed
-    # conclusion: transcripts read like the model was staying suspiciously close to the
-    # soft-cap number every time, which is at least consistent with the prompt's own "the
-    # student asked for N or fewer" wording anchoring it there regardless of the actual
-    # `hard_credit_cap`. Removing both numbers from the text answers "does it still self-limit
-    # without being told to, and to what." The scorer is UNCHANGED — `credit_cap_violation`/
-    # `soft_credit_overages` still fire exactly as before, so a model that overloads a semester
-    # now shows up as a real, measured violation instead of being warned off it in advance. If
-    # this needs reverting, `limit`/`hard_cap` are still on `profile` — only the prose describing
-    # them was removed here; see git history for the exact two lines to restore.
+    semesters = max(1, int(profile.semesters_to_plan or 1))
+    ask = int(profile.max_credits_per_semester or 0)
+    # `profile.hard_credit_cap` is deliberately NOT stated any more (2026-08-21) — see the
+    # target note below. The scorer never enforced 18 in the first place: its hard line is 22,
+    # `real_scoring._ABSURD_SEMESTER_CREDITS`, and everything between the student's ask and 21
+    # is a soft overage. So this removes an assertion, not a constraint.
+    if credits_remaining:
+        target = math.ceil(float(credits_remaining) / semesters)
+        # A RANGE, NOT A POINT. An exact per-semester figure is unreachable by construction —
+        # courses come in 1, 3, 4 and 5-credit sizes, so no arrangement of them lands on the
+        # same integer eight times, and a model told to hit one exactly is being set a target
+        # it can only miss. Stating the band it should land in describes the same intent
+        # without the false precision, and it leaves room for the lab-sized course that has to
+        # go somewhere.
+        if ask and target > ask:
+            # THE HORIZON IS TOO SHORT FOR THE DEGREE at the load this student will carry.
+            # Saying the plan does not fit is both true and actionable, and the honest response
+            # is a full schedule plus a report of the overflow.
+            parts = [
+                f"Fill every semester to about {ask} credits — that is this student's limit. "
+                f"The {credits_remaining:g} credits still to place over {semesters} semesters "
+                f"works out at {target} a semester, which is above that limit, so not "
+                f"everything fits: place what does, and say what does not"
+            ]
+        else:
+            # AN OBJECTIVE, NOT A CONDITION TO SATISFY. This read "every semester should land
+            # in {low}-{high}", and qwen3.8-27b explained in its own output exactly what that
+            # cost: "the total credit count of the required courses (108) does not divide
+            # evenly by 8 semesters to reach the target of 14 credits per semester without
+            # exceeding the 16-credit ceiling in some terms or leaving others underfilled".
+            # It tested the range as a hard constraint, correctly found it unsatisfiable —
+            # courses come in 1, 3, 4 and 5-credit sizes and no arrangement lands on the same
+            # number eight times — and then discarded the instruction entirely, producing
+            # `[16, 18, 15, 17, 18, 17, 3, 0, 0, 0]` for a student who asked for thirteen.
+            #
+            # A constraint that cannot be met is worth nothing to a model checking whether it
+            # can be met. An objective to get as close to as possible is worth something even
+            # when it cannot be reached exactly, which is always. So the number is stated as
+            # the aim, the impossibility of hitting it exactly is stated OUT LOUD so no
+            # feasibility check has anything to discover, and what is actually forbidden — a
+            # heavy term sitting next to an empty one — is stated as the rule instead.
+            # NO TARGET NUMBER, 2026-08-21. The instruction is now purely RELATIVE: make the
+            # semesters resemble each other. Every previous version named a figure — a limit, a
+            # quota, a derived target — and each one gave the model something to test, satisfy
+            # or discard instead of a shape to aim at. The derived target was the best of them
+            # and still produced `[19, 19, 16, 17, 14, 14, 5, 0]` on qwen3.8-27b: it filled the
+            # early terms toward the ceiling it could see and let the remainder fall off the
+            # end. A comparison ("no semester much heavier than another") cannot be front-loaded
+            # the way an absolute number can, because it is only satisfiable by looking at the
+            # whole schedule.
+            #
+            # `credits_remaining` and `semesters` are still stated as FACTS — how much work
+            # there is and how many terms it has to fit into — because that is the arithmetic
+            # the model needs to spread anything at all. What is gone is the per-semester
+            # figure derived from them.
+            # THE TARGET IS BACK, 2026-08-21, AND THIS IS WHY. It came out for one day on the
+            # theory that a purely RELATIVE instruction ("no semester much heavier than
+            # another") cannot be front-loaded the way an absolute number can. Measured on
+            # construction-management that looked free — 5 scenarios, mean spread 12.6 -> 12.4,
+            # coverage held at 100%. It did not survive contact with a second program. Same
+            # model, same scenario, animal-sciences/fresh-start, target vs no target:
+            #
+            #   with target     [18, 15, 15, 14, 13, 16, 12, 6]   8/8 terms, viable, 0 violations
+            #   without target  [20, 22, 20, 21, 16, 10,  0, 0]   6/8 terms, NOT viable, 1
+            #
+            # With nothing to aim at, the model packs toward the only number left — the
+            # student's own ceiling — overshoots it by its usual ~4, and exhausts the course
+            # list two terms early. The relative sentences are kept BELOW as reinforcement;
+            # they are not a substitute for a figure.
+            #
+            # ⚠ BOTH OF THOSE PLANS SCORE credit_spread = 12. The metric measures max-min across
+            # NON-EMPTY semesters, so abandoning two terms costs nothing in that column and the
+            # regression is invisible to it. Do not evaluate a change to this line on spread
+            # alone — read `semesters_used` and the violation count beside it.
+            parts = [
+                f"Aim for about {target} credits a semester: the {credits_remaining:g} credits "
+                f"still to place, divided over all {semesters} semesters. You will not hit that "
+                f"exactly and you are not expected to — courses come in different sizes, so "
+                f"some terms will be a credit or two either side of it. Get as close as you "
+                f"can, term by term, and keep every semester within a few credits of {target}"
+            ]
+            parts.append(
+                f"What is NOT acceptable is a heavy term next to a light or empty one. If a "
+                f"semester ends up under {max(1, target - _CREDIT_BAND)} credits while another "
+                f"is over {target + _CREDIT_BAND}, move courses between them until both are "
+                f"near {target}. Use all {semesters} semesters — the last ones carry work too, "
+                f"and finishing early while a later term sits empty is exactly the shape to "
+                f"avoid"
+            )
+            # ONE CEILING, CAPPED AT 18, AND NO SECOND NUMBER. 2026-08-21.
+            #
+            # The anchor experiment: this model fills terms toward whatever ceiling the prompt
+            # names, so a LOWER stated ceiling should drag the drift down with it. Measured on
+            # qwen3.8-27b / construction-management, 5 scenarios, everything else held: stating
+            # 15 gave a heaviest term of 19 and mean credit spread 11.6; stating nothing at all
+            # gave a heaviest term of 22 (an unregistrable semester, and one lost plan) and
+            # spread 12.4. So the ceiling matters — but the DRIFT ABOVE IT IS ROUGHLY CONSTANT
+            # at about +4, whatever number is named. The model does not read this as a limit to
+            # stay under; it reads it as the size a semester is meant to be, and then overruns.
+            #
+            # 15 was tried on that basis and rejected as too fictional to hold: told 15 it still
+            # opened at 19. Capped at 18 the stated number is at least the true registrar
+            # figure, so the prompt is not asserting something the catalog contradicts, and 18
+            # still sits four credits under the scorer's hard line of 22
+            # (`real_scoring._ABSURD_SEMESTER_CREDITS`) — which is the margin the drift eats.
+            #
+            # `min(ask, 18)` — NEVER a flat 18. Students ask for 12 and 13 in these scenarios,
+            # and telling one of them "never go above 18" would RAISE their ceiling past what
+            # they asked for, replacing the student's own stated preference with a number they
+            # never gave. The cap only ever binds a student who asked for MORE than 18.
+            #
+            # THE REGISTRAR LINE IS STILL GONE. This is the only credit ceiling in the prompt;
+            # there is no longer a second sentence naming a different maximum, because two
+            # numbers is what the earlier versions of this instruction kept failing on.
+            #
+            # THE FEASIBILITY CHECK ABOVE STILL USES THE REAL `ask`, deliberately. If the stated
+            # number fed that branch, changing it would flip scenarios into the "not everything
+            # fits, say what did not" path and the model would start DROPPING courses — a
+            # coverage collapse caused by the anchor rather than by the plan.
+            if ask:
+                stated = min(ask, 18)
+                parts.append(f"Never go above {stated} credits in a semester")
+        return ". ".join(parts)
     return ("Spread the courses evenly across all "
             f"{profile.semesters_to_plan} semesters instead of filling the early ones and "
             "leaving the later ones empty")
@@ -719,6 +991,68 @@ def _course_context(profile: Profile, catalog: list[Course]) -> str:
         tags = ", ".join(course.requirement_tags) or "none"
         lines.append(f"- {course.code} \"{course.title}\" ({course.credits} cr; tags: {tags})")
     return "\n".join(lines) or "(no known remaining courses)"
+
+
+# =============================================================================================
+# STAGE SYSTEM PROMPTS (2026-08-13 architecture)
+# =============================================================================================
+
+# SELECT ONLY. This prompt never mentions semesters, prerequisites or credit loads per term,
+# because none of them are this stage's problem and every sentence about them is a sentence the
+# model spends attention on instead of reading the option lists. The one arithmetic it must do
+# is per-group credit targets.
+SELECT_SYSTEM = """\
+You choose which courses a student should take to finish their degree. You do NOT decide when
+they take them — a later step does the scheduling, so ignore ordering entirely here.
+
+You are given the degree's requirement groups. Each group carries its own `options`: the
+courses that satisfy it, with credits.
+
+Rules:
+- `all_of` groups: the student must take EVERY option listed. Include all of them.
+- `choose_credits` groups: pick options totalling at least `credits_min` credits. Pick the
+  fewest courses that reach the target — not the whole list.
+- A course already completed satisfies its group. Never select a completed course again.
+- ONE COURSE CAN SATISFY SEVERAL GROUPS. If a course you already selected also appears in
+  another group's options, that group is already paid for — do not select another course for it.
+- Only course codes from that group's own `options`. Never invent one.
+- Cover every group. A group you skip is a requirement the student does not graduate without."""
+
+# ORDER / AUDIT. Shared by Mode A (a schedule already exists) and Mode B stage 2 (it does not).
+# The prompt is deliberately blind to the catalog: it sees only the courses in play and their
+# prerequisites, which is what makes it ~1-2k tokens instead of the ~12.5k the fused Mode B
+# prompt needed.
+ORDER_SYSTEM = """\
+You lay out a student's courses across their semesters, and you check the result.
+
+You are given the exact set of courses to place — the selection is already made, so never add a
+course that is not in the list and never drop one that is.
+
+Rules, all hard:
+- PREREQUISITES COME FIRST. Every prerequisite of a course must be in a STRICTLY EARLIER
+  semester than the course itself, or already completed. The same semester is NOT early enough.
+  Corequisites may share a semester. Each course's prerequisites are listed with it.
+- NEVER SCHEDULE A COMPLETED COURSE. The student's completed list is closed and final.
+- EACH COURSE APPEARS EXACTLY ONCE in the whole schedule.
+- SPREAD THE CREDITS EVENLY across every semester the student has, including the last ones.
+  Balance credit hours, not course counts — courses are not the same size. Do not fill the
+  early terms to the limit and leave the later ones nearly empty.
+- Respect the student's stated credit ceiling every semester.
+
+Return `semesters`: the COMPLETE schedule, not a diff. Every course in the list above appears
+exactly once in it. Return nothing else — no commentary, no explanation, no lists of what did
+not fit. The schedule is the whole answer."""
+
+# REPAIR (Mode C). Everything ORDER_SYSTEM says still applies; this adds the one permission
+# that separates Mode C from Mode B — the model may change WHICH courses are in the plan, not
+# just where they sit, because a validator finding a coverage gap can only be fixed by adding a
+# course the selection stage missed.
+REPAIR_RULES = """\
+This is a revision pass. A validator checked your previous schedule and its findings are below.
+
+You MAY add courses that satisfy an unmet requirement, and you MAY remove courses that are not
+required, in addition to moving what is already there. Every rule above still holds for the
+schedule you return."""
 
 
 class PromptBuilder:
@@ -802,6 +1136,217 @@ class PromptBuilder:
             f"STUDENT'S REQUEST:\n{scenario.feedback}\n\n"
             f"Produce the plan of study."
         )
+
+    # -- STAGE 1: course selection (Mode B/C's first pass) -----------------------------------
+
+    def select_courses(self, scenario: Scenario) -> tuple[str, str, str]:
+        """"Which courses does this student still need?" — no scheduling, no semesters.
+
+        The static block is the REQUIREMENT GROUPS ONLY, not the full catalog export. That is
+        the point of the split: this stage never needs a course's prerequisites, title or
+        credit-hour breakdown, and the ~12.5k-token export existed only so a single fused call
+        could both choose and sequence. What is left is the option lists themselves.
+        """
+        static = f"{SELECT_SYSTEM}\n\n{self._requirement_groups_block()}"
+        completed = ", ".join(scenario.profile.completed_courses) or "none"
+        user = (
+            f"STUDENT: {scenario.profile.name} — {scenario.profile.degree_program}\n"
+            f"Already completed (complete list): {completed}\n\n"
+            f"STUDENT'S REQUEST:\n{scenario.feedback}\n\n"
+            f"Choose the courses. Do not schedule them."
+        )
+        return static, user, _static_hash(static, SELECTION_SCHEMA)
+
+    def _requirement_groups_block(self) -> str:
+        """Every requirement group with its options and credit target, one JSON row per group.
+
+        Built from `self.database`'s own rows rather than the fixture's, for the same reason
+        Mode B's course enum is: the model must be shown, and grammar-bound to, the program it
+        is actually being scored against.
+        """
+        if self.database is None:  # pragma: no cover — `run.py check` refuses this first
+            raise RuntimeError("selection needs a catalog database — see harness/real_db.py.")
+        options_by_group: dict[str, list[dict[str, Any]]] = {}
+        for row in self.database.rows("requirement_options"):
+            options_by_group.setdefault(row["requirement_group_id"], []).append(row)
+        lines = [
+            "REQUIREMENT GROUPS — the complete set for this degree. Nothing outside this list "
+            "exists; never invent a course code.",
+            "",
+            'kind "all" = take every option. kind "choose" = take options totalling at least '
+            "`credits_min` credits.",
+            "",
+        ]
+        for row in self.database.rows("requirement_groups"):
+            options = options_by_group.get(row["id"]) or []
+            if not options:
+                continue
+            lines.append(json.dumps({
+                "name": row.get("name"),
+                "kind": "choose" if row.get("requirement_type") == "choose_credits" else "all",
+                "credits_min": row.get("credits_min"),
+                "options": [{"code": o["course_code"], "credits": o.get("credits")}
+                            for o in options],
+            }, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+        return "\n".join(lines)
+
+    # -- STAGE 2: ordering and audit (Mode A, and Mode B/C's second pass) --------------------
+
+    def order_courses(
+        self, scenario: Scenario, courses: list[str], *,
+        existing: list[list[str]] | None = None,
+        findings: list[str] | None = None,
+        repair: bool = False,
+        context_by_code: dict[str, str] | None = None,
+    ) -> tuple[str, str, str]:
+        """Place `courses` into semesters, and report what is wrong with `existing`.
+
+        ONE BUILDER, THREE CALLERS, and the sharing is deliberate — Mode A hands it the
+        student's own draft schedule (`existing`), Mode B stage 2 hands it a bare selection
+        (`existing=None`), and Mode C hands it the previous attempt plus the validator's
+        `findings`. They differ only in the variable tail, so the static hash is identical for
+        Mode A and Mode B stage 2 and the two are directly comparable.
+        """
+        static = ORDER_SYSTEM + (f"\n\n{REPAIR_RULES}" if repair else "")
+        # THE TARGET IS COMPUTED FROM THE COURSES IN FRONT OF THE MODEL, not from a separate
+        # course list — see `credit_load_line`. Anything the database has no credit figure for
+        # contributes nothing rather than a guessed default, so the target can only understate.
+        by_code = ({row["course_code"]: row for row in self.database.rows("courses")}
+                   if self.database is not None else {})
+        credits_remaining = sum(
+            float((by_code.get(code) or {}).get("credit_hours_min") or 0) for code in courses)
+        parts = [_profile_block(scenario.profile, scenario, self.database, credits_remaining), ""]
+        if existing is not None:
+            # ONE BLOCK, TWO PROVENANCES, AND THE LABEL HAS TO SAY WHICH. Mode A's `existing`
+            # is the student's own draft — a real schedule someone else wrote, which the model
+            # is being asked to nudge. Mode C's `existing` is the model's OWN previous attempt,
+            # which a validator just rejected. Both were once headed "THE SCHEDULE THE STUDENT
+            # ALREADY HAS", so on every repair pass the model was handed its own failed draft
+            # under a heading asserting the student was committed to it — directly below a
+            # profile line reading "Already completed: none". Told it to change nothing and
+            # that nothing had happened, in the same breath. Anchoring on a draft presented as
+            # settled fact is the correct response to that heading; the heading was the bug.
+            parts += [
+                ("YOUR PREVIOUS ATTEMPT — your own draft, not anything the student is committed "
+                 "to. Rewrite it as freely as you need to:") if repair else
+                "THE SCHEDULE THE STUDENT ALREADY HAS:",
+                self._semester_block(existing), ""]
+        parts += [
+            f"COURSES TO PLACE ({len(courses)}), with their prerequisites:",
+            self._course_block(courses, context_by_code),
+            "",
+        ]
+        if findings:
+            parts += ["WHAT THE VALIDATOR FOUND IN YOUR LAST SCHEDULE:"]
+            parts += [f"  - {f}" for f in findings]
+            parts.append("")
+        parts.append("Return the complete schedule.")
+        return static, "\n".join(parts), _static_hash(static, AUDIT_SCHEMA)
+
+    def _semester_block(self, semesters: list[list[str]]) -> str:
+        return "\n".join(
+            f"  Semester {index + 1}: " + (", ".join(codes) if codes else "(empty)")
+            for index, codes in enumerate(semesters)
+        ) or "  (no schedule yet)"
+
+    def _course_block(self, courses: list[str],
+                      context_by_code: dict[str, str] | None = None) -> str:
+        """The courses to place, GROUPED UNDER THE REQUIREMENT EACH ONE SATISFIES.
+
+        WHY GROUPED, 2026-08-14. This block was a flat list of `{"code","credits",
+        "prerequisites"}` rows — everything needed to SEQUENCE a course and nothing about what
+        it was FOR. Models dropped courses, and they dropped them silently and consistently:
+        every model missed requirements on the same programs, because from inside a flat list
+        there is no difference between omitting a course and omitting a degree requirement. The
+        model could see that CS 18200 needs CS 18000; it could not see that leaving out
+        BIOL 22100 fails "Science Courses".
+
+        Grouping restores that. Each requirement group prints its own heading with its kind
+        (`all of` / `choose N credits`) and its courses with credits, so an omission is
+        visibly an omission FROM SOMETHING. The prerequisite and corequisite facts stay on each
+        course line, because they are what the sequencing decision needs.
+
+        A course satisfying several groups is printed under each of them — that is the honest
+        rendering (one course really does pay into several requirements) and it also tells the
+        model that placing it once settles more than one line item. Courses in the plan that
+        belong to no group (prerequisite closure supplies these — Calculus I for a degree that
+        only names Calculus III) get their own trailing section, labelled for what they are.
+        """
+        by_code = {}
+        if self.database is not None:
+            by_code = {row["course_code"]: row for row in self.database.rows("courses")}
+        wanted = list(dict.fromkeys(courses))
+
+        def course_line(code: str) -> str:
+            row = by_code.get(code) or {}
+            credits = row.get("credit_hours_min")
+            bits = [f"{code} ({credits:g} cr)" if credits else code]
+            prereqs = row.get("prereq_groups") or []
+            if prereqs:
+                bits.append("needs " + " and ".join(
+                    " or ".join(group) for group in prereqs if group))
+            coreqs = row.get("coreq_codes") or []
+            if coreqs:
+                bits.append("with " + ", ".join(coreqs) + " in the same semester or earlier")
+            line = "      " + "; ".join(bits)
+            # RETRIEVED DETAIL, ATTACHED TO THE COURSE IT DESCRIBES (2026-08-15). This used to
+            # be a separate "RETRIEVED CATALOG CONTEXT" block after the course list, which
+            # printed each course's code twice — once where it had to be placed and once in a
+            # paragraph the model had to cross-reference by hand. Inline, the description sits
+            # where the decision is made and the second copy of the code disappears, so the
+            # prompt gets shorter AND the association gets easier. Trimmed, because a full
+            # catalog paragraph per course would swamp the structure this block exists to show.
+            detail = (context_by_code or {}).get(code)
+            if detail:
+                trimmed = " ".join(detail.split())
+                # The ingest prefixes every course chunk with "COURSE <CODE> — ", which is the
+                # code we just printed. Stripping it keeps the line reading as one statement
+                # about one course instead of naming it twice.
+                prefix = f"COURSE {code} —"
+                if trimmed.startswith(prefix):
+                    trimmed = trimmed[len(prefix):].strip()
+                if len(trimmed) > 220:
+                    trimmed = trimmed[:217].rstrip() + "..."
+                line += f" — {trimmed}"
+            return line
+
+        options_by_group: dict[str, list[str]] = {}
+        if self.database is not None:
+            for row in self.database.rows("requirement_options"):
+                options_by_group.setdefault(row["requirement_group_id"], []).append(
+                    row["course_code"])
+
+        lines: list[str] = []
+        claimed: set[str] = set()
+        if self.database is not None:
+            for row in self.database.rows("requirement_groups"):
+                members = [c for c in wanted
+                           if c in (options_by_group.get(row["id"]) or [])]
+                if not members:
+                    continue
+                claimed.update(members)
+                if row.get("requirement_type") == "choose_credits":
+                    target = row.get("credits_min")
+                    # "AT LEAST", not a bare figure. "choose 3 credits" reads as a quota to hit
+                    # exactly, and courses do not come in sizes that make that possible — the
+                    # only Written Communication options in English Education are a 3-credit and
+                    # a 2-credit course, so every satisfying answer overshoots. A model reading
+                    # the phrase as an equality has no legal move and picks the closest thing to
+                    # 3, which is the 2-credit course, which fails the requirement.
+                    kind = (f"take at least {target:g} credits' worth from this group — more "
+                            f"than {target:g} is fine, less is not"
+                            if target else "choose from")
+                else:
+                    kind = "take all of these"
+                lines.append(f"  {row.get('name')} — {kind}:")
+                lines += [course_line(c) for c in members]
+
+        leftover = [c for c in wanted if c not in claimed]
+        if leftover:
+            lines.append("  Prerequisites for the above (required to reach them, not a "
+                         "requirement group of their own):")
+            lines += [course_line(c) for c in leftover]
+        return "\n".join(lines)
 
     # -- Mode C: retry to convergence, with locked slots ------------------------------------
 

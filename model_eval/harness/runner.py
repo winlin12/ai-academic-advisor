@@ -39,13 +39,13 @@ from typing import Any
 
 import yaml
 
-from . import plan_scorers, scorers
+from . import plan_scorers, real_scoring, scorers
 from .catalog_export import CatalogDatabase
-from .fixtures import Fixture, Scenario
+from .fixtures import Fixture, Scenario, with_prereq_closure
 from .llamacpp_client import GenerationResult, LlamaCppClient, LlamaCppError
 from .real_db import (
     RealDatabaseBase, build_scenario_database, fetch_real_db_base, fixture_from_database,
-    merge_real_db_bases, resolve_poid,
+    merge_real_db_bases, resolve_poid, retrieve_context,
 )
 from .real_scoring import RealScore, score_against_real_db
 from .planner import (
@@ -53,8 +53,8 @@ from .planner import (
     set_planning_terms, severity,
 )
 from .prompts import (
-    PROPOSAL_SCHEMA, PromptBuilder, catalog_tags, json_response_format, plan_schema,
-    proposal_schema,
+    PromptBuilder, audit_schema, catalog_tags, json_response_format, proposal_schema,
+    selection_schema,
 )
 from .server import (
     ServerHandle, gpu_memory_used_mb, resolve_draft, resolve_host, slot_context,
@@ -167,7 +167,8 @@ class EvalContext:
 
     def write_transcript(
         self, model: str, stage: str, item: str, run_idx: int,
-        system: str, user: str, output: str, verdict: str = "", detail: str = "",
+        system: str, user: str, output: str, reasoning: str = "",
+        verdict: str = "", detail: str = "",
     ) -> None:
         """Save one full exchange as readable markdown.
 
@@ -189,7 +190,13 @@ class EvalContext:
             + (detail + "\n" if detail else "")
             + f"## System prompt\n\n```\n{system}\n```\n\n"
             f"## User prompt\n\n```\n{user}\n```\n\n"
-            f"## Model output\n\n```\n{output}\n```\n",
+            # REASONING IS A SEPARATE CHANNEL, not part of `output` — llama-server streams it
+            # as `delta.reasoning_content`, so without this it was recorded nowhere and the
+            # one question the thinking arm exists to answer ("what did it actually consider
+            # before scheduling?") could not be read back. Empty for every reasoning-off stage,
+            # where the heading is simply omitted.
+            + (f"## Reasoning\n\n```\n{reasoning}\n```\n\n" if reasoning else "")
+            + f"## Model output\n\n```\n{output}\n```\n",
             encoding="utf-8",
         )
 
@@ -230,18 +237,26 @@ def _score_detail(
 
     if score.semester_credits:
         terms = plan_scorers._terms(profile, len(score.semester_credits))
-        # BOTH credit numbers, because they mean different things and the table marks them
-        # differently: `asked` is what the student wants (over it is *heavy*, and shows up as a
-        # failed `max_credits_at_most` below), `ceiling` is what the registrar allows (over it
-        # is **OVER**, a hard violation). Printing only one of them is what made a 17-credit
-        # term read as the same kind of failure as a broken prereq chain.
+        # THE TABLE MARKS WHAT THE SCORER ACTUALLY COUNTS, and until now it did not. This block
+        # was written when passing the registrar's ceiling was a hard violation, and its own
+        # comment said so — but that policy changed on 2026-08-16, when `_ABSURD_SEMESTER_CREDITS`
+        # moved the hard line to 22 and left everything from the student's ask up to 21 soft.
+        # The markers were never updated, so a 19-credit term printed as **OVER** directly above
+        # "None — every hard rule held", and a 5th ENGL course printed **OVER** against a cap the
+        # scorer only counts softly. Two different answers to "is this a violation" on one page.
+        #
+        # Three bands now, matching `real_scoring` exactly: over the student's ask is *over ask*,
+        # past the tolerance band is *heavy*, and only 22+ — what nobody can register for — is
+        # **VIOLATION**. The major-course cap has no hard tier in the scorer at all, so it no
+        # longer prints one.
         asked = profile.max_credits_per_semester
         ceiling = profile.hard_credit_cap
         soft = min(profile.preferred_major_courses_per_semester,
                    profile.max_major_courses_per_semester)
         hard = profile.max_major_courses_per_semester
         lines += [
-            f"### Semesters (credits: {asked} asked, {ceiling} hard limit; "
+            f"### Semesters (credits: {asked} asked, {ceiling} registrar ceiling, "
+            f"{real_scoring._ABSURD_SEMESTER_CREDITS}+ is a violation; "
             f"{profile.major_subject} cap {hard}, {soft} preferred)", "",
             f"| # | term | credits | {profile.major_subject} | courses |",
             "|---|---|---|---|---|",
@@ -251,9 +266,11 @@ def _score_detail(
                      if i < len(score.major_courses_per_semester) else 0)
             term, year = terms[i] if i < len(terms) else ("?", "?")
             codes = ", ".join(semesters[i]) if i < len(semesters) else ""
-            over_cr = (" **OVER**" if credits > ceiling
-                       else (" *over ask*" if credits > asked else ""))
-            over_mj = " **OVER**" if major > hard else (" *heavy*" if major > soft else "")
+            over_cr = (" **VIOLATION**" if credits >= real_scoring._ABSURD_SEMESTER_CREDITS
+                       else (" *heavy*" if credits > asked + real_scoring._CREDIT_BAND
+                             else (" *over ask*" if credits > asked else "")))
+            over_mj = (" *over cap*" if major > hard
+                       else (" *heavy*" if major > soft else ""))
             lines.append(
                 f"| {i + 1} | {term} {year} | {credits}{over_cr} | {major}{over_mj} | {codes} |")
         lines.append("")
@@ -499,6 +516,31 @@ def _env_record(
     }
 
 
+def _stage_thinking(cfg: dict[str, Any]) -> bool | None:
+    """Should QA and explain ask the model to reason first?
+
+    Two conditions, and both are needed. The server must have been launched with a reasoning
+    budget (`run.reasoning_budget`), because a per-request `enable_thinking` cannot undo a
+    `--reasoning off` launch — see `server.build_argv`. And the advising stages must be opted
+    in separately (`run.advising_thinking`), because Mode C requires the launch budget for its
+    own reasons and the advising stages should not silently inherit its cost.
+
+    None rather than False when off, so the model's own template default stands instead of the
+    harness forcing a switch it may not honour.
+    """
+    if not cfg["run"].get("advising_thinking"):
+        return None
+    return True if int(cfg["run"].get("reasoning_budget") or 0) > 0 else None
+
+
+def _stage_tools(cfg: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """The tool list offered to QA/explain, or None when tools are switched off in config."""
+    web = (cfg.get("tools") or {}).get("web_search") or {}
+    if not web.get("enabled"):
+        return None
+    return [LlamaCppClient.WEB_SEARCH_TOOL]
+
+
 def _base_record(model: str, res: GenerationResult, static_hash: str, **extra) -> dict[str, Any]:
     # llama-server reports the draft counters in its own `timings` block, and ONLY when it
     # actually drafted (`draft_n > 0`) — so these keys are absent, not zero, for a model with no
@@ -518,6 +560,14 @@ def _base_record(model: str, res: GenerationResult, static_hash: str, **extra) -
         "finish_reason": res.finish_reason,
         "truncated": res.truncated,
         "output": res.text,
+        # DID THE MODEL ACTUALLY THINK? llama-server streams reasoning on its own channel
+        # (`delta.reasoning_content`), so it never appears in `output` and nothing downstream
+        # could see it. 0 on every stage that runs with reasoning off, which is the point: in
+        # the thinking arm a 0 means the template has no reasoning channel and the row is a
+        # plain Mode B in disguise, while a large number and an unchanged score means the model
+        # thought and did no better. Those are opposite findings that look identical in a
+        # score column.
+        "reasoning_chars": len(res.reasoning_text or ""),
     }
     if drafted:
         accepted = timings.get("draft_n_accepted") or 0
@@ -526,6 +576,225 @@ def _base_record(model: str, res: GenerationResult, static_hash: str, **extra) -
         rec["draft_acceptance"] = round(accepted / drafted, 4)
     rec.update(extra)
     return rec
+
+
+# --- the two stages every plan mode is built from ---------------------------------------------
+#
+# ARCHITECTURE, 2026-08-13. Every plan mode is now some arrangement of two calls:
+#
+#   SELECT   requirement groups in, chosen course codes out. No semesters, no prerequisites.
+#   ORDER    a course set in, a schedule out, plus what the model thinks is missing or wrong.
+#
+#   Mode A = ORDER over the student's own (damaged) draft schedule.
+#   Mode B = SELECT then ORDER.
+#   Mode C = SELECT then ORDER, then up to `repair_passes` more ORDER calls that may add or
+#            remove courses, each one shown the validator's findings from the last.
+#
+# The previous design fused select+order into one call against a ~12.5k-token catalog export
+# and measured, across 14 programs and 7 models: 34% viable at best, 11% at worst, 5-30
+# prerequisite violations each, up to 169 duplicate courses per model. Both halves were failing
+# independently, which is what a fused task looks like from the outside.
+
+
+def _selection_stage(
+    ctx: EvalContext, client: LlamaCppClient, model_cfg: dict, scenario: Scenario,
+) -> tuple[list[str], dict[str, Any], GenerationResult | None, tuple[str, str, str] | None]:
+    """Which courses does this student still need? Answered by SQL, not by a model.
+
+    NO GENERATION HAPPENS HERE ANY MORE (2026-08-14). `profile.remaining_courses` is already
+    the deterministic answer: `fixtures.select_remaining_courses` walks the requirement groups
+    (every `all_of` option, then enough of each `choose_credits` group to reach its credit
+    target, counting completed courses against it), and `with_prereq_closure` adds the
+    prerequisites the audit never lists. That is what Purdue's Smart Plan does, and this
+    harness's own numbers say it is right: the deterministic selector reaches 100% requirement
+    coverage on every program `run.py check` has been run against, while the best model tested
+    dropped seven required ANSC courses from a single group and lost 9 points of coverage doing
+    it (animal sciences, 2026-08-14).
+
+    Choosing courses is a join and a credit sum. It does not need a language model, and giving
+    it one only adds a way to be wrong. What still needs judgment — which of forty
+    interchangeable electives suits this student — is a ranking problem, and the elective
+    ranking already happens in `real_db.build_scenario_database` against the scenario's stated
+    preference.
+
+    The signature keeps its `client`/`model_cfg` parameters and its return shape so the callers
+    (`_run_staged_plan`, `convergence.run_case`) are unchanged; the generation slots simply come
+    back None and no tokens are spent.
+    """
+    chosen = [plan_scorers.normalize_code(c) for c in scenario.profile.remaining_courses]
+    fields = {
+        "selection_source": "deterministic",
+        "selection_parse_failed": False,
+        "selected_count": len(chosen),
+        "selection_coverage": _selection_coverage(ctx.database_for(scenario), scenario, chosen),
+    }
+    return chosen, fields, None, None
+
+
+def _selection_coverage(database, scenario: Scenario, chosen: list[str]) -> float:
+    """Requirement coverage of a course SET, ignoring order entirely.
+
+    Scored by handing `score_against_real_db` a single-semester plan containing everything
+    chosen — the same requirement logic the final plan is scored with, so the two numbers are
+    comparable and a coverage drop between them is attributable to the ordering stage.
+    """
+    if not chosen:
+        return 0.0
+    score = score_against_real_db(database, scenario.profile, [list(chosen)])
+    return round(score.requirement_coverage, 4)
+
+
+def _order_stage(
+    ctx: EvalContext, client: LlamaCppClient, model_cfg: dict, scenario: Scenario,
+    courses: list[str], *, existing: list[list[str]] | None = None,
+    findings: list[str] | None = None, repair: bool = False,
+    think_override: bool | None = None, extra_max_tokens: int = 0,
+    context_by_code: dict[str, str] | None = None,
+) -> tuple[list[list[str]], dict[str, Any], GenerationResult, tuple[str, str, str]]:
+    """Ask the model to place `courses` into semesters and report what is wrong.
+
+    The course enum is bound to `courses` plus whatever the draft already contains — NOT to the
+    whole catalog. That is the structural difference from the old fused Mode B: the model
+    physically cannot wander outside the selection, so "did it invent a course" stops being a
+    failure mode this stage can have, and the grammar is small enough to keep a 30B model on
+    task.
+    """
+    database = ctx.database_for(scenario)
+    prompt = ctx.prompts_for(scenario).order_courses(
+        scenario, courses, existing=existing, findings=findings, repair=repair,
+        context_by_code=context_by_code)
+    system, user, _ = prompt
+    enum_codes = set(courses) | {c for sem in (existing or []) for c in sem}
+    # Repair may legitimately need a course the selection stage missed, so it gets the full
+    # option list to choose from; the ordering stages do not.
+    if repair:
+        enum_codes |= {row["course_code"] for row in database.rows("requirement_options")}
+    res = client.chat(
+        system, user,
+        options=sampling_options(
+            ctx.cfg, max_tokens=ctx.cfg["run"]["max_plan_tokens"] + extra_max_tokens,
+            model_cfg=model_cfg),
+        think=think_override if think_override is not None else model_cfg.get("think"),
+        response_format=json_response_format(
+            "ScheduleAudit",
+            audit_schema(ctx.cfg["run"]["planning_terms"], sorted(enum_codes))),
+    )
+    parsed = scorers.extract_json(res.text)
+    if not parsed or not isinstance(parsed.get("semesters"), list):
+        return [], {
+            "structure_ok": False,
+            "parse_failure_reason": "no JSON object" if not parsed else "no semesters array",
+        }, res, prompt
+
+    semesters = [
+        [plan_scorers.normalize_code(str(c)) for c in (s.get("courses") or [])]
+        for s in parsed["semesters"] if isinstance(s, dict)
+    ]
+    fields = {
+        "structure_ok": True,
+        "term_labels_ok": _term_labels_ok(parsed["semesters"], scenario.profile),
+    }
+    return semesters, fields, res, prompt
+
+
+def _context_by_code(chunks: list[dict[str, Any]]) -> dict[str, str]:
+    """Retrieved chunks, keyed by the course they describe, for inline rendering.
+
+    A chunk with no `code` in its metadata (a requirement-group passage) is dropped rather than
+    attached to an arbitrary course — it has no line to sit on, and the course block is the only
+    place this stage renders retrieved text now.
+    """
+    out: dict[str, str] = {}
+    for chunk in chunks:
+        code = (chunk.get("metadata") or {}).get("code")
+        if code and code not in out:
+            out[str(code)] = str(chunk.get("content") or "")
+    return out
+
+
+def _score_semesters(
+    ctx: EvalContext, scenario: Scenario, semesters: list[list[str]],
+) -> tuple[RealScore, list[list[str]], int]:
+    """Dedupe then score against this scenario's own real database. Shared by every mode so a
+    plan's number means the same thing wherever it came from."""
+    database = ctx.database_for(scenario)
+    alias_of = {row["course_code"]: row["alias_of"] for row in database.rows("course_aliases")}
+    real_canonical = {code: alias_of.get(code, code) for code in database.course_codes}
+    canon = lambda code: real_canonical.get(code, code)  # noqa: E731
+    completed = {canon(plan_scorers.normalize_code(c))
+                 for c in scenario.profile.completed_courses}
+    deduped, duplicates_removed = plan_scorers.dedupe_semesters(
+        semesters, canon=canon, completed=completed)
+    score = score_against_real_db(
+        database, scenario.profile, deduped, assertions=scenario.assertions)
+    return score, deduped, len(duplicates_removed)
+
+
+def _audit_findings(score: RealScore, profile: Profile, *,
+                    expected: list[str] | None = None,
+                    placed: list[list[str]] | None = None) -> list[str]:
+    """What the validator found, in the order a model should deal with it.
+
+    VIOLATIONS FIRST: an illegal plan is a harder failure than an unfilled elective, and a model
+    reading a list top-down should hit the blocking problems first.
+
+    SPREAD IS IN HERE NOW (2026-08-17), and it is the reason this function takes a profile.
+    Uneven distribution was the one defect the repair loop could never fix, because nobody told
+    the model about it — `violations` and `missing_requirements` describe legality and coverage,
+    and a plan can be perfect on both while handing the student 18 credits in the spring and 3
+    in the autumn. Measured on qwen3.8-27b: 100% coverage, zero violations, and
+    `[16, 18, 15, 17, 18, 17, 3, 0, 0, 0]` for a student who asked for thirteen. The findings
+    are phrased as the specific terms to move credit between, rather than "spread more evenly",
+    because the model already read that instruction once and a repeat of it carries no new
+    information.
+    """
+    findings = list(score.violations)
+
+    # THE OMISSION ITSELF, NAMED, AHEAD OF THE REQUIREMENT IT BROKE. Every unmet requirement
+    # measured on English Education traced back to a course that was handed to the model and
+    # never placed — not to a choice between options and not to arithmetic. The requirement-level
+    # phrasing ("Written Communication: 1 more credit(s) from this list") asks the model to
+    # re-derive WHICH course it forgot, by re-reading a 38-item list and redoing the credit sum
+    # that already went wrong once. Naming the course turns that back into a placement.
+    if expected:
+        seen = {c for sem in (placed or []) for c in sem}
+        dropped = [c for c in expected if c not in seen]
+        if dropped:
+            findings.append(
+                f"you left {len(dropped)} course(s) out of the schedule entirely: "
+                f"{', '.join(dropped)}. Every course in the list must appear exactly once — "
+                f"place them"
+            )
+
+    findings += [f"still missing: {m}" for m in score.missing_requirements]
+
+    credits = score.semester_credits or []
+    ask = int(profile.max_credits_per_semester or 0)
+    if credits:
+        over = [i + 1 for i, c in enumerate(credits) if ask and c > ask]
+        if over:
+            findings.append(
+                f"semester(s) {', '.join(map(str, over))} exceed the student's limit of {ask} "
+                f"credits ({', '.join(str(credits[i - 1]) for i in over)}) — move courses out "
+                f"of them into the lighter semesters"
+            )
+        # An EMPTY term while another is overloaded is the specific shape to name: it is the
+        # one the student notices, and it is trivially fixable by moving a course.
+        empty = [i + 1 for i, c in enumerate(credits) if c == 0]
+        if empty and max(credits) > (ask or max(credits)):
+            findings.append(
+                f"semester(s) {', '.join(map(str, empty))} are empty while others are full — "
+                f"the student has {profile.semesters_to_plan} semesters and every one of them "
+                f"should carry work"
+            )
+        light = [i + 1 for i, c in enumerate(credits) if 0 < c < 6]
+        if light and max(credits) - min(c for c in credits if c) > 8:
+            findings.append(
+                f"semester(s) {', '.join(map(str, light))} carry very little "
+                f"({', '.join(str(credits[i - 1]) for i in light)} credits) against a heaviest "
+                f"term of {max(credits)} — even that out"
+            )
+    return findings
 
 
 # --- MODE A: revise-plan proposal (the app's production path) -------------------------------
@@ -539,6 +808,15 @@ def run_mode_a(
 
     The plan that comes out is legal by construction, so viability is not the discriminator
     here — proposal groundedness and whether the student's ask was honoured are.
+
+    RESTORED 2026-08-14, after two days as a schedule-audit task. The audit version asked the
+    model to find planted damage in a draft and scored it against the answer key, which was a
+    real measurement — but it measured something the app does not do. This is the app's actual
+    revise-plan call site, and its value is precisely that viability should be ~100% for every
+    model BY CONSTRUCTION: the model expresses preferences and a deterministic planner rebuilds
+    the schedule, so it cannot emit an illegal plan. When this column is not ~100%, the finding
+    is that `harness/planner.py` has drifted from `backend/app/services/planner.py` — an
+    invariant worth having, and one no other mode provides. See `run.py parity`.
     """
     profile, catalog = scenario.profile, ctx.fixture.catalog
     baseline = generate_plan(profile, catalog)
@@ -692,177 +970,249 @@ def run_mode_a(
     )
 
 
-# --- MODES B and C: free-form plan of study --------------------------------------------------
-#
-# ONE function, two prompts. Mode C exists to measure what the published sample plan buys, and
-# that subtraction is only valid if everything downstream of the prompt — sampling options, the
-# response grammar, the parse, the scorer, the record shape — is identical. Two near-copies of
-# this function would drift, and the drift would land in the delta.
+# --- MODES B and C: select, then order (C repairs) ---------------------------------------------
 
 
 def run_mode_b(
     ctx: EvalContext, client: LlamaCppClient, model_cfg: dict,
     scenario: Scenario, run_idx: int, out, *, mitigate: bool,
 ) -> None:
-    """The model emits the whole schedule. Scored against the real database it was shown
-    (`real_scoring.score_against_real_db`) — not the fixture; see that module's docstring.
-
-    This is where models actually separate. A plan is viable only if it has ZERO hard
-    violations and covers every CHECKABLE requirement — one prerequisite mistake anywhere in
-    eight semesters fails the whole plan, which is the correct standard: a student following it
-    would be turned away at registration.
-    """
-    _run_freeform_plan(
-        ctx, client, model_cfg, scenario, run_idx, out,
-        mitigate=mitigate, stage="plan_mode_b",
-        prompt=ctx.prompts_for(scenario).plan_freeform(scenario),
-    )
+    """Select, schedule, then repair — and write both Mode B and Mode C. See
+    `_run_staged_plan`, which explains why the two modes share one pass."""
+    _run_staged_plan(ctx, client, model_cfg, scenario, run_idx, out,
+                     mitigate=mitigate, stage="plan_mode_b",
+                     repair_passes=int(ctx.cfg["run"].get("repair_passes", 2)))
 
 
-def run_mode_b_thinking(
-    ctx: EvalContext, client: LlamaCppClient, model_cfg: dict,
-    scenario: Scenario, run_idx: int, out, *, thinking_budget: int,
-) -> None:
-    """Mode B, but the model reasons BEFORE it commits to the plan, bounded to
-    `thinking_budget` tokens — see `run_thinking_experiment` for why this needs its own server
-    process and can never run inside the baseline's own `run_mode_b` pass.
-
-    This is a different mechanism from the removed post-hoc `rationale` field
-    (`prompts.PLAN_SCHEMA`'s own history note): that text was written AFTER `semesters` was
-    already fixed, so nothing in it could have changed the plan — pure narration, correctly
-    cut for the tokens it cost. Reasoning that happens before the grammar-constrained JSON
-    starts is structurally different: it is generated BEFORE any course is chosen, so it is at
-    least possible for it to change what gets picked. Whether it actually does, on THESE
-    models, is the open question this experiment measures — same prompt, same schema, same
-    scorer as `run_mode_b`, the only difference is reasoning on vs. off.
-    """
-    _run_freeform_plan(
-        ctx, client, model_cfg, scenario, run_idx, out,
-        mitigate=False, stage="plan_mode_b_thinking",
-        prompt=ctx.prompts_for(scenario).plan_freeform(scenario),
-        think_override=True, extra_max_tokens=thinking_budget,
-    )
-
-
-def _run_freeform_plan(
-    ctx: EvalContext, client: LlamaCppClient, model_cfg: dict,
-    scenario: Scenario, run_idx: int, out, *, mitigate: bool,
-    stage: str, prompt: tuple[str, str, str],
+def _run_staged_plan(
+    ctx: EvalContext, client: LlamaCppClient, model_cfg: dict, scenario: Scenario,
+    run_idx: int, out, *, mitigate: bool, stage: str, repair_passes: int,
     think_override: bool | None = None, extra_max_tokens: int = 0,
+    variant: str | None = None,
 ) -> None:
-    """`think_override`/`extra_max_tokens` exist for exactly one caller, `run_mode_b_thinking`:
-    force reasoning ON for this call (independent of `model_cfg["think"]`, which stays the
-    baseline's own setting) and widen the token budget by the reasoning budget the server was
-    launched with, so a bounded pre-plan reasoning pass doesn't starve the JSON plan that has
-    to follow it out of `max_plan_tokens`. Both are no-ops (`None`/`0`) on every other call.
+    """SELECT -> ORDER -> repair, writing MODE B AND MODE C FROM ONE PASS (2026-08-17).
+
+    Mode B IS the first attempt. Mode C is where that attempt ends up after the validator has
+    told the model what was wrong and it has had `repair_passes` more tries. Running them as
+    one loop rather than two tasks halves the generation: the old arrangement paid for attempt
+    one twice, once as Mode B's whole answer and again as Mode C's opening move, from the same
+    model on the same prompt.
+
+    So the pair is now a true before/after on the SAME plan — not two independently sampled
+    ones — which is what makes "did the feedback help" answerable at all. Two records come out
+    of here: `plan_mode_b` (attempt 1, exactly as it stood) and `plan_mode_c` (the final state,
+    plus the per-attempt trace).
+
+    THIS REPLACED THE REASONING ARM. Mode C spent two days as "Mode B with thinking forced on";
+    measured on qwen3.8-27b, reasoning cost ~2x latency for mean credit spread 13.8 -> 14.4,
+    mean over-ask 1.4 -> 1.6, and viability 5/5 -> 3/5 (two plans broke the 22-credit line).
+    The repair loop, by contrast, demonstrably moves coverage — 0.44 -> 0.89 across attempts on
+    the same model. Feedback earns its tokens; thinking did not.
     """
-    system, user, static_hash = prompt
-    database = ctx.database_for(scenario)
-    try:
-        res = client.chat(
-            system, user,
-            options=sampling_options(
-                ctx.cfg, max_tokens=ctx.cfg["run"]["max_plan_tokens"] + extra_max_tokens,
-                model_cfg=model_cfg),
-            think=think_override if think_override is not None else model_cfg.get("think"),
-            # THE COURSE ENUM MUST COME FROM THIS SCENARIO'S OWN `database`, NOT
-            # `ctx.fixture.catalog` AND NOT ANOTHER SCENARIO'S DATABASE. This schema is what
-            # grammar-constrains the model's OUTPUT — get it wrong and the model is not merely
-            # scored against the wrong catalog, it is physically unable to emit any course
-            # outside whatever catalog built the enum, no matter what program or elective menu
-            # the PROMPT TEXT showed it. That was exactly backwards for a non-CS `--major`: the
-            # model was shown a real WGSS catalog and grammar-forced to answer only in CS
-            # Machine Intelligence course codes, which is why every course it could possibly
-            # write scored `hallucinated_course` against the real program — the grammar had
-            # already made a correct answer impossible before the model wrote a token. The same
-            # failure mode now applies PER SCENARIO, not just per program.
-            response_format=json_response_format(
-                "PlanOfStudy", plan_schema(
-                    ctx.cfg["run"]["planning_terms"],
-                    sorted(database.course_codes))),
+    chosen, select_fields, _select_res, _select_prompt = _selection_stage(
+        ctx, client, model_cfg, scenario)
+
+    real_db_cfg = ctx.cfg.get("real_db", {})
+    context_by_code = _context_by_code(retrieve_context(
+        os.environ.get("MODEL_EVAL_REAL_DB_URL", real_db_cfg["url"]),
+        chosen, query=scenario.feedback,
+        top_k=int(ctx.cfg["run"].get("rag_top_k", 12)),
+        allowed_codes=set(ctx.database_for(scenario).course_codes),
+    ))
+    select_fields["context_chunks"] = len(context_by_code)
+
+    total_s = 0.0
+    eval_count = 0
+    attempts: list[dict[str, Any]] = []
+    semesters: list[list[str]] = []
+    score = RealScore()
+    order_fields: dict[str, Any] = {"structure_ok": False,
+                                    "parse_failure_reason": "selection produced no courses"}
+    last_exchange = ("", "", "", "")
+    # ATTEMPT ONE IS KEPT SEPARATELY BECAUSE IT IS A DIFFERENT MODE'S EVIDENCE. `last_exchange`
+    # is overwritten every pass, so after the loop it holds Mode C's final repair prompt — which
+    # was then being filed as the Mode B transcript, complete with the previous attempt's full
+    # schedule under a "THE SCHEDULE THE STUDENT ALREADY HAS" heading, for a fresh-start student
+    # who has completed nothing. The record in the JSONL was right all along (emitted at attempt
+    # 1, below); only the saved transcript was showing a later pass under Mode B's name.
+    first_exchange = ("", "", "", "")
+    duplicates_removed = 0
+    findings: list[str] | None = None
+    static_hash = ""
+    res = None
+    # THE BEST ATTEMPT WINS, NOT THE LAST ONE (2026-08-17).
+    #
+    # A revision pass can make a good plan worse. Measured on qwen3.8-27b / midway-catchup: the
+    # first attempt was `[13, 15, 15, 14, 17, 10]`, spread 7, nothing wrong with it that
+    # mattered; three passes later it was `[17, 18, 14, 15, 13, 7]`, spread 11. The model was
+    # handed findings, moved things around, and ended up further from where it started. Taking
+    # whatever attempt 3 happened to produce would report that regression as Mode C's result,
+    # which describes the loop's last roll rather than what it can do.
+    #
+    # So Mode C reports the best state the loop ever reached. That is also the honest product
+    # answer: a system that revises a plan three times and shows the student the worst of the
+    # three is not one anybody would ship.
+    best: dict[str, Any] | None = None
+
+    def emit(stage_name: str, *, trace: bool, best_attempt: int | None = None) -> None:
+        """Write one record. Mode B gets attempt 1's state; Mode C gets the final state."""
+        rec = _base_record(
+            model_cfg["name"], res, static_hash,
+            stage=stage_name, scenario=scenario.id, run_idx=run_idx, mitigated=mitigate,
+            expect_unsatisfiable=scenario.expect_unsatisfiable,
+            fixture_hash=ctx.fixture.fixture_hash,
         )
-    except LlamaCppError as exc:
-        out.write(json.dumps({
-            "model": model_cfg["name"], "stage": stage, "scenario": scenario.id,
-            "run_idx": run_idx, "mitigated": mitigate, "error": str(exc)}) + "\n")
-        return
-
-    parsed = scorers.extract_json(res.text)
-    rec = _base_record(
-        model_cfg["name"], res, static_hash,
-        stage=stage, scenario=scenario.id, run_idx=run_idx, mitigated=mitigate,
-        expect_unsatisfiable=scenario.expect_unsatisfiable,
-        fixture_hash=ctx.fixture.fixture_hash,
-    )
-
-    if not parsed or not isinstance(parsed.get("semesters"), list):
-        # Not a scoring edge case — a plan that cannot be parsed cannot be shown to a student.
-        rec.update(RealScore().as_record())
-        rec["structure_ok"] = False
-        rec["parse_failure_reason"] = "no JSON object" if not parsed else "no semesters array"
+        rec.update(select_fields)
+        rec.update(order_fields)
+        rec.update(score.as_record())
+        rec.update({
+            "total_s": round(total_s, 3),
+            "eval_count": eval_count,
+            "semesters": semesters,
+            "semester_count": len(semesters),
+            "over_horizon": len(semesters) > scenario.profile.semesters_to_plan,
+            "duplicates_removed": duplicates_removed,
+            **({"variant": variant} if variant else {}),
+        })
+        if trace:
+            rec.update({
+                "attempts": attempts,
+                "attempts_used": len(attempts),
+                # Which attempt this record actually reports. Below `attempts_used` whenever a
+                # later pass made the plan worse and the guard kept the earlier one.
+                "best_attempt": best_attempt,
+                # CLEAN, not merely viable — the first attempt the validator had nothing to
+                # say about. A plan that is legal but lopsided is not converged here.
+                "converged_at": next(
+                    (a["attempt"] for a in attempts if a.get("findings") == 0), None),
+            })
+        if not order_fields.get("structure_ok"):
+            rec["structure_ok"] = False
         out.write(json.dumps(rec, default=str) + "\n")
-        ctx.write_transcript(model_cfg["name"], stage, scenario.id, run_idx,
-                             system, user, res.text,
-                             verdict=f"UNPARSEABLE ({rec['parse_failure_reason']})")
-        return
 
-    raw_semesters = [
-        [str(c) for c in (s.get("courses") or [])]
-        for s in parsed["semesters"] if isinstance(s, dict)
-    ]
-    # Every real course maps to itself except the aliased subset, which maps to its primary —
-    # same shape as `fixture.canonical`, built from `database` instead.
-    alias_of = {row["course_code"]: row["alias_of"] for row in database.rows("course_aliases")}
-    real_canonical = {code: alias_of.get(code, code) for code in database.course_codes}
-    canon = lambda code: real_canonical.get(code, code)  # noqa: E731
-    completed = {canon(plan_scorers.normalize_code(c)) for c in scenario.profile.completed_courses}
-    # DEDUPE BEFORE SCORING, not after — see plan_scorers.dedupe_semesters's docstring. A
-    # repeated or already-completed course is deleted here so `score_against_real_db` never
-    # sees it and `plan_viable` is never held hostage by one trivially-fixable repeated line.
-    semesters, duplicates_removed = plan_scorers.dedupe_semesters(
-        raw_semesters, canon=canon, completed=completed
-    )
-    # SCORED AGAINST `database` — this SCENARIO's own real, live catalog, the one it was
-    # actually shown and grammar-constrained to — not the hand-authored fixture, and not any
-    # other scenario's database. See real_scoring.py's module docstring for the incidents (real
-    # courses flagged hallucinated, invented gen-ed groups counted as "missing") that made
-    # scoring Mode B against the fixture wrong rather than merely approximate; the same
-    # reasoning is why this must be `database`, not `ctx.database_for` of a different scenario.
-    real_score = score_against_real_db(
-        database, scenario.profile, semesters, assertions=scenario.assertions
-    )
-    planned_codes = {plan_scorers.normalize_code(c) for s in semesters for c in s}
-    rec.update(real_score.as_record())
-    rec.update({
-        "semesters": semesters,
-        "semester_count": len(semesters),
-        "over_horizon": len(semesters) > scenario.profile.semesters_to_plan,
-        "duplicates_removed": duplicates_removed,
-        "declared_unplanned": parsed.get("unplanned") or [],
-        "rationale": parsed.get("rationale"),
-        "rationale_flags": plan_scorers.rationale_flags(
-            str(parsed.get("rationale") or ""), planned_codes, database.course_codes
-        ),
-        "term_labels_ok": _term_labels_ok(parsed["semesters"], scenario.profile),
-        # Empty on every call except `run_mode_b_thinking`'s (see that function and
-        # `_run_freeform_plan`'s own docstring) — reasoning stays off at launch everywhere
-        # else, so this channel never fires there.
-        "reasoning_chars": len(res.reasoning_text),
-    })
-    out.write(json.dumps(rec, default=str) + "\n")
-    program_rows = database.rows("programs")
-    program_name = program_rows[0]["name"] if program_rows else "(unknown program)"
-    transcript_text = res.text
-    if res.reasoning_text:
-        transcript_text = f"<think>\n{res.reasoning_text}\n</think>\n\n{res.text}"
-    ctx.write_transcript(
-        model_cfg["name"], stage, scenario.id, run_idx, system, user, transcript_text,
-        verdict=f"viable={real_score.viable} coverage={real_score.requirement_coverage:.0%} "
-                f"violations={real_score.violation_counts or 'none'} | "
-                f"{real_score.groups_satisfied}/{real_score.groups_total} requirement groups",
-        detail=_score_detail(real_score, semesters, scenario.profile)
-              + "\n" + _real_score_detail(real_score, program_name),
-    )
+    for attempt in range(1, repair_passes + 2):
+        if not chosen and attempt == 1:
+            break
+        try:
+            raw, order_fields, res, prompt = _order_stage(
+                ctx, client, model_cfg, scenario, chosen,
+                existing=semesters or None, findings=findings, repair=attempt > 1,
+                think_override=think_override, extra_max_tokens=extra_max_tokens,
+                context_by_code=context_by_code)
+        except LlamaCppError as exc:
+            order_fields = {"structure_ok": False, "parse_failure_reason": str(exc)}
+            break
+        total_s += res.total_s
+        eval_count += res.eval_count or 0
+        static_hash = prompt[2]
+        last_exchange = (prompt[0], prompt[1], res.text, res.reasoning_text)
+        if attempt == 1:
+            first_exchange = last_exchange
+        if order_fields.get("structure_ok"):
+            score, semesters, duplicates_removed = _score_semesters(ctx, scenario, raw)
+            attempts.append({
+                "attempt": attempt,
+                "viable": score.viable,
+                "coverage": round(score.requirement_coverage, 4),
+                "violations": len(score.violations),
+                "credit_spread": score.credit_spread,
+                "over_ask_terms": score.soft_credit_overages,
+            })
+        else:
+            attempts.append({"attempt": attempt, "structure_ok": False})
+
+        # MODE B IS ATTEMPT ONE, WRITTEN BEFORE ANY FEEDBACK EXISTS. Emitted here rather than
+        # reconstructed at the end so it records exactly what the model produced unaided.
+        if attempt == 1:
+            emit(stage, trace=False)
+
+        if not order_fields.get("structure_ok"):
+            findings = ["Your last answer was not valid JSON and could not be read."]
+            continue
+
+        # THE LOOP STOPS WHEN THERE IS NOTHING LEFT TO SAY, NOT WHEN THE PLAN IS MERELY LEGAL.
+        #
+        # It used to break on `score.viable`, and that made the repair passes unreachable for
+        # exactly the defect they were added to fix: `viable` means zero hard violations and
+        # full requirement coverage, which a badly-shaped plan satisfies easily. Measured on
+        # qwen3.8-27b, every scenario converged on attempt 1 while light-load stood at
+        # `[16, 18, 15, 17, 18, 17, 3, 0, 0, 0]` — five terms over the student's limit, three
+        # semesters empty, and viable. The model was never told, because the loop had already
+        # decided it was done.
+        #
+        # `_audit_findings` is now the whole stopping condition: while it has something to
+        # report — a violation, an unmet requirement, an overloaded or empty term — there is a
+        # revision worth asking for. An empty findings list means legal, complete AND evenly
+        # spread, which is the plan a student should actually receive.
+        findings = _audit_findings(score, scenario.profile,
+                                   expected=chosen, placed=semesters)
+        attempts[-1]["findings"] = len(findings)
+
+        # RANKED, not "latest wins". Parseable first (an unreadable plan is not a plan), then
+        # fewest outstanding findings, then coverage, then the tightest spread as the
+        # tie-break. Ties keep the EARLIER attempt, since a later one that is no better cost
+        # tokens to produce and carries no evidence it is any more sound.
+        rank = (len(findings) * -1, round(score.requirement_coverage, 4), -score.credit_spread)
+        if best is None or rank > best["rank"]:
+            best = {"rank": rank, "attempt": attempt, "score": score,
+                    "semesters": semesters, "duplicates": duplicates_removed,
+                    "order_fields": dict(order_fields)}
+        if not findings or attempt > repair_passes:
+            break
+        # UNION, NEVER REPLACEMENT (2026-08-17). This read
+        # `chosen = sorted({c for sem in semesters for c in sem})` — the next attempt's course
+        # list rebuilt from what the model actually placed. So every course the model FORGOT was
+        # deleted from the list it was about to be asked to fix. Measured on qwen3.8-27b /
+        # fresh-start: attempt 1 was handed 38 courses and placed 36, and attempt 2 was handed
+        # those 36 — while being told "University Core: Written Communication: 1 more credit(s)
+        # from this list", with AMST 10100, the only remaining course in that group, no longer in
+        # the list. The repair pass was asked to fix an omission using a list the omission had
+        # been erased from, so no number of passes could ever converge.
+        #
+        # REPAIR_RULES lets the model add and drop courses deliberately, and that still works:
+        # anything it added is picked up from `semesters`. What it can no longer do is lose a
+        # course by silence.
+        chosen = sorted(set(chosen) | {c for sem in semesters for c in sem})
+
+    if not attempts:
+        emit(stage, trace=False)
+    # Mode C reports `best`, which is usually but not always the final attempt — see the guard.
+    if best is not None:
+        score = best["score"]
+        semesters = best["semesters"]
+        duplicates_removed = best["duplicates"]
+        order_fields = best["order_fields"]
+        best_attempt = best["attempt"]
+    else:
+        best_attempt = None
+    emit(_REPAIRED_STAGE.get(stage, "plan_mode_c"), trace=True, best_attempt=best_attempt)
+
+    # ONE TRANSCRIPT PER MODE, EACH SHOWING ITS OWN EXCHANGE. Mode B's is attempt 1 — what the
+    # model wrote unaided, with no prior schedule in the prompt. Mode C's is the final pass, and
+    # it is only written when a repair pass actually ran; a plan that converged on attempt 1 has
+    # no second exchange to show and gets a Mode B transcript alone.
+    detail = (_score_detail(score, semesters, scenario.profile)
+              + "\n" + _real_score_detail(score, ctx.fixture.name))
+    if first_exchange[1]:
+        ctx.write_transcript(
+            model_cfg["name"], stage, scenario.id, run_idx, *first_exchange,
+            verdict=f"selected {select_fields.get('selected_count')} course(s), "
+                    f"attempt 1 of {len(attempts)} — scores below are Mode C's reported plan",
+            detail=detail,
+        )
+    if len(attempts) > 1:
+        ctx.write_transcript(
+            model_cfg["name"], _REPAIRED_STAGE.get(stage, "plan_mode_c"),
+            scenario.id, run_idx, *last_exchange,
+            verdict=f"selected {select_fields.get('selected_count')} course(s), "
+                    f"viable={score.viable} coverage={score.requirement_coverage:.0%} "
+                    f"attempts={len(attempts)} best={best_attempt}",
+            detail=detail,
+        )
+
+
+# Which stage each first-attempt stage graduates into once the repair loop has run.
+_REPAIRED_STAGE = {"plan_mode_b": "plan_mode_c", "plan_mode_b_thinking": "plan_mode_c_thinking"}
 
 
 def _term_labels_ok(semesters: list[dict], profile: Profile) -> bool:
@@ -895,7 +1245,17 @@ def run_qa(
         res = client.chat(
             system, user,
             options=sampling_options(ctx.cfg, model_cfg=model_cfg),
-            think=model_cfg.get("think"),
+            # FULL REIGN ON THE ADVISING STAGES (2026-08-13): reasoning on, and the web-search
+            # tool offered. A student's question is exactly the case where what to fetch depends
+            # on what was asked — see `llamacpp_client`'s tools section — and the abstention
+            # policy the prompt now carries wants the model to have tried before it says it
+            # cannot answer. Both are no-ops where unavailable: reasoning needs a server
+            # launched with a budget (`run.reasoning_budget`), and the search tool reports
+            # itself unavailable until a provider is configured.
+            think=_stage_thinking(ctx.cfg),
+            tools=_stage_tools(ctx.cfg),
+            max_tool_calls=int(((ctx.cfg.get("tools") or {}).get("web_search")
+                                or {}).get("max_calls", 3)),
         )
     except LlamaCppError as exc:
         out.write(json.dumps({
@@ -905,6 +1265,9 @@ def run_qa(
 
     rec = _base_record(
         model_cfg["name"], res, static_hash,
+        # WHAT THE MODEL WENT AND FETCHED. Empty on a question it answered from context alone;
+        # a long list means it kept asking, which is worth seeing next to the latency.
+        tool_calls=(res.raw_final.get("tool_calls") or []),
         stage="qa", question_id=question["id"], category=question.get("category"),
         # `topic` (course | policy | process) is what `report._qa_section`'s by-topic table
         # slices on — a bot can be fluent about prerequisites and useless about how to CODO,
@@ -965,7 +1328,9 @@ def run_explain(
             options=sampling_options(
                 ctx.cfg, max_tokens=ctx.cfg["run"].get("max_explain_tokens"),
                 model_cfg=model_cfg),
-            think=model_cfg.get("think")
+            # Same allowance as QA — see `run_qa`'s comment.
+            think=_stage_thinking(ctx.cfg),
+            tools=_stage_tools(ctx.cfg),
         )
     except LlamaCppError as exc:
         out.write(json.dumps({
@@ -1341,11 +1706,11 @@ def run_thinking_experiment(
     keeping the results apart is what makes "reasoning on vs. off, same prompt, same schema,
     same scorer" a comparison that means something, rather than one file mixing two settings.
 
-    NOT in `run.default_tasks` — this only runs when asked for by name, exactly like
-    `converge` used to before it was folded into `--tasks`, except this one stays opt-in on
-    purpose: it is a genuine experiment (does reasoning change the plan?), not a mode the app
-    ships, and every sweep paying its cost by default would be measuring something nobody asked
-    for.
+    OPT-IN AGAIN AS OF 2026-08-21. It spent a day in `run.default_tasks` to settle whether
+    pre-plan reasoning produces a more balanced schedule. It does not — spread got worse on 5
+    of 7 models, and the viability it did buy landed almost entirely on two models that were
+    failing without it, at 3-4x wall clock. config.yaml's `thinking:` block carries the full
+    numbers. Kept runnable by name for a targeted re-test; not worth a sweep's time by default.
     """
     ctx = load_context(root)
     thinking_cfg = ctx.cfg.get("thinking") or {}

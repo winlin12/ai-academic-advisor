@@ -543,10 +543,7 @@ export default function HomePage() {
           )}
 
           {plan && provenance && (
-            <ProvenancePanel
-              provenance={provenance}
-              unresolved={requirements?.unresolved.length ?? 0}
-            />
+            <ProvenancePanel provenance={provenance} />
           )}
 
           {plan && !provenance && !aiMode && (
@@ -675,17 +672,9 @@ export default function HomePage() {
 // it, so "the AI made this" is only partly true and the student is entitled to the specifics:
 // how much of the degree it covers, what was dropped as unschedulable, what was added back.
 // Anything hidden here is something a student would find out later, from a registrar.
-function ProvenancePanel({
-  provenance,
-  unresolved,
-}: {
-  provenance: PlanProvenance;
-  // How many requirements nobody can check. A "100% covered" chip over a degree with ten
-  // unverifiable requirements is the single most misleading thing this screen could say.
-  unresolved: number;
-}) {
+function ProvenancePanel({ provenance }: { provenance: PlanProvenance }) {
   const coverage = Math.round(provenance.requirement_coverage * 100);
-  const complete = coverage >= 100 && unresolved === 0;
+  const complete = coverage >= 100;
 
   return (
     <div className="card p-5">
@@ -704,8 +693,7 @@ function ProvenancePanel({
               : "border-amber-500/30 bg-amber-500/10 text-amber-300"
           }`}
         >
-          {coverage}% of checkable requirements
-          {unresolved > 0 ? ` · ${unresolved} unverifiable` : ""}
+          {coverage}% of requirement groups
         </span>
       </div>
 

@@ -7,8 +7,6 @@ import type {
   RequirementProgressResponse,
   RequirementSlot,
   SlotOption,
-  UnresolvedRequirementView,
-  UnresolvedScope,
 } from "@/lib/api";
 
 type Props = {
@@ -50,26 +48,13 @@ const STATUS_WORD: Record<RequirementSlot["status"], string> = {
   unfilled: "Not filled",
 };
 
-// Groups the "can't be checked" pile by who else has it. A Women's, Gender & Sexuality
-// Studies student and a Computer Science student see the exact same "University Core
-// Requirements" paragraph — filing it under WGSS as if the department wrote it would be its
-// own small lie. Order is broadest first: university, then college, then this program alone.
-const SCOPE_ORDER: UnresolvedScope[] = ["university", "college", "program"];
-
-const SCOPE_META: Record<UnresolvedScope, { heading: string; blurb: string }> = {
-  university: {
-    heading: "University-wide",
-    blurb: "Every Purdue undergraduate has these — they don't come from this major.",
-  },
-  college: {
-    heading: "College-wide",
-    blurb: "Everyone in your college has these, whatever their major.",
-  },
-  program: {
-    heading: "Specific to this program",
-    blurb: "Stated in the catalog as prose rather than a list of courses.",
-  },
-};
+// THERE WAS A FOURTH PILE HERE — "can't be checked automatically": the requirements the
+// catalog states in prose and never enumerates (university core, world language, "choose 1
+// course in 6 disciplines"), shown in amber with the catalog's own words and a semantic guess
+// at courses that might fit. Removed 2026-08-12 along with the backend path behind it. It was
+// honest, but it was a card a student could not act on, and it took up the bottom of the
+// checklist. When those requirements come back they come back as real course menus, scheduled
+// through the same "pick a term and add it" control as everything else on this screen.
 
 export default function RequirementChecklist({ progress, busy, onFill }: Props) {
   const done = progress.groups_satisfied;
@@ -92,21 +77,9 @@ export default function RequirementChecklist({ progress, busy, onFill }: Props) 
                 : "border-amber-500/30 bg-amber-500/10 text-amber-300"
             }`}
           >
-            {done}/{total} checkable groups filled
+            {done}/{total} requirement groups filled
           </span>
         </div>
-        {progress.unresolved.length > 0 && (
-          <p className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/[0.07] px-3 py-2 text-xs text-amber-200/90">
-            <span className="font-semibold">
-              {progress.unresolved.length} more requirement
-              {progress.unresolved.length === 1 ? "" : "s"} can&rsquo;t be checked automatically.
-            </span>{" "}
-            The catalog states {progress.unresolved.length === 1 ? "it" : "them"} in prose
-            rather than as a list of courses, so this app can neither plan nor verify{" "}
-            {progress.unresolved.length === 1 ? "it" : "them"} — they&rsquo;re listed at the
-            bottom, with a best-effort guess at courses that might fit.
-          </p>
-        )}
         {progress.computed.length > 0 && (
           <div className="mt-3 space-y-2">
             {progress.computed.map((item) => (
@@ -149,47 +122,6 @@ export default function RequirementChecklist({ progress, busy, onFill }: Props) 
         />
       ))}
 
-      {progress.unresolved.length > 0 && (
-        <div className="card border-amber-500/25 p-5">
-          <p className="kicker !text-amber-400">Can&rsquo;t be checked automatically</p>
-          <p className="mt-2 text-sm text-[var(--muted)]">
-            Your program lists {progress.unresolved.length} more requirement
-            {progress.unresolved.length === 1 ? "" : "s"} that the catalog describes in words
-            rather than as a set of courses — a rule over disciplines, a list kept on another
-            site, or a choice of world language. This app can&rsquo;t verify these against the
-            catalog rule itself, so it shows them as the catalog writes them, with a
-            best-effort guess at courses that might fit, and leaves them out of the count
-            above. Grouped below by who else has the exact same requirement.
-          </p>
-          <div className="mt-4 space-y-5">
-            {SCOPE_ORDER.map((scope) => {
-              const items = progress.unresolved.filter((item) => item.scope === scope);
-              if (items.length === 0) return null;
-              const meta = SCOPE_META[scope];
-              return (
-                <div key={scope}>
-                  <p className="text-xs font-semibold uppercase tracking-wide text-amber-300/90">
-                    {meta.heading}
-                  </p>
-                  <p className="mt-0.5 text-xs text-[var(--muted)]">{meta.blurb}</p>
-                  <ul className="mt-2 space-y-2">
-                    {items.map((item) => (
-                      <li key={item.id}>
-                        <UnresolvedCard
-                          item={item}
-                          labels={progress.semester_labels}
-                          busy={busy}
-                          onFill={onFill}
-                        />
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      )}
     </div>
   );
 }
@@ -248,69 +180,6 @@ function ComputedBar({ item }: { item: ComputedRequirementView }) {
             </li>
           ))}
         </ul>
-      )}
-    </div>
-  );
-}
-
-function UnresolvedCard({
-  item,
-  labels,
-  busy,
-  onFill,
-}: {
-  item: UnresolvedRequirementView;
-  labels: string[];
-  busy: boolean;
-  onFill: (courseCode: string, semesterIndex: number) => void;
-}) {
-  const [open, setOpen] = useState(false);
-  const text = item.raw_text ?? "";
-  const long = text.length > 190;
-
-  return (
-    <div className="rounded-lg border border-amber-500/30 bg-amber-500/[0.06] px-3 py-2 text-sm">
-      <div className="flex items-start gap-3">
-        <span aria-hidden className="mt-0.5 w-3 text-center font-bold text-amber-300">
-          ?
-        </span>
-        <span className="sr-only">Cannot be checked:</span>
-        <span className="flex-1 font-semibold text-amber-200">{item.name}</span>
-        {item.credits_min ? (
-          <span className="whitespace-nowrap text-xs text-amber-200/70">
-            {item.credits_min} cr
-          </span>
-        ) : null}
-      </div>
-      {text && (
-        <div className="mt-1.5 pl-6">
-          <p className="whitespace-pre-line text-xs leading-relaxed text-[var(--muted)]">
-            {open || !long ? text : `${text.slice(0, 190)}…`}
-          </p>
-          {long && (
-            <button
-              onClick={() => setOpen((v) => !v)}
-              className="mt-1 text-xs font-semibold text-amber-300/80 underline-offset-2 hover:underline"
-            >
-              {open ? "Show less" : "Show the full catalog text"}
-            </button>
-          )}
-        </div>
-      )}
-      {item.suggested_courses.length > 0 && (
-        <div className="mt-2 pl-6">
-          <p className="text-xs text-amber-200/60">
-            Might be a fit — guessed from course descriptions, not checked against this rule.
-            Scheduling still goes through the same prerequisite/term check as everything else.
-          </p>
-          <ul className="mt-1.5 space-y-1.5">
-            {item.suggested_courses.map((option) => (
-              <li key={option.code}>
-                <OptionRow option={option} labels={labels} busy={busy} onFill={onFill} />
-              </li>
-            ))}
-          </ul>
-        </div>
       )}
     </div>
   );

@@ -188,13 +188,6 @@ _COLUMN_NOTES = (
     ("  - course_aliases.alias_of names an approved substitute: the two codes satisfy the same "
      "requirement and the same prerequisites, so take one, never both."),
 
-    ("  - unresolved_requirement_groups are real degree requirements — university-wide gen-ed, "
-     "college/school core, world language — that the catalog states in prose instead of as a "
-     "course list (e.g. \"choose 1 course in 6 disciplines\", \"complete 10100/10200 in one "
-     "world language\"). There is nothing to schedule for them: never invent a course code to "
-     "satisfy one, and \"cover every requirement group\" refers only to `requirement_groups`, "
-     "not to these. `scope` says whose requirement it is — `university` (every student), "
-     "`college` (every student in that school), or `program` (this degree only)."),
 )
 
 
@@ -263,19 +256,6 @@ def render_program_context(
             "credits_min": group.credits_min,
         }))
     parts.append("")
-
-    if catalog.unresolved:
-        parts.append(
-            f"## unresolved_requirement_groups  (catalog_ingestion, {len(catalog.unresolved)} rows)"
-        )
-        for item in catalog.unresolved:
-            parts.append(_row({
-                "name": item.name,
-                "scope": item.scope,
-                "credits_min": item.credits_min,
-                "raw_text": item.raw_text,
-            }))
-        parts.append("")
 
     # Options carry their alternatives inline: one row per requirement, not one per course, so
     # "MA 26100 or MA 27101" cannot read as two separate things to schedule.

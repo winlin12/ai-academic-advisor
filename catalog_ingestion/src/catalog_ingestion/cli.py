@@ -525,6 +525,117 @@ def import_courses_cmd(
     )
 
 
+@app.command("import-prerequisites")
+def import_prerequisites(
+    from_dir: Path = typer.Option(..., "--from-dir",
+                                  help="Directory of SAVED Banner course-detail pages (.html)"),
+    year: str = typer.Option(..., "--year", help="Catalog year label, e.g. '2026-2027'"),
+    dry_run: bool = typer.Option(False, "--dry-run",
+                                 help="Print what each file yields; write nothing"),
+):
+    """Import prerequisites from saved Banner course-detail pages.
+
+    WHY A DIRECTORY AND NOT A URL. Prerequisites exist in exactly one place Purdue publishes:
+    Banner self-service (`bwckctlg.p_disp_course_detail`). Verified 2026-08-12, the two sources
+    this pipeline crawls automatically do NOT carry them — Acalog course pages have title,
+    credits and description only, and PurdueIO's OData Course entity has no prerequisite field
+    at all. And `selfservice.mypurdue.purdue.edu/robots.txt` is:
+
+        User-agent: *
+        Disallow: /
+
+    a blanket disallow. So this command takes pages a PERSON saved from their own browser
+    ("Save Page As" / Ctrl-S, or a copy of the page source) and never fetches anything itself.
+    There is deliberately no crawler here.
+
+    Point it at a directory of .html files, in any layout — subdirectories are walked. Each
+    file is matched to a course by the code in its own title ("CS 18200 - Foundations Of
+    Computer Science"), not by its filename, so whatever the browser called it does not matter.
+
+    Run with --dry-run first: it prints the prerequisite text and the parsed AND/OR tree for
+    every file, which is the fastest way to see whether the page layout matches this parser
+    before anything reaches the database.
+    """
+    _setup_logging(get_settings().log_level)
+
+    from catalog_ingestion.db.session import get_session
+    from catalog_ingestion.db.models import CatalogYear, Course
+    from catalog_ingestion.ingest.courses import upsert_prerequisite_rule
+    from catalog_ingestion.parse.prerequisites import (
+        parse_banner_course_detail,
+        parse_prerequisite_text,
+    )
+
+    files = sorted(p for p in Path(from_dir).rglob("*")
+                   if p.is_file() and p.suffix.lower() in {".html", ".htm"})
+    if not files:
+        rprint(f"[red]No .html files under {from_dir}[/red]")
+        raise typer.Exit(1)
+    rprint(f"[bold]{len(files)}[/bold] saved page(s) under {from_dir}")
+
+    parsed_ok = with_prereqs = written = unmatched = skipped = 0
+    for path in files:
+        try:
+            html = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            rprint(f"  [red]unreadable {path.name}: {exc}[/red]")
+            continue
+
+        detail = parse_banner_course_detail(html)
+        if detail is None:
+            skipped += 1
+            rprint(f"  [yellow]not a course-detail page: {path.name}[/yellow]")
+            continue
+        parsed_ok += 1
+        if not detail.prerequisites_raw:
+            rprint(f"  {detail.course_code}: no prerequisites stated")
+            continue
+        with_prereqs += 1
+
+        result = parse_prerequisite_text(detail.prerequisites_raw)
+        rprint(f"  [green]{detail.course_code}[/green] "
+               f"[{result.parse_confidence}] {detail.prerequisites_raw[:100]}")
+        if dry_run:
+            rprint(f"      {json.dumps(result.parsed_json)}")
+            continue
+
+        with get_session() as session:
+            db_year = session.query(CatalogYear).filter_by(label=year).first()
+            if not db_year:
+                rprint(f"[red]Catalog year {year!r} not in database.[/red]")
+                raise typer.Exit(1)
+            # The COURSE has to already exist — this command adds prerequisites to the catalog,
+            # it does not create courses (that is `import-courses`/`sync-courses`). A code with
+            # no row is reported rather than inserted: a course Banner knows and the catalog
+            # does not is a gap worth seeing, not one to paper over with a stub row.
+            course = (
+                session.query(Course)
+                .filter_by(catalog_year_id=db_year.id, course_code=detail.course_code)
+                .first()
+            )
+            if course is None:
+                unmatched += 1
+                rprint(f"      [yellow]{detail.course_code} is not in `courses` for {year} — "
+                       f"skipped[/yellow]")
+                continue
+            course.prerequisites_raw = detail.prerequisites_raw
+            if detail.corequisites_raw:
+                course.corequisites_raw = detail.corequisites_raw
+            if detail.restrictions_raw:
+                course.restrictions_raw = detail.restrictions_raw
+            upsert_prerequisite_rule(session, course=course,
+                                     raw_text=detail.prerequisites_raw)
+            session.commit()
+            written += 1
+
+    rprint(f"\n[bold]{parsed_ok}[/bold] course page(s) parsed, "
+           f"[bold]{with_prereqs}[/bold] with prerequisites, "
+           f"[bold]{written}[/bold] written"
+           + (f", {unmatched} course(s) not in the catalog" if unmatched else "")
+           + (f", {skipped} file(s) were not course-detail pages" if skipped else "")
+           + (" [dim](dry run — nothing written)[/dim]" if dry_run else ""))
+
+
 @app.command("import-purdueapi")
 def import_purdueapi(
     entity: str = typer.Option("all", "--entity", help="subjects|courses|terms|all"),

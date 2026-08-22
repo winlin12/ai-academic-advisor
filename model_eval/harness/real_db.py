@@ -228,6 +228,18 @@ SCOPE_TIERS = {
     "university": frozenset({"university"}),
 }
 
+# Purdue's standard single-course core slot, and the target every synthesized UCC group carries.
+_UCC_TARGET_CREDITS = 3.0
+# Ceiling on how many options one topped-up competency may list. The point of the top-up is to
+# make the target reachable, not to reproduce a 24,000-row catalog menu in the prompt.
+_UCC_MAX_OPTIONS = 8
+# Floor, so a competency is a CHOICE rather than a single forced course. Reaching the credit
+# target is the hard requirement; this is what stops the menu reading as "your Written
+# Communication requirement is AMST 10100, take it" when the catalog offers hundreds. A student
+# looking at four options is being advised; a student looking at one is being told.
+_UCC_MIN_OPTIONS = 4
+
+
 # Purdue's University Core Curriculum competencies, as they appear in the catalog's own option
 # text: "MA 16100 - Plane Analytic Geometry And Calculus I (UCC: QR) Credit Hours: 5.00".
 #
@@ -344,6 +356,116 @@ def _is_selective(requirement_type: str, credits_min: float | None,
     return bool(credits_min) and sum(option_credits) > float(credits_min) + 0.01
 
 
+# --- RAG retrieval (Mode B's context) ---------------------------------------------------------
+#
+# WHY MODE B RETRIEVES INSTEAD OF BEING HANDED THE CATALOG. Every plan mode used to receive
+# `catalog_export.render_context`'s whole program export — ~12.5k tokens of every course, every
+# requirement group, every alias — because a model that had to CHOOSE courses needed to see all
+# of them. It does not choose any more: `select_remaining_courses` plus `with_prereq_closure`
+# produce the required set deterministically (that is `profile.remaining_courses`), which is
+# what Purdue's own Smart Plan does and what this harness's own numbers argue for — the
+# deterministic selector hits 100% requirement coverage on every program while the best model
+# tested dropped seven required courses from one group.
+#
+# So the open question changed. It is no longer "can a model pick the right courses" but "given
+# the right courses, is RETRIEVED context enough to sequence them" — which is the question that
+# transfers to the deployed app, where a live pgvector query stands where the dump used to.
+#
+# HYBRID, MIRRORING `app/services/rag/pipeline.py`: an exact metadata lookup for the courses
+# actually in play, plus a semantic search over the student's own words. The exact half is
+# what guarantees a course in the plan is never missing from the context (a pure cosine search
+# would sometimes drop one, and the model cannot sequence what it cannot see); the semantic
+# half is what makes the context about THIS student rather than a generic dump.
+def retrieve_context(
+    pg_url: str, codes: list[str], *, query: str = "", top_k: int = 12,
+    allowed_codes: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Chunks from `academic_rules` for `codes`, plus `top_k` semantic matches for `query`.
+
+    `allowed_codes` SCOPES THE SEMANTIC HALF to this program's own course universe, and it is
+    not optional in practice. Measured 2026-08-14 on "I want to focus on machine learning and
+    AI": unfiltered, the top matches were CGT 63700 (Creative AI for Design), MGMT 59900
+    (AI-Assisted Big Data Analytics), GRAD 50900 and HIST 30701 — all genuinely close in
+    embedding space, all graduate courses from departments this student is not in, none of them
+    schedulable. The ordering stage's grammar is bound to the courses being placed, so every
+    one of those passages is context the model cannot act on: distraction at best, and an
+    invitation to argue with its own enum at worst. The EXACT half is never filtered — those
+    are the courses being placed, and they must always appear.
+
+    Returns [] rather than raising when the corpus is empty or the embedding model is
+    unavailable — a harness that dies because nobody ran the ingest is worse than one that
+    reports an empty context and lets the scorer show what that costs.
+    """
+    exact: list[dict[str, Any]] = []
+    semantic: list[dict[str, Any]] = []
+    try:
+        with psycopg.connect(pg_url, row_factory=dict_row) as conn, conn.cursor() as cur:
+            if codes:
+                cur.execute(
+                    """
+                    SELECT DISTINCT ON (metadata->>'code') content, metadata
+                    FROM academic_rules
+                    WHERE metadata->>'code' = ANY(%s)
+                    ORDER BY metadata->>'code'
+                    """,
+                    (sorted({c for c in codes}),),
+                )
+                exact = [dict(r) for r in cur.fetchall()]
+            if query:
+                vector = _embed_query(query)
+                if vector is not None:
+                    # `<=>` is pgvector's cosine distance; the metadata filter keeps the 295
+                    # near-identical "University Core Requirements" chunks from crowding out
+                    # everything else (see `rag/store.py`'s note on exactly that failure).
+                    cur.execute(
+                        """
+                        SELECT content, metadata, 1 - (embedding <=> %s::vector) AS similarity
+                        FROM academic_rules
+                        ORDER BY embedding <=> %s::vector
+                        LIMIT %s
+                        """,
+                        # Over-fetch when a filter is in play: the nearest neighbours are
+                        # dominated by out-of-program courses, so asking for exactly `top_k`
+                        # and then filtering would routinely return nothing.
+                        (vector, vector, top_k * (8 if allowed_codes else 1)),
+                    )
+                    seen = {r["metadata"].get("code") for r in exact}
+                    semantic = [
+                        dict(r) for r in cur.fetchall()
+                        if r["metadata"].get("code") not in seen
+                        and (allowed_codes is None
+                             or r["metadata"].get("code") in allowed_codes)
+                    ]
+    except psycopg.Error as exc:
+        logger.warning("RAG retrieval failed (%s) — Mode B will run on an empty context", exc)
+        return []
+    return exact + semantic[:top_k]
+
+
+def _embed_query(text: str) -> list[float] | None:
+    """The same `bge-small-en-v1.5` the corpus was built with, loaded once per process.
+
+    THE PREFIX MATTERS. bge asks for "Represent this sentence for searching relevant passages:"
+    on the QUERY side only, and `app/services/rag/embeddings.py` documents that fastembed 0.8's
+    `query_embed` does not add it. Retrieving with an unprefixed query against a corpus
+    embedded as passages quietly degrades every result, so it is added here explicitly and the
+    two sides stay comparable.
+    """
+    global _EMBED_MODEL
+    try:
+        if _EMBED_MODEL is None:
+            from fastembed import TextEmbedding
+            _EMBED_MODEL = TextEmbedding("BAAI/bge-small-en-v1.5")
+        prefixed = f"Represent this sentence for searching relevant passages: {text}"
+        return list(next(iter(_EMBED_MODEL.embed([prefixed]))).tolist())
+    except Exception as exc:  # model missing, no network for the weights, ONNX failure
+        logger.warning("query embedding unavailable (%s) — exact lookup only", exc)
+        return None
+
+
+_EMBED_MODEL: Any = None
+
+
 # --- prerequisites ------------------------------------------------------------------------------
 #
 # TWO SOURCES, TRIED IN THAT ORDER, because the same fact lives in two shapes depending on how a
@@ -439,18 +561,16 @@ _HARDCODED_PREREQS: dict[str, list[list[str]]] = {
     "PHYS 27200": [["PHYS 17200"], ["MA 16200", "MA 16600"]],
     "PHYS 22100": [["PHYS 22000"]],
     "PHYS 24100": [["PHYS 17200"]],
-    # --- Chemistry. The 255/256 organic sequence and its labs; the labs are corequisites of
-    # their lectures, which this table cannot express (see `_HARDCODED_COREQS`).
+    # --- Chemistry. The 255/256 organic sequence only. The LECTURE/LAB pairs are corequisites
+    # and live in `_HARDCODED_COREQS` — see the incident note there.
     "CHM 11200": [["CHM 11100"]],
-    "CHM 11620": [["CHM 11610"]],
     "CHM 25600": [["CHM 25500"]],
     "CHM 33900": [["CHM 25600"]],
     # --- Biology.
     "BIOL 11100": [["BIOL 11000"]],
-    "BIOL 24200": [["BIOL 24100"]],
-    # --- Electrical & Computer Engineering. ECE 20001/20002 with their paired labs.
+    # --- Electrical & Computer Engineering. Lecture sequence only; the labs are corequisites
+    # of their own lecture, not a sequence among themselves.
     "ECE 20002": [["ECE 20001"]],
-    "ECE 20008": [["ECE 20007"]],
     # --- Mechanical Engineering. Statics before mechanics of materials and dynamics.
     "ME 27400": [["ME 27000"]],
     "ME 32300": [["ME 27000"]],
@@ -460,11 +580,30 @@ _HARDCODED_PREREQS: dict[str, list[list[str]]] = {
 # provenance, same rules, same fate as `_HARDCODED_PREREQS` above. The lab-with-lecture pairs
 # are the whole content: scoring a lab as needing its lecture STRICTLY earlier would charge
 # every model for the schedule the catalog itself prescribes.
+# A LAB IS A COREQUISITE OF ITS OWN LECTURE, NEVER A PREREQUISITE OF IT — and getting that
+# backwards is the most expensive mistake this table can make, because the schedule it charges
+# a violation for is the one the catalog prescribes and every student follows.
+#
+# MEASURED, 2026-08-14. `CHM 11620` and `BIOL 24200` were entered above as prerequisites
+# requiring a STRICTLY EARLIER semester. Their titles are "General Chemistry II - Laboratory"
+# and "Laboratory In Biology IV" — they pair with CHM 11610 and BIOL 24100 and are taken
+# alongside them. Every plan that scheduled the lab with its lecture, which is every correct
+# plan, took a `prereq_violation` for it: qwen3.8-27b produced 8 plans at 91-100% requirement
+# coverage and all 8 were marked not viable on that single invented edge, which read from the
+# outside as the model being weak. It was not. Fixed by moving them here, where "same semester
+# or earlier" is the rule.
+#
+# The `- Laboratory` suffix in `courses.title` is the check to run before adding anything to
+# either table. It is the one signal in the crawl that distinguishes the two cases.
 _HARDCODED_COREQS: dict[str, list[str]] = {
+    "CHM 11520": ["CHM 11510"],
+    "CHM 11620": ["CHM 11610"],
     "CHM 25501": ["CHM 25500"],
     "CHM 25601": ["CHM 25600"],
     "CHM 33901": ["CHM 33900"],
+    "BIOL 24200": ["BIOL 24100"],
     "ECE 20007": ["ECE 20001"],
+    "ECE 20008": ["ECE 20002"],
     "ME 30801": ["ME 30800"],
     "ME 32301": ["ME 32300"],
 }
@@ -1278,6 +1417,28 @@ def fetch_real_db_base(
         # .course_workload` is likewise no longer fetched — see the same module's TABLES
         # comment on why.
 
+        # CATALOG-WIDE UCC CANDIDATES, for topping up a competency this program cannot satisfy
+        # from its own courses. See the synthesis block below for why that happens and what is
+        # done with these; fetched here because the cursor is open and it is one query.
+        cur.execute(
+            """
+            SELECT DISTINCT c.course_code, c.title, c.credit_hours_min, ro.option_text
+            FROM requirement_options ro
+            JOIN courses c ON c.id = ro.course_id
+            WHERE ro.option_text LIKE %s
+            """,
+            ("%UCC:%",),
+        )
+        ucc_catalog: dict[str, list[dict[str, Any]]] = {}
+        for row in cur.fetchall():
+            for tag in _UCC_RE.findall(row.get("option_text") or ""):
+                if tag in UCC_COMPETENCIES:
+                    ucc_catalog.setdefault(tag, []).append({
+                        "course_code": row["course_code"].strip(),
+                        "title": row["title"],
+                        "credit_hours_min": row["credit_hours_min"],
+                    })
+
         cur.execute(
             "SELECT note_type, note_text FROM program_notes WHERE program_id = %s",
             (program_id,),
@@ -1537,13 +1698,55 @@ def fetch_real_db_base(
             if not tagged:
                 continue  # this program's universe cannot satisfy it; say nothing rather than
                           # assert a requirement with an empty menu
+
+            # THE MENU MUST BE ABLE TO REACH THE TARGET. Scoping these options to the program's
+            # own course universe is what keeps the prompt finite — "Human Cultures: Humanities"
+            # has 24,289 options catalog-wide — but the 3-credit university target came along
+            # unscoped, and the two together manufacture requirements nobody can satisfy.
+            #
+            # MEASURED on Elementary Education, 2026-08-17: `UCC: WC`'s only tagged course in
+            # that program is EDCI 20500 (2 cr) and `UCC: AI`'s is EDCI 27000 (1 cr), against a
+            # 3-credit target each. Both were selected, both were scheduled, and both groups
+            # failed on all 35 records — every model, every scenario, and a human planner would
+            # have failed them too. The requirement was impossible, not unmet.
+            #
+            # So a short menu is topped up from the catalog at large with courses carrying the
+            # same competency, cheapest-first and capped, until the target is reachable. Those
+            # courses are real, they genuinely carry the tag, and a student really could take
+            # one — they were simply outside the slice of the catalog this program's own
+            # requirement rows happen to name.
+            available = sum(float(courses_by_code[c]["credit_hours_min"] or 0) for c in tagged)
+            if available < _UCC_TARGET_CREDITS or len(tagged) < _UCC_MIN_OPTIONS:
+                for candidate in sorted(
+                    ucc_catalog.get(tag, []),
+                    key=lambda r: (-(float(r["credit_hours_min"] or 0)), r["course_code"]),
+                ):
+                    code = candidate["course_code"]
+                    if code in tagged or _course_number(code) >= 50000:
+                        continue  # already listed, or a graduate course no undergraduate takes
+                    credits = float(candidate["credit_hours_min"] or 0)
+                    if credits <= 0:
+                        continue
+                    courses_by_code.setdefault(code, {
+                        "title": candidate["title"] or code,
+                        "credit_hours_min": candidate["credit_hours_min"],
+                        "attributes_raw": None,
+                        "ucc_tags": [tag],
+                    })
+                    tagged.append(code)
+                    available += credits
+                    if (available >= _UCC_TARGET_CREDITS
+                            and len(tagged) >= _UCC_MIN_OPTIONS) or \
+                            len(tagged) >= _UCC_MAX_OPTIONS:
+                        break
+
             elective_groups.append(GroupMeta(
                 group_id=f"ucc-{tag.lower()}",
                 name=f"University Core: {label} (UCC: {tag})",
                 requirement_type="choose_credits",
-                credits_min=3.0,
+                credits_min=_UCC_TARGET_CREDITS,
                 display_order=9000 + order,   # after the program's own groups, before nothing
-                option_codes=tagged,
+                option_codes=sorted(tagged),
                 option_credits={c: float(courses_by_code[c]["credit_hours_min"] or 3.0)
                                 for c in tagged},
                 language_subject=None,
@@ -2243,7 +2446,17 @@ def fixture_from_database(database: CatalogDatabase, *, slug: str = "") -> Fixtu
             "courses": [opt["course_code"] for opt in options],
         }
         if selective:
-            group["choose_credits"] = row.get("credits_min") or 0
+            # ONLY WHEN THE CATALOG STATES ONE. `or 0` used to live here, and it turned "the
+            # crawl recorded no credit minimum" into "this group needs zero credits" — which
+            # `select_remaining_courses` correctly honoured by selecting NOTHING for the group,
+            # while `real_scoring` independently defaulted the same absent value to 3.0 and
+            # demanded three credits. The group was then unsatisfiable by construction: every
+            # model on Animal Sciences missed "Interpersonal Development" (35 options, no
+            # stated minimum) no matter what it planned. Leaving the key absent lets the
+            # selector apply its documented fallback — at least the cheapest option — and the
+            # scorer now applies the same one.
+            if row.get("credits_min"):
+                group["choose_credits"] = row["credits_min"]
         requirement_groups.append(group)
 
     program_row = database.rows("programs")[0] if database.rows("programs") else {}

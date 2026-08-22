@@ -170,6 +170,16 @@ class RealScore:
         }
 
 
+# The point past which a semester is not merely heavy but impossible. 21 is reachable with a
+# dean's approval in exceptional cases; 22 is not, on any account this project has found.
+_ABSURD_SEMESTER_CREDITS = 22
+
+# Mirrors `prompts._CREDIT_BAND`: the prompt asks for target +/- this, so the scorer forgives
+# the same margin. Kept as two constants rather than an import because `real_scoring` must not
+# depend on the prompt module — but if one moves, move the other.
+_CREDIT_BAND = 2
+
+
 def _is_upper_level(code: str) -> bool:
     """Is this a junior-level-or-above course — the Upper Level Requirement's own test?
 
@@ -291,11 +301,32 @@ def score_against_real_db(
 
         score.semester_credits.append(credits)
         score.major_courses_per_semester.append(major_courses)
-        # BOTH SOFT ONLY, never gate `viable` — a heavy semester, credit-wise or major-course-
-        # wise, is the student's own call to adjust and can change from one advising
-        # conversation to the next, unlike a missed prerequisite. See `plan_scorers.py`'s
-        # module docstring for the same call made the same way for Mode A/C.
-        if credits > profile.max_credits_per_semester:
+        # A SEMESTER CAN BE HEAVY. IT CANNOT BE ABSURD. (2026-08-16)
+        #
+        # Everything between the student's stated ask and 21 credits stays SOFT — a heavy term
+        # is the student's own call, it changes from one advising conversation to the next, and
+        # under genuinely exceptional circumstances a student does carry 19, 20 or 21 with a
+        # dean's signature. Failing a whole plan for one such term would be the harness
+        # inventing a rule stricter than the university's own practice, and the plan a student
+        # would actually be handed is not wrong — it is demanding.
+        #
+        # At 22 the claim stops being defensible under any circumstance, so that is where the
+        # hard line sits. Note the deliberate gap between this and the PROMPT, which tells the
+        # model 18 is the registrar's maximum: the instruction states the rule, the scorer
+        # refuses only what no student could do. A model that lands on 20 is over-heavy and
+        # shows up as `soft_credit_overages`; a model that writes a 22-credit semester has
+        # produced a schedule nobody can register for.
+        if credits >= _ABSURD_SEMESTER_CREDITS:
+            flag("credit_cap_violation",
+                 f"semester {index + 1} carries {credits} credits, which no student can "
+                 f"register for")
+        # TOLERANCE OF ONE LAB COURSE. The prompt now asks for a RANGE (see
+        # `prompts.credit_load_line`), because course sizes make an exact per-semester figure
+        # unreachable, and the scorer matches it: a student who asked for 13 and got 14 has
+        # not been badly served, and flagging that as an overload would report a failure the
+        # student would not recognise as one. Past the band it is a real overshoot and still
+        # counted — softly, because a heavy term remains the student's call to make.
+        if credits > profile.max_credits_per_semester + _CREDIT_BAND:
             score.soft_credit_overages += 1
         if major_courses > soft_major_cap:
             score.soft_major_overloads += 1
@@ -377,7 +408,18 @@ def score_against_real_db(
             filled = [c for c in courses if canon(c) in canonical_satisfied]
             credits_filled = sum(float(by_code[c].get("credit_hours_min") or 0)
                                  for c in filled if c in by_code)
-            target = float(group["credits_min"] or 0) or 3.0
+            # NO STATED MINIMUM MEANS "CHOOSE ONE", NOT "CHOOSE THREE CREDITS". The 3.0 that
+            # used to sit here was an invented figure — a standard single-course slot — and it
+            # disagreed with `fixtures.select_remaining_courses`, which fills an unquantified
+            # group with its cheapest option. A 1-credit option therefore satisfied the
+            # selector and left the scorer asking for 2 more credits forever. Both ends now use
+            # the same rule, and it is the one the catalog can actually support: if the crawl
+            # recorded no minimum, one option from the list is the requirement.
+            stated = float(group["credits_min"] or 0)
+            option_credits = [float(by_code[c].get("credit_hours_min") or 0)
+                              for c in courses if c in by_code]
+            cheapest = min((c for c in option_credits if c > 0), default=3.0)
+            target = stated or cheapest
             satisfied = credits_filled >= target
             missing_label = (None if satisfied else
                              f"{target - credits_filled:g} more credit(s) from this list")

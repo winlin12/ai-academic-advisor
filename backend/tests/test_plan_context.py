@@ -12,7 +12,7 @@ from app.services.plan_context import (
     offering_note,
     render_program_context,
 )
-from app.services.planner_db import ProgramCatalog, RequirementGroup, UnresolvedRequirement
+from app.services.planner_db import ProgramCatalog, ProseRule, RequirementGroup
 
 
 def _course(code, credits=3, terms=("fall", "spring", "summer"), groups=()):
@@ -129,34 +129,21 @@ def test_the_export_says_when_it_trimmed_a_menu():
     assert "## course_planner_terms" in export
 
 
-def test_unresolved_requirements_are_shown_scoped_and_marked_unschedulable():
-    """University gen-ed, college core and world-language requirements have no course list to
-    plan from, but the model must still be told they exist rather than silently going quiet
-    about them (see `UnresolvedRequirement`'s docstring: hiding these was this app's worst
-    bug)."""
-    catalog = _catalog(unresolved=[
-        UnresolvedRequirement(
-            id="u1", name="University Core Requirements", requirement_type="core",
-            credits_min=None, scope="university",
-            raw_text="Choose 1 course in 6 different disciplines within the College of Liberal "
-                     "Arts.",
-        ),
-        UnresolvedRequirement(
-            id="u2", name="World Language Requirement", requirement_type="world_language",
-            credits_min=None, scope="university",
-            raw_text="Completion of 10100, 10200, 20100 and 20200 in one world language.",
-        ),
-    ])
+def test_prose_only_requirements_never_reach_the_export():
+    """The catalog states university core, world language and "choose 1 course in 6
+    disciplines" in prose, with no course list. They used to be exported to the model as
+    `unresolved_requirement_groups`, described as real requirements it could do nothing about;
+    removed 2026-08-12 (see `planner_db.ProseRule`) so the prompt is only things the model can
+    actually schedule. `ProgramCatalog.prose_rules` has ONE reader and it is not this one."""
+    catalog = _catalog()
+    catalog.prose_rules = [
+        ProseRule(id="u1", name="University Core Requirements", credits_min=None,
+                  raw_text="Choose 1 course in 6 different disciplines."),
+    ]
     export = render_program_context(catalog)
-    assert "## unresolved_requirement_groups" in export
-    assert '"name":"University Core Requirements"' in export
-    assert '"scope":"university"' in export
-    assert "Choose 1 course in 6 different disciplines" in export
-    assert "never invent a course code to satisfy one" in export
-
-
-def test_no_unresolved_section_when_the_program_has_none():
-    assert "## unresolved_requirement_groups" not in render_program_context(_catalog())
+    assert "unresolved" not in export
+    assert "University Core Requirements" not in export
+    assert "6 different disciplines" not in export
 
 
 def test_the_export_is_deterministic_for_a_given_database_state():

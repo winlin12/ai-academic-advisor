@@ -16,6 +16,7 @@ Guards that refuse to produce a number rather than produce a misleading one:
 from __future__ import annotations
 
 import json
+import os
 import statistics
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -39,6 +40,19 @@ def _load(path: Path) -> list[dict[str, Any]]:
         except json.JSONDecodeError:
             continue
     return records
+
+
+def _count(value: Any) -> int:
+    """`duplicates_removed` as a number, whichever shape the record stores it in.
+
+    It was a LIST of the deleted course codes until 2026-08-13 and is a COUNT since — the
+    staged pipeline's `_score_semesters` returns the count because nothing downstream reads the
+    codes. Records written on either side of that change live in the same `results_old/`, and a
+    report that crashes on the older shape makes the archive unreadable for no benefit.
+    """
+    if isinstance(value, int):
+        return value
+    return len(value or [])
 
 
 def _rate(values: list[bool]) -> str:
@@ -221,7 +235,7 @@ def _plan_section(records: list[dict], mode: str, title: str, note: str) -> list
         duplicates = 0
         for rec in recs:
             counts.update(rec.get("violation_counts") or {})
-            duplicates += len(rec.get("duplicates_removed") or [])
+            duplicates += _count(rec.get("duplicates_removed"))
         lines.append(
             f"| `{model}` | {counts.get('prereq_violation', 0)} "
             f"| {counts.get('coreq_violation', 0)} "
@@ -232,28 +246,87 @@ def _plan_section(records: list[dict], mode: str, title: str, note: str) -> list
 
 
 def _mode_a_extra(records: list[dict]) -> list[str]:
+    """Mode A's own question: did it find what was wrong with the student's schedule?
+
+    THE ANSWER KEY IS KNOWN. `fixtures.student_draft_schedule` damages a legal plan in two
+    specific ways — courses deleted, one course pushed ahead of its prerequisites — seeded off
+    the scenario id, so every model audits the identical draft. These are therefore not
+    heuristics: `Found missing` is the share of the deleted courses the model actually named,
+    and `False alarms` counts courses it called missing that were never removed.
+
+    The columns here used to describe the revise-plan proposal Mode A emitted before 2026-08-13,
+    when a deterministic planner rebuilt the schedule afterwards and all seven models scored
+    identically because the model's answer barely reached the plan. See `runner.run_mode_a`.
+    """
     groups = _group(records, "plan_mode_a")
     if not groups:
         return []
     lines = [
-        "**Did the model actually help?** Mode A's plan is legal no matter what the model says "
-        "— the deterministic planner guarantees that, and a hallucinated proposal degrades to a "
-        "no-op. These columns are what separates a model that understood the student from one "
-        "that returned an empty proposal.",
+        "**Did it find the damage?** Each student's draft is the deterministic planner's own "
+        "legal plan with courses removed and one course moved ahead of its prerequisites. The "
+        "model is scored against that answer key, not against its own account of itself.",
         "",
-        "| Model | Proposal parsed | Touched anything | Grounded | Ask honoured | Plan not worse |",
+        "| Model | Found missing | False alarms | Moves fixed | Final plan viable | Coverage |",
         "|---|---|---|---|---|---|",
     ]
     for model, recs in groups.items():
-        asserts: list[bool] = []
-        for rec in recs:
-            asserts.extend((rec.get("assertions_passed") or {}).values())
+        rates = [r["found_missing_rate"] for r in recs
+                 if r.get("found_missing_rate") is not None]
+        moves = [bool(r["fixed_moves"]) for r in recs if r.get("fixed_moves") is not None]
+        coverage = [r["requirement_coverage"] for r in recs
+                    if r.get("requirement_coverage") is not None]
+        found_cell = f"{(sum(rates) / len(rates)):.0%}" if rates else "—"
+        coverage_cell = f"{(sum(coverage) / len(coverage)):.0%}" if coverage else "—"
         lines.append(
-            f"| `{model}` | {_rate([not r.get('proposal_parse_failed') for r in recs])} "
-            f"| {_rate([bool(r.get('proposal_touched_anything')) for r in recs])} "
-            f"| {_rate([bool(r.get('proposal_grounded')) for r in recs])} "
-            f"| {_rate(asserts)} "
-            f"| {_rate([bool(r.get('plan_not_worse')) for r in recs])} |"
+            f"| `{model}` | {found_cell} "
+            f"| {_stat([len(r.get('false_missing') or []) for r in recs], 'mean')} "
+            f"| {_rate(moves) if moves else '—'} "
+            f"| {_rate_with_range(_by_run(recs, 'plan_viable'))} "
+            f"| {coverage_cell} |"
+        )
+    return lines + [""]
+
+
+def _selection_section(records: list[dict]) -> list[str]:
+    """Stage 1 of Mode B/C, scored on its own.
+
+    THE POINT OF SPLITTING THE STAGES IS THIS TABLE. `Selection coverage` is how much of the
+    degree the chosen course SET covers with ordering ignored entirely; the plan coverage in
+    the Mode B table above is what survived scheduling. A model whose selection is 100% and
+    whose plan is 80% lost the difference in stage two; a model at 55% in both never had a
+    chance at stage two, and no amount of prompt work on the scheduler will help it.
+    """
+    groups = {m: [r for r in recs if r.get("selection_coverage") is not None]
+              for m, recs in _group(records, "plan_mode_b").items()}
+    groups = {m: recs for m, recs in groups.items() if recs}
+    if not groups:
+        return []
+    lines = ["### Stage 1 — course selection (Mode B/C's first pass)", "",
+             "Requirement groups in, course codes out, no scheduling. Compare `Selection "
+             "coverage` against Mode B's plan coverage above: the gap between them is what the "
+             "ordering stage lost.", "",
+             "`Prereqs supplied` is the repair the pipeline had to make: courses the model's "
+             "selection needed but never chose, because they satisfy no requirement group and "
+             "are pure prerequisites (see `runner._selection_stage`). Zero is a clean "
+             "selection; a large number means the model read the requirement list and not the "
+             "chains underneath it.", "",
+             "| Model | Parsed | Courses chosen | Prereqs supplied | Selection coverage | "
+             "Plan coverage | Lost in ordering |",
+             "|---|---|---|---|---|---|---|"]
+    for model, recs in groups.items():
+        selection = [r["selection_coverage"] for r in recs]
+        plan = [r["requirement_coverage"] for r in recs
+                if r.get("requirement_coverage") is not None]
+        sel_mean = sum(selection) / len(selection)
+        plan_mean = (sum(plan) / len(plan)) if plan else None
+        lines.append(
+            f"| `{model}` "
+            f"| {_rate([not r.get('selection_parse_failed') for r in recs])} "
+            f"| {_stat([r.get('selected_count') for r in recs], 'mean')} "
+            f"| {_stat([r.get('selection_prereq_added_count') for r in recs], 'mean')} "
+            f"| {sel_mean:.0%} "
+            f"| {f'{plan_mean:.0%}' if plan_mean is not None else '—'} "
+            f"| {f'{(sel_mean - plan_mean):.0%}' if plan_mean is not None else '—'} |"
         )
     return lines + [""]
 
@@ -764,7 +837,10 @@ def _by_model(recs: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
 
 def generate_report(root: Path) -> Path:
     cfg = yaml.safe_load((root / "config.yaml").read_text())
-    results = root / cfg["paths"]["results_dir"]
+    # Same override every other entry point honours (`runner.load_context`), so
+    # `MODEL_EVAL_RESULTS_DIR=... run.py report` reads the directory it just wrote instead of
+    # config.yaml's default.
+    results = root / os.environ.get("MODEL_EVAL_RESULTS_DIR", cfg["paths"]["results_dir"])
     results.mkdir(exist_ok=True)
     baseline = _load(results / "runs_baseline.jsonl")
     mitigated = _load(results / "runs_mitigated.jsonl")
@@ -831,7 +907,10 @@ def generate_report(root: Path) -> Path:
         if avg_chars:
             lines += [f"Average reasoning length: {avg_chars:.0f} characters. Full reasoning "
                       "text is in each run's transcript (`transcripts/<model>/"
-                      "plan_mode_b_thinking/`), inside the `<think>` block.", ""]
+                      "plan_mode_b_thinking/`) under the `## Reasoning` heading. A model "
+                      "whose average is 0 has no reasoning channel its template will open — "
+                      "its rows here ARE Mode B, and a flat score against Mode B means "
+                      "nothing happened, not that thinking failed to help.", ""]
     lines += _plan_section(
         baseline, "plan_mode_a", "Mode A — the app's real revise-plan path",
         "This is `advisor_agent.revise_plan` as shipped: the model emits a `PlanEditProposal` "
@@ -840,6 +919,7 @@ def generate_report(root: Path) -> Path:
         "drifted from the app's, and that is itself the finding.",
     )
     lines += _mode_a_extra(baseline)
+    lines += _selection_section(baseline)
     lines += _unsatisfiable_section(baseline)
     lines += _qa_section(baseline)
     lines += _explain_section(baseline)
@@ -856,7 +936,7 @@ def generate_report(root: Path) -> Path:
         lines += _mode_a_extra(mitigated)
         section += 1
 
-    lines += [f"## {section}. Mode C — retry to convergence", ""]
+    lines += [f"## {section}. Mode C — what the repair passes bought", ""]
     lines += mode_c_lines(results)
     section += 1
 
@@ -923,6 +1003,12 @@ def generate_summary(root: Path) -> Path:
       2. PER SCHOOL: a compact PLAN_VIABLE/coverage grid, school x model, so a specific bad row
          (one school, one model) is visible even though the overall table averages it away.
 
+    BOTH VIEWS INCLUDE THE THINKING ARM (`runs_thinking.jsonl`) when a school has one. It is
+    kept as its own corpus rather than pooled into the baseline — the two were generated
+    against servers launched with opposite reasoning settings and must never be averaged
+    together — but it is REPORTED HERE, in the same file, because a reader asking "did
+    thinking help" should not have to know which file each arm lives in.
+
     Schools that never ran (no `results/results_<slug>/runs_baseline.jsonl`) are silently
     absent from both views — this reports what exists, it does not claim the sweep was
     complete. Cross-reference against the program's own database export if you need to know what's
@@ -937,8 +1023,20 @@ def generate_summary(root: Path) -> Path:
 
     pooled: list[dict[str, Any]] = []
     per_school: dict[str, list[dict[str, Any]]] = {}
+    # THE THINKING ARM IS POOLED TOO, in its own corpus rather than mixed into `pooled`.
+    # It lives in a separate file per school because it was generated against a separate
+    # server (reasoning ON), and that separation is the whole reason its numbers mean
+    # anything — but "separate file" was being read as "separate report", so a full sweep
+    # produced a cross-school summary that silently omitted an entire arm. One
+    # `run.py report --all` now shows both.
+    pooled_thinking: list[dict[str, Any]] = []
+    per_school_thinking: dict[str, list[dict[str, Any]]] = {}
     fixture_names: dict[str, str] = {}
     for slug, d in school_dirs:
+        thinking_recs = _load(d / "runs_thinking.jsonl")
+        if thinking_recs:
+            per_school_thinking[slug] = thinking_recs
+            pooled_thinking.extend(thinking_recs)
         recs = _load(d / "runs_baseline.jsonl")
         if not recs:
             continue
@@ -977,28 +1075,56 @@ def generate_summary(root: Path) -> Path:
         "",
     ]
     lines += _plan_section(
-        pooled, "plan_mode_b", "Mode B — the model builds the whole schedule",
+        pooled, "plan_mode_b", "Mode B — select the courses, then schedule them",
         "Pooled across every school's scenarios. A model whose free-form planning only works "
         "for the one or two most heavily-authored fixtures will show up here as worse than its "
         "own single-school report suggests — that gap IS the finding.",
     )
+    if pooled_thinking:
+        thinking_budget = (yaml.safe_load((root / "config.yaml").read_text())
+                           .get("thinking") or {}).get("budget_tokens", "?")
+        lines += _plan_section(
+            pooled_thinking, "plan_mode_b_thinking",
+            "Mode B — thinking variant, pooled across every school",
+            "The same select-then-schedule task as the table above, with reasoning ON and "
+            f"capped at {thinking_budget} tokens before the plan starts. Read this table "
+            "against Mode B's directly above it: same prompt, same schema, same scorer, one "
+            "difference. Credit spread is the column to watch if the question is whether "
+            "reasoning produces a more evenly balanced schedule.",
+        )
+        avg_chars = _mean([r.get("reasoning_chars") for r in pooled_thinking
+                           if r.get("stage") == "plan_mode_b_thinking"])
+        if avg_chars is not None:
+            lines += [f"Average reasoning length: {avg_chars:.0f} characters, pooled. Models "
+                      "averaging 0 never opened a reasoning channel — their rows are Mode B "
+                      "under another name, and must not be read as evidence about thinking.",
+                      ""]
+
     lines += _plan_section(
-        pooled, "plan_mode_a", "Mode A — the app's real revise-plan path",
-        "Should be ~100% PLAN_VIABLE for every model, every school, by construction. A school "
-        "that drags this down has a deterministic-planner bug in ITS fixture, not a model "
-        "problem — see that school's own `results/results_<slug>/report.md`.",
+        pooled, "plan_mode_a", "Mode A — auditing the schedule the student already has",
+        "The student arrives with a draft that has known damage in it (courses removed, one "
+        "moved ahead of its prerequisites). PLAN_VIABLE here is whether the CORRECTED schedule "
+        "the model returned is legal and complete — see the answer-key table in each school's "
+        "own report for whether it found the specific damage.",
     )
+    lines += _mode_a_extra(pooled)
+    lines += _selection_section(pooled)
 
     lines += ["## 2. Per school — PLAN_VIABLE and requirement coverage", "", ]
-    for mode, label in (("plan_mode_a", "Mode A"), ("plan_mode_b", "Mode B")):
+    # (mode, label, corpus) — the thinking arm reads from its own per-school records, since
+    # they came out of a different file written by a different server.
+    grids = [("plan_mode_a", "Mode A", per_school, pooled),
+             ("plan_mode_b", "Mode B", per_school, pooled)]
+    if pooled_thinking:
+        grids.append(("plan_mode_b_thinking", "Mode B — thinking variant",
+                      per_school_thinking, pooled_thinking))
+    for mode, label, source, corpus in grids:
+        models = sorted({r["model"] for r in corpus if r.get("stage") == mode})
         lines += [f"### {label}", "",
                   "| School | Program | " + " | ".join(
-                      f"`{m}` viable / coverage" for m in
-                      sorted({r["model"] for r in pooled if r.get("stage") == mode})
-                  ) + " |"]
-        models = sorted({r["model"] for r in pooled if r.get("stage") == mode})
+                      f"`{m}` viable / coverage" for m in models) + " |"]
         lines += ["|---|---|" + "---|" * len(models)]
-        for slug, recs in sorted(per_school.items()):
+        for slug, recs in sorted(source.items()):
             cells = []
             for model in models:
                 model_recs = _satisfiable(
@@ -1063,7 +1189,7 @@ def generate_summary(root: Path) -> Path:
                 f"| `{slug}` | {fixture_names.get(slug, slug)} | " + " | ".join(cells) + " |")
         lines.append("")
 
-    lines += ["## 4. Mode C — retry to convergence, across schools", ""]
+    lines += ["## 4. Mode C — what the repair passes bought, across schools", ""]
     lines += mode_c_cross_school_lines(school_dirs)
 
     summary_path = root / "results" / "summary.md"

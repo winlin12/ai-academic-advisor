@@ -31,12 +31,14 @@
   python run.py run --major cs --tasks plan_b_thinking   Mode B with reasoning ON, budget-
                                              capped at config.yaml's thinking.budget_tokens —
                                              own server, own results/runs_thinking.jsonl,
-                                             never mixed with the --reasoning off baseline
+                                             never mixed with the --reasoning off baseline.
+                                             OPT-IN: measured 2026-08-21, did not pay
   python run.py report                      results/report.md for the CURRENTLY CONFIGURED
                                              program: plan tables, Mode C, validity guards,
                                              review queue — one file, every mode
   python run.py report --all                results/summary.md aggregating every
-                                             results/results_<slug>/ the sweep wrote
+                                             results/results_<slug>/ the sweep wrote — every
+                                             arm in one file, thinking included
   python run.py parity                      check the vendored planner against the app's
 
 The harness starts and stops llama-server itself (see harness/server.py): under llama.cpp,
@@ -112,8 +114,8 @@ def main() -> None:
     runp.add_argument("--brackets", help="comma-separated brackets: 8gb,coder,server,reference")
     runp.add_argument(
         "--tasks", help="comma-separated: plan_a,plan_b,qa,explain,converge,plan_b_thinking "
-                        "(default: config.yaml's run.default_tasks, which does NOT include "
-                        "plan_b_thinking — opt in explicitly)")
+                        "(default: config.yaml's run.default_tasks; plan_b_thinking is NOT in "
+                        "it — measured 2026-08-21 and it did not pay, see the `thinking:` block)")
     runp.add_argument("--mitigate", action="store_true",
                       help="mitigation mode: multi-iteration revise loop; writes "
                            "runs_mitigated.jsonl (plan_a/plan_b/qa/explain only)")
@@ -319,8 +321,9 @@ def _run_single(args, *, results_dir_override: str | None = None) -> None:
     # run_thinking_experiment`). Same special-casing as `converge`: it needs its own server
     # launch (reasoning ON, budget-capped) and own results file, so it cannot go through
     # `run_eval`'s normal per-model loop, which launches every model with the baseline's
-    # `--reasoning off`. Deliberately absent from `run.default_tasks` — see that function's
-    # own docstring for why it must stay opt-in.
+    # `--reasoning off`. IT RUNS PER PROGRAM, right after that program's other tasks — not
+    # after the whole sweep — so the first school's thinking results land without waiting for
+    # the last school's. Now part of `run.default_tasks`, so a bare `run.py run` includes it.
     do_thinking = "plan_b_thinking" in task_set
     eval_tasks = task_set - {"converge", "plan_b_thinking"}
 

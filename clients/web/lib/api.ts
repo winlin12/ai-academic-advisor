@@ -415,34 +415,10 @@ export type RequirementGroupProgress = {
   slots: RequirementSlot[];
 };
 
-// A requirement the catalog states but never enumerates, so it cannot be checked or planned.
-// NOT DECIDABLE is a different fact from NOT MET — rendering one as the other would tell a
-// student they are behind when the truth is that we do not know.
-// Who else has this exact requirement, verbatim — "university" ones are identical across
-// every program that carries them, "college" identical across every program in that college,
-// "program" is genuinely specific to this major. See the backend's `planner_db._scope_for`.
-export type UnresolvedScope = "university" | "college" | "program";
-
-export type UnresolvedRequirementView = {
-  id: string;
-  name: string;
-  scope: UnresolvedScope;
-  credits_min: number | null;
-  // The catalog's own prose. It is the only thing we can honestly show, and it is usually
-  // enough for a student to act on.
-  raw_text: string | null;
-  // A course that MIGHT belong to this requirement — a semantic guess pulled from course
-  // descriptions, not a checked answer (nothing has confirmed it satisfies the requirement's
-  // rule). Same `SlotOption` shape a real slot's options use, with `legal_semesters` computed
-  // the same way — the GUESS is uncertain, the scheduling legality is not, so it gets the
-  // same "pick a term and add it" control as any other option.
-  suggested_courses: SlotOption[];
-};
-
 // A requirement the catalog states as a CREDIT THRESHOLD over a course-number range ("at
 // least 32 semester hours... junior-level (30000+)") rather than as any specific course
-// list — genuinely checkable, unlike UnresolvedRequirementView, just not against a fixed
-// option list. DOUBLE-COUNTING IS CORRECT HERE: a course already satisfying a major
+// list — genuinely checkable, just not against a fixed option list.
+// DOUBLE-COUNTING IS CORRECT HERE: a course already satisfying a major
 // requirement still counts toward this too (Purdue's own catalog text says so), so this is
 // computed independently over every completed/planned course, never subtracted elsewhere.
 export type ComputedCourseView = {
@@ -470,12 +446,9 @@ export type RequirementProgressResponse = {
   credits_completed: number;
   credits_planned: number;
   semester_labels: string[];
-  // Deliberately NOT in groups_satisfied/groups_total: counting a requirement nobody can check
-  // as either met or unmet would be a guess either way.
-  unresolved: UnresolvedRequirementView[];
   // Requirements stated as a credit threshold rather than a course list — see
-  // ComputedRequirementView. A third bucket: not in `groups` (no fixed option list) and not
-  // in `unresolved` (this one genuinely can be checked).
+  // ComputedRequirementView. A second bucket, deliberately not in `groups`/`groups_satisfied`:
+  // no fixed option list, so it has no slots and would change that fraction's denominator.
   computed: ComputedRequirementView[];
   // Subject code -> display name ("SPAN" -> "Spanish") for every language-sequence
   // requirement this program has, regardless of what the student already picked. Empty for a

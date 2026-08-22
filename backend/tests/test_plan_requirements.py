@@ -8,18 +8,8 @@ substitute the student already took satisfies the primary it stands in for.
 import pytest
 
 from app.models.schemas import Course, StudentProfile
-from app.services import plan_requirements
 from app.services.plan_requirements import requirement_progress, semester_labels
 from app.services.planner_db import ProgramCatalog, RequirementGroup
-
-
-@pytest.fixture(autouse=True)
-def _no_real_suggestions(monkeypatch):
-    """Keeps this file's "no database, no model" promise: `requirement_progress` normally
-    calls `suggest_courses`, which hits a live embedding model + Postgres. Stubbed here to
-    empty by default; the real path is covered in test_plan_suggestions.py, and the wiring
-    (that a real return value reaches `UnresolvedRequirementView`) is covered below."""
-    monkeypatch.setattr(plan_requirements, "suggest_courses", lambda *a, **k: [])
 
 
 def _course(code, credits=3, groups=(), terms=("fall", "spring")):
@@ -224,98 +214,6 @@ def test_filled_slots_never_carry_options(plan):
             assert slot.options == []
 
 
-# --- requirements the catalog states but never enumerates --------------------------------------
-
-
-def test_unresolved_requirements_are_reported_and_never_counted_as_satisfied():
-    """The bug this fixes: Women's, Gender & Sexuality Studies showed TWO requirement groups —
-    both from the major — and 100% coverage, while the Liberal Arts core, the university core,
-    the world-language requirement and 20 credits of electives were absent from the screen.
-    NOT DECIDABLE is a different fact from NOT MET, and both differ from "not shown at all".
-    """
-    from app.services.planner_db import UnresolvedRequirement
-
-    groups = [RequirementGroup(id="core", name="Major Core", selective=False, credits_min=3.0,
-                               options=[["CS 18000"]])]
-    catalog = _catalog(groups, [_course("CS 18000", 4)])
-    catalog.unresolved = [
-        UnresolvedRequirement(id="ucc", name="University Core Requirements",
-                              requirement_type="core", credits_min=None, scope="university",
-                              raw_text="For a complete listing, visit the Senate Website."),
-        UnresolvedRequirement(id="lang", name="Core III: Linguistic Diversity",
-                              requirement_type="major", credits_min=8.0, scope="program",
-                              raw_text="Completion of 10100, 10200 in one world language."),
-    ]
-
-    result = requirement_progress(_profile(completed_courses=["CS 18000"]), catalog,
-                                  [[], [], [], []])
-
-    # The checkable group really is satisfied — and the fraction says CHECKABLE, not "all".
-    assert result.groups_satisfied == 1
-    assert result.groups_total == 1
-    # The other two are shown, with the catalog's own words, and counted separately.
-    assert [u.name for u in result.unresolved] == [
-        "University Core Requirements", "Core III: Linguistic Diversity",
-    ]
-    assert result.unresolved[1].credits_min == 8.0
-    assert "world language" in (result.unresolved[1].raw_text or "")
-    # They are NOT groups: nothing can plan, check or satisfy them.
-    assert all(g.id not in {"ucc", "lang"} for g in result.groups)
-    # Scope carries through so the checklist can tell "every Purdue student has this" apart
-    # from "specific to this major" instead of filing both under the same department.
-    assert [u.scope for u in result.unresolved] == ["university", "program"]
-
-
-def test_unresolved_requirements_carry_suggested_courses(monkeypatch):
-    """`suggest_courses` is a semantic guess (see plan_suggestions.py) — this only checks that
-    whatever it returns reaches the view and is passed the right exclusion set, not that the
-    guess itself is any good."""
-    from app.services.planner_db import UnresolvedRequirement
-    from app.services.plan_suggestions import SuggestedCourse
-
-    calls = []
-
-    def fake_suggest(name, raw_text, *, exclude=frozenset(), limit=5):
-        calls.append((name, exclude))
-        return [SuggestedCourse(code="COM 11400", title="Fundamentals of Speech", credits=3)]
-
-    monkeypatch.setattr(plan_requirements, "suggest_courses", fake_suggest)
-
-    groups = [RequirementGroup(id="core", name="Major Core", selective=False, credits_min=3.0,
-                               options=[["CS 18000"]])]
-    # The suggested code must be a real catalog course, same as any other addable option —
-    # `_options_for` (the same function real slots use) looks its title/credits up here.
-    catalog = _catalog(groups, [_course("CS 18000", 4), _course("COM 11400", 3)])
-    catalog.unresolved = [
-        UnresolvedRequirement(id="ucc", name="University Core Requirements",
-                              requirement_type="core", credits_min=None, scope="university",
-                              raw_text="Visit the Senate Website."),
-    ]
-
-    result = requirement_progress(_profile(completed_courses=["CS 18000"]), catalog,
-                                  [["CS 25100"], [], [], []])
-
-    # Same shape (and the same "choose a term and add it" data) as a real slot's options —
-    # a guess at WHICH requirement a course satisfies is not a guess at whether it can be
-    # legally scheduled.
-    suggested = result.unresolved[0].suggested_courses
-    assert [o.code for o in suggested] == ["COM 11400"]
-    assert suggested[0].title == "COM 11400 title"
-    assert suggested[0].credits == 3
-    # Completed AND planned courses both went into the exclusion set the suggester saw.
-    assert calls == [("University Core Requirements", frozenset({"CS 18000", "CS 25100"}))]
-
-
-def test_the_catalog_prose_does_not_repeat_the_requirement_title():
-    from app.services.plan_requirements import _without_title
-
-    assert _without_title("Core II: Social Diversity\nCulture and religion play a role.",
-                          "Core II: Social Diversity") == "Culture and religion play a role."
-    # Only an exact leading match is stripped; anything else is the catalog's words.
-    assert _without_title("Something else entirely.", "Core II") == "Something else entirely."
-    assert _without_title(None, "Core II") is None
-
-
 # --- computed requirements (credit-threshold rules, not course lists) -------------------------
 #
 # "Upper Level Requirement" is real, unmodified Purdue catalog text — verified against the
@@ -356,24 +254,21 @@ def test_course_number_extraction(code, expected):
     assert _course_number(code) == expected
 
 
-def test_a_credit_threshold_requirement_becomes_a_computed_check_not_an_unresolved_one():
-    from app.services.planner_db import UnresolvedRequirement
+def test_a_credit_threshold_requirement_becomes_a_computed_check():
+    from app.services.planner_db import ProseRule
 
     groups = [RequirementGroup(id="major", name="Machine Intelligence Core", selective=False,
                                credits_min=3.0, options=[["STAT 35000"]])]
     catalog = _catalog(groups, [_course("STAT 35000", 3), _course("CS 18000", 4)])
-    catalog.unresolved = [
-        UnresolvedRequirement(id="upper", name="Upper Level Requirement",
-                              requirement_type="university", credits_min=None,
-                              scope="university", raw_text=UPPER_LEVEL_TEXT),
+    catalog.prose_rules = [
+        ProseRule(id="upper", name="Upper Level Requirement", credits_min=None,
+                  raw_text=UPPER_LEVEL_TEXT),
     ]
 
     result = requirement_progress(
         _profile(completed_courses=["STAT 35000"]), catalog, [["CS 18000"], [], [], []],
     )
 
-    # Moved out of `unresolved` entirely — this one CAN be checked.
-    assert result.unresolved == []
     assert len(result.computed) == 1
     computed = result.computed[0]
     assert computed.name == "Upper Level Requirement"
@@ -389,15 +284,14 @@ def test_a_course_already_counted_toward_a_major_group_also_counts_toward_the_co
     fulfill most, if not all, of these credits within their major requirements." A course
     satisfying `groups` is not excluded from `computed` — they are independent views over the
     same completed/planned set, not a shared, subtractive pool."""
-    from app.services.planner_db import UnresolvedRequirement
+    from app.services.planner_db import ProseRule
 
     groups = [RequirementGroup(id="major", name="Machine Intelligence Core", selective=False,
                                credits_min=3.0, options=[["STAT 35000"]])]
     catalog = _catalog(groups, [_course("STAT 35000", 3)])
-    catalog.unresolved = [
-        UnresolvedRequirement(id="upper", name="Upper Level Requirement",
-                              requirement_type="university", credits_min=None,
-                              scope="university", raw_text=UPPER_LEVEL_TEXT),
+    catalog.prose_rules = [
+        ProseRule(id="upper", name="Upper Level Requirement", credits_min=None,
+                  raw_text=UPPER_LEVEL_TEXT),
     ]
 
     result = requirement_progress(
@@ -412,15 +306,14 @@ def test_a_course_already_counted_toward_a_major_group_also_counts_toward_the_co
 
 
 def test_below_the_course_number_floor_does_not_count():
-    from app.services.planner_db import UnresolvedRequirement
+    from app.services.planner_db import ProseRule
 
     groups = [RequirementGroup(id="major", name="Core", selective=False, credits_min=4.0,
                                options=[["CS 18000"]])]
     catalog = _catalog(groups, [_course("CS 18000", 4)])
-    catalog.unresolved = [
-        UnresolvedRequirement(id="upper", name="Upper Level Requirement",
-                              requirement_type="university", credits_min=None,
-                              scope="university", raw_text=UPPER_LEVEL_TEXT),
+    catalog.prose_rules = [
+        ProseRule(id="upper", name="Upper Level Requirement", credits_min=None,
+                  raw_text=UPPER_LEVEL_TEXT),
     ]
 
     result = requirement_progress(
@@ -431,17 +324,19 @@ def test_below_the_course_number_floor_does_not_count():
     assert result.computed[0].contributing_courses == []
 
 
-def test_an_unrelated_unresolved_requirement_is_unaffected_by_computed_detection():
-    from app.services.planner_db import UnresolvedRequirement
+def test_a_prose_rule_with_nothing_computable_in_it_is_dropped_entirely():
+    """The other half of the 2026-08-12 removal: a prose requirement the app cannot COMPUTE is
+    no longer reported anywhere — not as a group, not as a computed check, not as its own
+    "can't check this" bucket. See `planner_db.ProseRule`."""
+    from app.services.planner_db import ProseRule
 
     catalog = _catalog([], [])
-    catalog.unresolved = [
-        UnresolvedRequirement(id="lang", name="World Language Courses",
-                              requirement_type="world_language", credits_min=None,
-                              scope="university", raw_text="Choose one world language."),
+    catalog.prose_rules = [
+        ProseRule(id="lang", name="World Language Courses", credits_min=None,
+                  raw_text="Choose one world language."),
     ]
 
     result = requirement_progress(_profile(), catalog, [[], [], [], []])
 
     assert result.computed == []
-    assert [u.name for u in result.unresolved] == ["World Language Courses"]
+    assert result.groups == []

@@ -10,25 +10,25 @@ It matters more now that nothing is auto-filled. The app used to pick a student'
 them and report 100% coverage; it no longer does, so the holes are real and this is where they
 become actionable rather than just a lower percentage.
 
-FOUR STATES, and the distinctions are the whole point:
+THREE STATES, and the distinctions are the whole point:
 
     completed   already on the transcript. Nothing more to do — shown in gold.
     planned     scheduled in the plan on screen, not yet taken. Provisional.
     unfilled    nothing satisfies it, and we know what could. Red, with the options.
-    unresolved  the catalog states the requirement but never enumerates it, so we cannot
-                check it at all. Amber, with the catalog's own words.
 
 "unfilled" is deliberately not "missing": it is a decision the student has not made, not a
-mistake they made. And "unresolved" is deliberately not "unfilled": NOT DECIDABLE is a
-different fact from NOT MET, and rendering one as the other tells a student they are behind
-when the truth is that we do not know.
+mistake they made.
 
-THE UNRESOLVED ONES ARE THE MAJORITY, and hiding them was this app's worst bug. 749 of 928
-crawled programs have at least one; the average program has 3.8 checkable groups and 2.6
-uncheckable. Women's, Gender & Sexuality Studies showed TWO requirement groups — both from the
-major — and a coverage figure of 100%, while the Liberal Arts core, the university core, the
-world-language requirement and 20 credits of electives were simply absent from the screen. See
-``planner_db.UnresolvedRequirement`` for why the catalog does not enumerate them.
+THERE WAS A FOURTH STATE, "unresolved" — a requirement the catalog states in prose and never
+enumerates, shown with the catalog's own words and never counted either way. Removed
+2026-08-12, along with the whole path behind it (``planner_db.UnresolvedRequirement``, the
+semantic course suggester, the checklist section, and the copy of it in every model prompt).
+It was accurate and it was the majority of rows, but a requirement with no action attached is
+not something a student or a model can do anything with, and carrying it made both worse at
+the part they can act on: the major. What replaces it has to be schedulable — the model eval
+harness already resolves University Core into per-competency course menus off each course's
+own UCC attributes, and that is the shape this needs. Until then the checklist covers the
+requirement groups that carry courses, plus ``computed`` below.
 """
 
 from __future__ import annotations
@@ -39,9 +39,8 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from app.models.schemas import StudentProfile
-from app.services.plan_suggestions import suggest_courses
 from app.services.plan_validation import legal_slots, normalize_code, term_sequence
-from app.services.planner_db import DEFAULT_OPTION_CREDITS, ProgramCatalog, UnresolvedRequirement
+from app.services.planner_db import DEFAULT_OPTION_CREDITS, ProgramCatalog
 
 SlotStatus = Literal["completed", "planned", "unfilled"]
 
@@ -58,29 +57,6 @@ class SlotOption(BaseModel):
     legal_semesters: list[int] = Field(default_factory=list)
 
 
-class UnresolvedRequirementView(BaseModel):
-    """A requirement we can show but cannot check. Carries the catalog's own text.
-
-    ``scope`` says who else has this exact requirement: "university" ones are identical across
-    every program that carries them (University Core, Civics Literacy, world language),
-    "college" ones identical across every program in that college, and "program" is the rest —
-    genuinely specific to this major. See ``planner_db._scope_for``.
-
-    ``suggested_courses`` is a best-effort "start here" list, NOT verification — see
-    ``plan_suggestions.suggest_courses``. Rendered with the exact same "choose a term and add
-    it" affordance as a real slot's options (``SlotOption``, computed the same way via
-    ``_options_for``) — a guess at WHICH requirement a course satisfies is not a guess at
-    whether it can legally be scheduled, so there is no reason to make it read-only.
-    """
-
-    id: str
-    name: str
-    scope: Literal["university", "college", "program"] = "program"
-    credits_min: float | None = None
-    raw_text: str | None = None
-    suggested_courses: list[SlotOption] = Field(default_factory=list)
-
-
 class ComputedCourseView(BaseModel):
     """One course counting toward a computed requirement — informational only, no "add"
     action, because nothing needs picking: it either already qualifies or it doesn't."""
@@ -94,8 +70,9 @@ class ComputedCourseView(BaseModel):
 class ComputedRequirementView(BaseModel):
     """A requirement the catalog states as a CREDIT THRESHOLD over a course-number range
     ("at least 32 semester hours... at least junior-level (30000+)") rather than as any
-    specific course list — so, unlike ``UnresolvedRequirementView``, it genuinely can be
-    checked: sum the credits of whatever the student already has that clears the bar.
+    specific course list — and, unlike the prose requirements this module stopped reporting,
+    it genuinely can be checked: sum the credits of whatever the student already has that
+    clears the bar.
 
     DOUBLE-COUNTING IS THE CORRECT BEHAVIOR HERE, NOT A BUG TO GUARD AGAINST. Purdue's own
     catalog text for "Upper Level Requirement" says so directly: "Students should be able to
@@ -185,16 +162,10 @@ class RequirementProgressResponse(BaseModel):
     credits_planned: float = 0.0
     # "Fall 2026", ... so the UI can name a legal semester rather than printing an index.
     semester_labels: list[str] = Field(default_factory=list)
-    # Requirements the catalog states but never enumerates. They are NOT in `groups` and NOT in
-    # the `groups_satisfied`/`groups_total` fraction — counting a requirement nobody can check
-    # as either met or unmet would be a guess either way. The UI must show them, and must never
-    # report a degree complete while any remain.
-    unresolved: list[UnresolvedRequirementView] = Field(default_factory=list)
     # Requirements the catalog states as a CREDIT THRESHOLD rather than a course list — see
-    # ComputedRequirementView. Genuinely checkable, unlike `unresolved`, so these are counted
-    # into neither `unresolved` (they are not "can't check this") nor `groups`/
-    # `groups_satisfied` (they are not a course-list group) — a third bucket for a third kind
-    # of requirement.
+    # ComputedRequirementView. Kept OUT of `groups`/`groups_satisfied`: they are not a
+    # course-list group and folding them in would change the denominator of a fraction the
+    # plan panel reports too.
     computed: list[ComputedRequirementView] = Field(default_factory=list)
     # Subject code -> display name ("SPAN" -> "Spanish") for every language-sequence
     # requirement this program has, regardless of what the student already picked — see
@@ -242,21 +213,6 @@ def _options_for(
                                         canonical=canonical),
         ))
     return out
-
-
-def _without_title(raw: str | None, name: str) -> str | None:
-    """Drop the leading copy of the group's own name from its catalog prose.
-
-    The crawler stores the heading as the first line of `raw_text`, so rendering both puts the
-    title twice in a row on every unresolved card. Only an exact leading match is removed —
-    anything else is the catalog's words and is left exactly as written.
-    """
-    if not raw:
-        return None
-    body = raw.strip()
-    if body.startswith(name.strip()):
-        body = body[len(name.strip()):].lstrip(" \n\t:-—")
-    return body or None
 
 
 def _credits_of(catalog: ProgramCatalog, code: str) -> float:
@@ -364,18 +320,15 @@ def requirement_progress(
             slots=slots,
         ))
 
-    taken = frozenset(completed | planned)
-
-    # A THIRD BUCKET, separate from `groups` and `unresolved`. Some catalog prose states a
-    # credit threshold over a course-NUMBER range rather than a course list ("at least 32
-    # semester hours... junior-level (30000+)") — genuinely checkable, just not against a
-    # fixed option list, so it does not fit `RequirementGroupProgress`'s slot model either.
-    unresolved_items: list[UnresolvedRequirement] = []
+    # A SECOND BUCKET, separate from `groups`. Some catalog prose states a credit threshold
+    # over a course-NUMBER range rather than a course list ("at least 32 semester hours...
+    # junior-level (30000+)") — genuinely checkable, just not against a fixed option list, so
+    # it does not fit `RequirementGroupProgress`'s slot model either. Every other prose rule is
+    # dropped here: nothing to compute means nothing to show. See `planner_db.ProseRule`.
     computed: list[ComputedRequirementView] = []
-    for item in catalog.unresolved:
+    for item in catalog.prose_rules:
         threshold = _parse_credit_threshold_rule(item.raw_text)
         if threshold is None:
-            unresolved_items.append(item)
             continue
         credits_required, level_floor = threshold
         contributing = []
@@ -399,17 +352,6 @@ def requirement_progress(
         ))
 
     return RequirementProgressResponse(
-        unresolved=[
-            UnresolvedRequirementView(
-                id=item.id, name=item.name, scope=item.scope, credits_min=item.credits_min,
-                raw_text=_without_title(item.raw_text, item.name),
-                suggested_courses=_options_for(
-                    [c.code for c in suggest_courses(item.name, item.raw_text, exclude=taken)],
-                    catalog, profile, semesters, taken,
-                ),
-            )
-            for item in unresolved_items
-        ],
         computed=computed,
         program_title=catalog.name,
         catalog_year=catalog.catalog_year,

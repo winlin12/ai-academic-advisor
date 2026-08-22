@@ -84,10 +84,6 @@ Where things are:
 - `requirement_groups` + `requirement_options` - the degree requirements, joined on
   course_code. `all_of` = take every option. `choose_credits` = take enough to reach
   `credits_min`.
-- `unresolved_requirement_groups` - real requirements (university gen-ed, college/school core,
-  world language) the catalog states in prose, not as a course list. Nothing to schedule here;
-  they are not part of `requirement_groups` and "cover every requirement group" does not apply
-  to them. Never invent a course code to satisfy one.
 - `course_aliases` - `alias_of` is an approved substitute. Take one, never both.
 
 Rules, all hard:

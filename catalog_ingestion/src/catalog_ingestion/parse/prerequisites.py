@@ -154,3 +154,144 @@ def _split_top_level(text: str, separator: str) -> list[str]:
             i += 1
     parts.append("".join(current))
     return parts if len(parts) > 1 else parts
+
+
+# ---------------------------------------------------------------------------
+# Banner course-detail pages
+# ---------------------------------------------------------------------------
+#
+# WHERE PREREQUISITES ACTUALLY LIVE. Neither of the two automated sources this pipeline uses
+# publishes them, verified 2026-08-12:
+#
+#   * Acalog (catalog.purdue.edu, the requirements crawl) — a course detail page carries the
+#     title, credits and description and nothing else. `parse_course_page` has always had a
+#     `prerequisites_raw` field; it comes back None for every course.
+#   * PurdueIO (api.purdue.io, the ~10.6k-course import) — the OData Course entity is
+#     Id/Number/SubjectId/Title/CreditHours/Description. There is no prerequisite field at all.
+#
+# Purdue publishes them on Banner self-service (`bwckctlg.p_disp_course_detail`), whose
+# robots.txt is `User-agent: * / Disallow: /` — a blanket disallow for automated clients. So
+# there is no crawler here and there must not be one: this parses pages that a PERSON saved
+# from their own browser, which is why the CLI that calls it (`import-prerequisites`) reads a
+# directory instead of a URL.
+#
+# THE FORMAT, as Banner renders it. The detail body is one `<td class="ntdefault">` cell: free
+# description text, then a run of labelled sections separated by `<br>`, each label in a
+# `<span class="fieldlabeltext">` or bold. Course references inside them are `<a>` links.
+#
+#     <td class="ntdefault">
+#       Discrete mathematics for computer science...
+#       <br><br><span class="fieldlabeltext">Levels: </span>Undergraduate
+#       <br><br><span class="fieldlabeltext">Prerequisites: </span>
+#       Undergraduate level <a href="...">CS 18000</a> Minimum Grade of C
+#       <br><br><span class="fieldlabeltext">Restrictions: </span>...
+#     </td>
+#
+# Parsed by LABEL, not by position: sections vary per course and several are usually absent.
+# Anything between a recognised label and the next one is that section's raw text; everything
+# unrecognised is ignored rather than guessed at.
+_TAG_RE = re.compile(r"<[^>]+>")
+_BR_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
+_NTDEFAULT_RE = re.compile(
+    r'<td[^>]*class="[^"]*ntdefault[^"]*"[^>]*>(.*?)</td>', re.IGNORECASE | re.DOTALL
+)
+# The course code Banner puts in the page title, e.g. "CS 18200 - Foundations Of Computer
+# Science". `ddlabel` is the header cell class on the catalog detail page.
+_TITLE_RE = re.compile(
+    r'<t[hd][^>]*class="[^"]*ddlabel[^"]*"[^>]*>(?:\s*<a[^>]*>)?\s*'
+    r'([A-Z]{2,6})\s+(\d{3,5}[A-Z]?)\s*-\s*([^<]*)',
+    re.IGNORECASE,
+)
+# Every labelled section Banner emits that this parser knows how to file. The VALUES are the
+# field names on `BannerCourseDetail`; a label not in here still terminates the previous
+# section (so its text never bleeds into the one before it) but is not stored.
+_SECTION_LABELS = {
+    "prerequisites": "prerequisites_raw",
+    "prerequisite": "prerequisites_raw",
+    "corequisites": "corequisites_raw",
+    "corequisite": "corequisites_raw",
+    "restrictions": "restrictions_raw",
+    "course attributes": "attributes_raw",
+    "levels": None,
+    "schedule types": None,
+    "grading basis": None,
+    "offered by": None,
+    "department": None,
+    "learning objectives": None,
+    "may be offered at any of the following campuses": None,
+    "repeatable for additional credit": None,
+    "credit hours": None,
+    "lecture hours": None,
+    "lab hours": None,
+    "other hours": None,
+}
+_LABEL_RE = re.compile(r"^\s*([A-Za-z][A-Za-z /&']{2,60}?)\s*:\s*(.*)$")
+
+
+@dataclass
+class BannerCourseDetail:
+    """One Banner course-detail page, reduced to the fields this pipeline stores."""
+
+    course_code: str
+    title: str
+    prerequisites_raw: str | None = None
+    corequisites_raw: str | None = None
+    restrictions_raw: str | None = None
+    attributes_raw: str | None = None
+    description: str | None = None
+
+
+def _visible_lines(html: str) -> list[str]:
+    """Banner's `<br>`-separated body as plain lines, entities decoded, tags gone."""
+    from html import unescape
+
+    text = _BR_RE.sub("\n", html)
+    text = _TAG_RE.sub(" ", text)
+    lines = []
+    for line in unescape(text).splitlines():
+        collapsed = " ".join(line.split())
+        if collapsed:
+            lines.append(collapsed)
+    return lines
+
+
+def parse_banner_course_detail(html: str) -> BannerCourseDetail | None:
+    """Parse one saved Banner `bwckctlg.p_disp_course_detail` page.
+
+    Returns None when the page is not a course-detail page at all (a search form, an error, a
+    login redirect) rather than guessing — a half-parsed page would write a course with no
+    prerequisites, which is indistinguishable downstream from a course that genuinely has none.
+    That distinction is the whole point of storing this.
+    """
+    title_match = _TITLE_RE.search(html)
+    if not title_match:
+        return None
+    subject, number, title = title_match.groups()
+    detail = BannerCourseDetail(
+        course_code=f"{subject.upper()} {number.upper()}",
+        title=" ".join(title.split()),
+    )
+
+    body_match = _NTDEFAULT_RE.search(html)
+    if not body_match:
+        return detail
+
+    current: str | None = "description"
+    buckets: dict[str, list[str]] = {}
+    for line in _visible_lines(body_match.group(1)):
+        label_match = _LABEL_RE.match(line)
+        key = label_match.group(1).strip().lower() if label_match else None
+        if key in _SECTION_LABELS:
+            current = _SECTION_LABELS[key]
+            remainder = label_match.group(2).strip()
+            if current and remainder:
+                buckets.setdefault(current, []).append(remainder)
+            continue
+        if current:
+            buckets.setdefault(current, []).append(line)
+
+    for field_name, lines in buckets.items():
+        joined = " ".join(lines).strip()
+        if joined:
+            setattr(detail, field_name, joined)
+    return detail

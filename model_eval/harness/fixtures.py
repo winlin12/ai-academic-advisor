@@ -34,6 +34,8 @@ stop being comparable.
 
 from __future__ import annotations
 
+import math
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -329,7 +331,7 @@ def _completed_prefix(
         course = next((c for c in catalog if c.code == code), None)
         return course.credits if course else 0
 
-    full = _with_prereq_closure(
+    full = with_prereq_closure(
         select_remaining_courses(requirement_groups, set(), credits_of, canonical),
         catalog, set(), canonical,
     )
@@ -338,7 +340,7 @@ def _completed_prefix(
     return ordered[:count]
 
 
-def _with_prereq_closure(
+def with_prereq_closure(
     codes: list[str], catalog: list[Course], completed: set[str],
     canonical: dict[str, str] | None = None,
 ) -> list[str]:
@@ -386,6 +388,100 @@ def _with_prereq_closure(
     return sorted(added, key=lambda c: order.get(c, 0)) + codes
 
 
+def student_draft_schedule(
+    semesters: list[list[str]], *, seed: int, drop: int = 2, swaps: int = 1,
+) -> tuple[list[list[str]], list[str], list[tuple[str, int, int]]]:
+    """A legal plan, damaged the way a student's own draft is damaged.
+
+    MODE A NEEDS A SCHEDULE THAT IS WRONG, and it has to be wrong in a way the harness knows
+    about — otherwise "did the model find the problems" has no answer key. Handing the model
+    the deterministic planner's output would ask it to audit a plan that is already legal by
+    construction, which is how Mode A ended up reporting the identical number for all seven
+    models (79% viable, zero violations, 2026-08-12 sweep): the task had no content.
+
+    Two damage types, because they are the two things a student's own draft actually gets
+    wrong, and they fail differently:
+
+      DROPPED   `drop` courses deleted outright -> a coverage gap. The model has to notice a
+                requirement is unfilled, which needs it to read the requirement list rather
+                than the schedule.
+      MOVED     `swaps` courses pushed EARLIER than a prerequisite -> an ordering error. The
+                model has to notice a sequence is impossible, which needs it to read the
+                prerequisites.
+
+    Deterministic for a given `seed` (the scenario id's hash), so the same student gets the
+    same broken draft on every run and across models — a model is never advantaged by drawing
+    an easier draft than the model it is being compared against.
+
+    Returns (draft, dropped_codes, moves) where `moves` is (course, from_index, to_index).
+    """
+    import random
+
+    rng = random.Random(seed)
+    draft = [list(codes) for codes in semesters]
+    flat = [(index, code) for index, codes in enumerate(draft) for code in codes]
+    if not flat:
+        return draft, [], []
+
+    # DROPPED: never from the first semester. A missing first-semester course is usually also a
+    # prerequisite for something later, which would produce a cascade of downstream violations
+    # and make the two damage types impossible to score apart.
+    droppable = [(i, c) for i, c in flat if i > 0]
+    dropped: list[str] = []
+    for index, code in rng.sample(droppable, min(drop, len(droppable))):
+        if code in draft[index]:
+            draft[index].remove(code)
+            dropped.append(code)
+
+    # MOVED: take a course from the back half and put it in the first semester. That is the
+    # damage shape that reliably breaks a prerequisite chain without needing the prereq graph
+    # here — a course scheduled late is late because something came before it.
+    moves: list[tuple[str, int, int]] = []
+    late = [(i, c) for i, codes in enumerate(draft) for c in codes if i >= max(1, len(draft) // 2)]
+    for index, code in rng.sample(late, min(swaps, len(late))):
+        if code not in draft[index]:
+            continue
+        draft[index].remove(code)
+        draft[0].append(code)
+        moves.append((code, index, 0))
+    return draft, sorted(dropped), moves
+
+
+# The cap when a degree's own subject is a normal share of it: never more than three of the
+# major's courses in one term, two preferred. Sensible for a CS or engineering major, where the
+# subject is roughly a third of the coursework.
+_DEFAULT_MAJOR_HARD = 3
+_DEFAULT_MAJOR_SOFT = 2
+
+
+def _major_load_caps(remaining: list[str], subject: str, semesters: int) -> tuple[int, int]:
+    """How many of the major's own courses may share a semester, DERIVED from this degree.
+
+    A FIXED CAP MAKES SUBJECT-HEAVY DEGREES UNPLANNABLE. English Education is 25 ENGL courses
+    out of 38: at three per semester over eight semesters there are 24 slots for 25 courses, so
+    the plan is one short before anything is scheduled. Measured 2026-08-17 — the deterministic
+    planner rode the ceiling the whole way (`[2, 2, 2, 3, 3, 3, 3, 1]`) and still left six
+    courses unplaced, which `run.py check` correctly reported as "no model can pass this", for
+    a program that is perfectly plannable in reality. For an English teacher, ENGL courses ARE
+    the degree; the cap was written for majors where they are a third of it.
+
+    So the ceiling is whatever this student's own list needs — `ceil(major courses / semesters)`
+    — and never less than the default. The soft preference sits one below the ceiling so the
+    planner still spreads them out when it can, and never below its own default either.
+
+    This only ever RAISES the caps. A degree whose subject is a normal share of the coursework
+    (CS: about twelve CS courses over eight semesters) gets exactly the 3/2 it had before, so
+    no existing program's plans change shape.
+    """
+    if not subject or semesters <= 0:
+        return _DEFAULT_MAJOR_HARD, _DEFAULT_MAJOR_SOFT
+    major_courses = sum(1 for code in remaining if code.split(" ")[0] == subject)
+    needed = math.ceil(major_courses / semesters)
+    hard = max(_DEFAULT_MAJOR_HARD, needed)
+    soft = max(_DEFAULT_MAJOR_SOFT, min(needed, hard - 1) if hard > needed else needed)
+    return hard, min(soft, hard)
+
+
 def synthesize_scenarios(
     program_name: str,
     catalog: list[Course],
@@ -412,6 +508,11 @@ def synthesize_scenarios(
         completed = _completed_prefix(catalog, requirement_groups,
                                       int(spec["completed"]), canonical)
         overrides = dict(spec["profile"])
+        remaining = with_prereq_closure(
+            select_remaining_courses(requirement_groups, set(completed), credits_of, canonical),
+            catalog, set(completed), canonical)
+        semesters = int(overrides.get("semesters_to_plan", 8))
+        hard_cap, soft_cap = _major_load_caps(remaining, subject, semesters)
         scenarios.append(Scenario(
             id=str(spec["id"]),
             label=str(spec["label"]),
@@ -419,13 +520,12 @@ def synthesize_scenarios(
                 name="Student",
                 degree_program=program_name,
                 completed_courses=completed,
-                remaining_courses=_with_prereq_closure(
-                    select_remaining_courses(
-                        requirement_groups, set(completed), credits_of, canonical),
-                    catalog, set(completed), canonical),
+                remaining_courses=remaining,
                 start_term=str(overrides.pop("start_term", "fall")),
                 start_year=int(overrides.pop("start_year", 2026)),
                 major_subject=subject,
+                max_major_courses_per_semester=hard_cap,
+                preferred_major_courses_per_semester=soft_cap,
                 **overrides,
             ),
             feedback=str(spec["feedback"]),

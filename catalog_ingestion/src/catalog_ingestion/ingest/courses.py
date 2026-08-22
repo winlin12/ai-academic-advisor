@@ -136,6 +136,13 @@ def ingest_course(
     return course
 
 
+def upsert_prerequisite_rule(session: Session, *, course: Course, raw_text: str) -> None:
+    """Store one course's prerequisite TEXT plus its best-effort parse. Idempotent on
+    (course, raw_text): re-importing the same page is a no-op, and a CHANGED text adds a new
+    rule rather than overwriting, so a re-parse never silently loses what the catalog said."""
+    return _upsert_prerequisite_rule(session, course=course, raw_text=raw_text)
+
+
 def _upsert_prerequisite_rule(session: Session, *, course: Course, raw_text: str) -> None:
     existing = (
         session.query(PrerequisiteRule)

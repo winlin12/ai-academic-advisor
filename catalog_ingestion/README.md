@@ -68,6 +68,33 @@ make sync-program POID=34693         # scrape ONE program
 make sync-programs                   # scrape ALL ~959 programs (long; see note)
 make validate                        # data-quality report
 ```
+
+### Prerequisites (manual, on purpose)
+Neither automated source publishes them — verified 2026-08-12: an Acalog course page carries
+title, credits and description only, and PurdueIO's OData `Course` entity has no prerequisite
+field at all. Purdue publishes them on **Banner self-service**
+(`bwckctlg.p_disp_course_detail`), and that host's `robots.txt` is:
+
+```
+User-agent: *
+Disallow: /
+```
+
+a blanket disallow, so this repo has no crawler for it and should not grow one. Instead, save
+the course-detail pages you want from your own browser (Ctrl-S, any filenames, subfolders
+fine) and import them:
+
+```bash
+podman compose run --rm -v /path/to/saved:/banner:ro ingestion \
+  import-prerequisites --from-dir /banner --year 2026-2027 --dry-run   # inspect first
+podman compose run --rm -v /path/to/saved:/banner:ro ingestion \
+  import-prerequisites --from-dir /banner --year 2026-2027             # then write
+```
+
+Each file is matched to a course by the code in its own page title, the prerequisite text is
+stored verbatim in `courses.prerequisites_raw`, and its parsed AND/OR tree lands in
+`prerequisite_rules`. `model_eval` reads that table directly (`real_db._groups_from_tree`), so
+imported prerequisites show up in the next eval run with no further step.
 **Crawl delay:** `sync-programs` honors Purdue's `robots.txt` (120 s/page by default).
 For a faster full run at your own discretion, lower it per-run — single-threaded, off-peak:
 ```bash
