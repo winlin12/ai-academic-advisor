@@ -789,7 +789,8 @@ export async function fetchModelStatus(): Promise<ModelStatus> {
 }
 
 // Resolves once the new model is loaded and healthy (or rejects) — no polling needed, but the
-// caller should expect this to take up to llamacpp_startup_timeout_s (180s server-side default).
+// caller should expect this to take up to vllm_startup_timeout_s (600s server-side default —
+// vLLM also profiles a forward pass and captures CUDA graphs before it will serve).
 export async function selectModel(name: string): Promise<ModelStatus> {
   const response = await fetch(`${API_V1_URL}/models/${encodeURIComponent(name)}/select`, {
     method: "POST",

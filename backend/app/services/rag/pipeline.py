@@ -1,7 +1,7 @@
 """Step 2 (ingest) + Step 3 (answer): the composition layer.
 
 This is the only module that composes the embedding provider (``embeddings``), the
-persistence layer (``store``), and the chat model (``LlamaCppClient``). Each helper it
+persistence layer (``store``), and the chat model (``VllmClient``). Each helper it
 calls is independently testable; this file wires them into the two end-to-end flows.
 
 Retrieval is two-tier, cheapest-first:
@@ -33,7 +33,7 @@ from typing import Any
 
 from app.core.config import settings
 from app.services import planner_db
-from app.services.llamacpp_client import LlamaCppClient
+from app.services.vllm_client import VllmClient
 from app.services.rag import embeddings, store
 
 logger = logging.getLogger(__name__)
@@ -167,7 +167,7 @@ async def answer_question(
     question: str,
     *,
     top_k: int | None = None,
-    client: LlamaCppClient | None = None,
+    client: VllmClient | None = None,
     seed: int | None = None,
 ) -> dict[str, Any]:
     """Step 3 end-to-end: exact + semantic retrieval -> budgeted context -> generate.
@@ -181,7 +181,7 @@ async def answer_question(
     to the same question disagree for reasons neither of them shows.
     """
     top_k = top_k or settings.rag_top_k
-    client = client or LlamaCppClient()
+    client = client or VllmClient()
 
     # Tier 1: deterministic — course codes named in the question, straight from SQL. Two
     # sources, because they know different things: `academic_rules` holds the crawled Acalog

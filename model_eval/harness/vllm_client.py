@@ -1,23 +1,31 @@
-"""Minimal llama-server HTTP client (stdlib only — the harness must not depend on the app).
+"""Minimal vLLM OpenAI-server HTTP client (stdlib only — the harness must not depend on the app).
 
-Replaces the old Ollama client. Three things changed and all of them matter:
+Replaces the llama.cpp client. The wire format barely moved — both speak OpenAI
+``/v1/chat/completions`` and both stream — so what changed is the three places llama.cpp had
+its own dialect:
 
-1. ENDPOINT. The app talks to llama-server's OpenAI-compatible ``/v1/chat/completions`` and
-   lets the gguf's own chat template (applied server-side under ``--jinja``) format the turn.
-   The harness does the same. It deliberately does NOT use llama.cpp's native ``/completion``,
-   even though that endpoint's timing fields are nicer — a hand-rolled prompt string would
-   measure a prompt format the app never sends.
+1. TIMINGS ARE GONE, AND THAT IS FINE. vLLM server answered with its own ``prompt_ms`` /
+   ``predicted_ms`` counters when asked for ``timings_per_token``; vLLM sends no such block,
+   and its request model rejects unknown fields rather than ignoring them, so the flag is not
+   merely useless here, it is a 400. ``prompt_ms``/``predicted_ms`` are therefore derived from
+   the WALL CLOCK: prefill is time-to-first-token, decode is everything after it. That is a
+   deliberate downgrade in precision and an upgrade in relevance — a student waits on the wall
+   clock, not on the engine's self-report — but it does mean throughput recorded here is not
+   comparable token-for-token with the llama.cpp-era records. ``raw_final["timings_source"]``
+   says which of the two produced any given row.
 
-2. TIMINGS. Ollama returned nanosecond counters in its final stream chunk. llama-server
-   returns an OpenAI-shaped stream, so we ask for ``stream_options.include_usage`` (token
-   counts) and ``timings_per_token`` (llama.cpp's own prompt_ms/predicted_ms) and fall back
-   to wall-clock when a build omits them. TTFT is always wall-clock off the stream.
+2. THERE IS NO ``/props``. llama.cpp exposed the launch settings for read-back, which is how
+   the harness proved every model really ran at ``num_ctx``. vLLM puts the same fact on
+   ``/v1/models`` as ``max_model_len``, so ``server_info()`` reads it from there and
+   ``runner`` records it exactly as before. ``/health`` also differs: it answers 200 with an
+   EMPTY body, so status code is the signal and parsing it as JSON would fail every poll.
 
-3. CONTEXT SIZE IS NOT A REQUEST PARAMETER. Ollama took ``num_ctx`` per request; llama-server
-   fixes it at launch (``--ctx-size``). The harness therefore owns the server process
-   (see ``server.py``) instead of assuming someone started it correctly — the alternative is
-   silently comparing models at different context sizes, which is exactly the pollution this
-   harness exists to prevent.
+3. CONTEXT IS NO LONGER DIVIDED BY THE SLOT COUNT. Under llama.cpp ``--parallel N`` cut the
+   per-request window to ``--ctx-size / N``, which is why the harness carried
+   ``slot_context()`` and refused to run when a prompt would not fit a slot. vLLM's
+   PagedAttention allocates KV by the block as sequences actually grow, so ``--max-model-len``
+   is what EVERY concurrent request gets and raising ``--max-num-seqs`` costs no context at
+   all. This is the reason the project moved; see ``server.py``.
 """
 
 from __future__ import annotations
@@ -30,7 +38,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
-class LlamaCppError(RuntimeError):
+class VllmError(RuntimeError):
     pass
 
 
@@ -41,15 +49,20 @@ class GenerationResult:
     total_s: float                  # wall-clock, request sent -> stream closed
     eval_count: int | None          # completion tokens
     prompt_eval_count: int | None   # prompt tokens
-    prompt_ms: float | None         # llama.cpp's own prompt-eval time
-    predicted_ms: float | None      # llama.cpp's own generation time
+    # WALL-CLOCK DERIVED, not engine-reported — see the module docstring. `prompt_ms` is
+    # time-to-first-token (prefill plus queueing plus HTTP), `predicted_ms` is everything
+    # after it (decode). Both are None when there was no stream to time, which is the
+    # tool-loop's direct-answer path.
+    prompt_ms: float | None
+    predicted_ms: float | None
     finish_reason: str | None = None
     raw_final: dict[str, Any] = field(default_factory=dict)
-    # llama-server streams reasoning as `delta.reasoning_content`, a channel separate from
+    # vLLM streams reasoning as `delta.reasoning` (llama.cpp used `reasoning_content`; the
+    # client reads both), a channel separate from
     # `delta.content` — NOT inline `<think>` tags in `text` (those only show up if a build/
     # template doesn't split the two). Captured here rather than left to fall on the floor,
-    # for the one caller that turns reasoning on (`runner.run_thinking_experiment`); empty for
-    # every normal call, where reasoning stays off at launch and this channel never fires.
+    # for the callers that turn reasoning on (`run.advising_thinking`); empty for every normal
+    # call, where the template is asked for `enable_thinking: false` and this never fires.
     reasoning_text: str = ""
 
     @property
@@ -60,7 +73,7 @@ class GenerationResult:
         return self.finish_reason == "length"
 
 
-class LlamaCppClient:
+class VllmClient:
     def __init__(self, base_url: str, timeout_s: float = 600.0,
                  search_provider: Any = None):
         self.base_url = base_url.rstrip("/")
@@ -79,10 +92,10 @@ class LlamaCppClient:
             return urllib.request.urlopen(req, timeout=timeout or self.timeout_s)
         except urllib.error.HTTPError as exc:
             body = exc.read().decode(errors="replace")[:500]
-            raise LlamaCppError(f"{method} {path} -> HTTP {exc.code}: {body}") from exc
+            raise VllmError(f"{method} {path} -> HTTP {exc.code}: {body}") from exc
         except urllib.error.URLError as exc:
-            raise LlamaCppError(
-                f"Cannot reach llama-server at {self.base_url} ({exc.reason})."
+            raise VllmError(
+                f"Cannot reach vLLM server at {self.base_url} ({exc.reason})."
             ) from exc
         except OSError as exc:
             # NOT a urllib.error.URLError: a reset/broken-pipe/timeout that happens AFTER the
@@ -90,45 +103,76 @@ class LlamaCppClient:
             # `TimeoutError`) raises the raw `OSError` subclass, not `URLError` — urlopen only
             # wraps failures during the connect itself. Uncaught, this crashed a whole sweep
             # (2026-08-04): `server.start_server`'s health-check poll hit a `ConnectionReset`
-            # while llama-server was still binding its port, and the exception propagated all
+            # while vLLM server was still binding its port, and the exception propagated all
             # the way out of `run_convergence`, killing the harness process mid-run and
             # orphaning the GPU-resident server it had just launched. `health()`/`props()`
-            # already treat `LlamaCppError` as "not ready yet, keep polling" — this makes a
+            # already treat `VllmError` as "not ready yet, keep polling" — this makes a
             # startup-window connection hiccup one of those instead of a fatal crash.
-            raise LlamaCppError(
+            raise VllmError(
                 f"{method} {path} -> connection to {self.base_url} reset or failed ({exc})."
             ) from exc
 
     # --- probes ---------------------------------------------------------------------------
 
     def health(self, timeout: float = 5.0) -> bool:
+        """STATUS CODE ONLY. vLLM's /health answers 200 with an EMPTY body; llama.cpp's
+        answered `{"status": "ok"}`. Parsing this as JSON fails on every poll, which reads as
+        "server never came up" and times out a launch that in fact succeeded minutes earlier.
+        """
         try:
             with self._request("GET", "/health", timeout=timeout) as resp:
-                return json.load(resp).get("status") == "ok"
-        except (LlamaCppError, json.JSONDecodeError):
+                return 200 <= resp.status < 300
+        except VllmError:
             return False
 
     def props(self) -> dict[str, Any]:
-        """Server-side truth about what is actually loaded: context size, model path, build.
+        """Server-side truth about what is actually loaded: context size and model id.
 
-        This is the check Ollama never made possible — with llama.cpp the context size is a
-        launch flag, so "is every model really running at num_ctx?" is answerable instead of
-        assumed. ``runner`` records it per model and the report flags mismatches.
+        THERE IS NO /props ON vLLM. The fact the harness needs from it — "is every model
+        really running at num_ctx?" — is on /v1/models as `max_model_len`, so this reads it
+        from there and re-shapes it into the `{"default_generation_settings": {"n_ctx": ...}}`
+        envelope `runner` already destructures. Keeping the adapter here rather than teaching
+        the runner two shapes means exactly one place knows the endpoint moved.
         """
+        # llama.cpp STILL HAS /props AND IT IS THE BETTER ANSWER, so try it first. It reports
+        # the context the server actually allocated per slot, which is the number this check
+        # exists to verify; vLLM has no such endpoint and 404s here, costing one cheap request
+        # before the /v1/models path below. Ordering it this way keeps both engines on one code
+        # path instead of teaching the runner which server it is talking to.
         try:
             with self._request("GET", "/props", timeout=10) as resp:
-                return json.load(resp)
-        except (LlamaCppError, json.JSONDecodeError):
-            return {}
+                props = json.load(resp)
+            settings = props.get("default_generation_settings") or {}
+            if settings.get("n_ctx"):
+                return {
+                    "default_generation_settings": {"n_ctx": settings["n_ctx"]},
+                    "model_path": props.get("model_path") or self.loaded_model(),
+                    "max_model_len": settings["n_ctx"],
+                }
+        except (VllmError, json.JSONDecodeError, AttributeError):
+            pass
 
-    def loaded_model(self) -> str | None:
+        entry = self._model_entry()
+        if not entry:
+            return {}
+        n_ctx = entry.get("max_model_len")
+        return {
+            "default_generation_settings": {"n_ctx": n_ctx},
+            "model_path": entry.get("id"),
+            "max_model_len": n_ctx,
+        }
+
+    def _model_entry(self) -> dict[str, Any]:
         try:
             with self._request("GET", "/v1/models", timeout=10) as resp:
                 data = json.load(resp)
-        except (LlamaCppError, json.JSONDecodeError):
-            return None
+        except (VllmError, json.JSONDecodeError):
+            return {}
         entries = data.get("data") or []
-        return entries[0].get("id") if entries else None
+        return entries[0] if entries else {}
+
+    def loaded_model(self) -> str | None:
+        return self._model_entry().get("id")
 
     # --- generation -----------------------------------------------------------------------
 
@@ -225,7 +269,8 @@ class LlamaCppClient:
                     prompt_ms=None,
                     predicted_ms=None,
                     finish_reason=direct.get("finish_reason"),
-                    raw_final={"usage": direct.get("usage") or {}, "timings": {},
+                    raw_final={"usage": direct.get("usage") or {},
+                               "timings_source": "wall_clock",
                                "tool_calls": tool_calls_made},
                     reasoning_text=direct.get("reasoning", "").strip(),
                 )
@@ -233,7 +278,9 @@ class LlamaCppClient:
             "messages": messages,
             "stream": True,
             "stream_options": {"include_usage": True},
-            "timings_per_token": True,
+            # NO `timings_per_token`. That was llama.cpp's opt-in for its own prompt_ms/
+            # predicted_ms counters; vLLM's request model REJECTS unknown fields outright, so
+            # sending it is a 400 on every generation rather than a harmless no-op.
             **options,
         }
         if response_format is not None:
@@ -245,10 +292,9 @@ class LlamaCppClient:
         # `reasoning_effort`. Anything the model still emits is stripped by the scorers.
         #
         # `think is True` is the mirror case, used only by the server the thinking experiment
-        # launches with reasoning enabled (see server.build_argv's `thinking_budget`) — this is
-        # the request-level ask that goes with that server-level allowance, not an override of
-        # a `--reasoning off` launch (which per llama.cpp's own budget=0 behavior a per-request
-        # kwarg cannot undo).
+        # asks a stage to reason — on vLLM that is purely a per-request matter, since there is
+        # no launch-time reasoning switch to override. Its only user now is
+        # `run.advising_thinking`; the `plan_b_thinking` arm was removed 2026-08-24.
         kwargs = dict(chat_template_kwargs or {})
         if think is False:
             kwargs.setdefault("enable_thinking", False)
@@ -262,7 +308,6 @@ class LlamaCppClient:
         parts: list[str] = []
         reasoning_parts: list[str] = []
         usage: dict[str, Any] = {}
-        timings: dict[str, Any] = {}
         finish_reason: str | None = None
 
         with self._request("POST", "/v1/chat/completions", payload) as resp:
@@ -278,14 +323,26 @@ class LlamaCppClient:
                 except json.JSONDecodeError:
                     continue
                 if chunk.get("error"):
-                    raise LlamaCppError(str(chunk["error"]))
+                    raise VllmError(str(chunk["error"]))
                 if chunk.get("usage"):
                     usage = chunk["usage"]
-                if chunk.get("timings"):
-                    timings = chunk["timings"]
                 for choice in chunk.get("choices") or []:
                     delta = choice.get("delta") or {}
-                    reasoning_piece = delta.get("reasoning_content") or ""
+                    # BOTH SPELLINGS, AND vLLM USES THE SECOND. llama-server streamed the
+                    # reasoning channel as `delta.reasoning_content`; vLLM 0.27.1's
+                    # `--reasoning-parser` streams it as `delta.reasoning`. Reading only the
+                    # llama.cpp name silently dropped EVERY reasoning token — VERIFIED
+                    # 2026-08-23 by dumping the raw delta keys, which were
+                    # `{'role': 1, 'content': 1, 'reasoning': 800}`.
+                    #
+                    # The failure was invisible in exactly the way that matters: a thinking run
+                    # recorded `reasoning_chars: 0` while its `eval_count` jumped from 315 to
+                    # 1747 on the same prompt, so the model plainly HAD reasoned and the
+                    # harness's one measure of whether it did said no. Any thinking-vs-not
+                    # comparison built on that field would have concluded "the model ignored
+                    # the instruction" from a client bug.
+                    reasoning_piece = (delta.get("reasoning")
+                                       or delta.get("reasoning_content") or "")
                     if reasoning_piece:
                         reasoning_parts.append(reasoning_piece)
                     piece = delta.get("content") or ""
@@ -296,16 +353,29 @@ class LlamaCppClient:
                     if choice.get("finish_reason"):
                         finish_reason = choice["finish_reason"]
 
+        total_s = time.perf_counter() - start
+        # SPLIT THE WALL CLOCK AT FIRST TOKEN. vLLM reports no timing block of its own, so
+        # prefill is "until the first content token arrived" and decode is "everything after",
+        # and the report's tok/s is `eval_count / predicted_ms`, exactly as before. What is
+        # measured has widened — queue time and HTTP now land in `prompt_ms` where llama.cpp's
+        # counter excluded them — which is the honest number for a server that is meant to hold
+        # several students at once, but it is NOT the same measurement as the pre-2026-08-22
+        # records. `timings_source` marks every row so the two can never be silently pooled.
+        #
+        # A response with no content token at all (an empty completion, or a refusal that
+        # streamed only reasoning) leaves `ttft` None; attributing all of it to decode would
+        # invent a throughput number out of a generation that produced nothing, so both fields
+        # stay None and the report drops the row rather than counting it.
         return GenerationResult(
             text="".join(parts).strip(),
             ttft_s=ttft,
-            total_s=time.perf_counter() - start,
-            eval_count=usage.get("completion_tokens") or timings.get("predicted_n"),
-            prompt_eval_count=usage.get("prompt_tokens") or timings.get("prompt_n"),
-            prompt_ms=timings.get("prompt_ms"),
-            predicted_ms=timings.get("predicted_ms"),
+            total_s=total_s,
+            eval_count=usage.get("completion_tokens"),
+            prompt_eval_count=usage.get("prompt_tokens"),
+            prompt_ms=ttft * 1000 if ttft is not None else None,
+            predicted_ms=(total_s - ttft) * 1000 if ttft is not None else None,
             finish_reason=finish_reason,
-            raw_final={"usage": usage, "timings": timings,
+            raw_final={"usage": usage, "timings_source": "wall_clock",
                        "tool_calls": tool_calls_made},
             reasoning_text="".join(reasoning_parts).strip(),
         )
@@ -343,7 +413,8 @@ class LlamaCppClient:
                 usage = body.get("usage") or {}
                 return messages, made, {
                     "text": message.get("content") or "",
-                    "reasoning": message.get("reasoning_content") or "",
+                    "reasoning": (message.get("reasoning")
+                                  or message.get("reasoning_content") or ""),
                     "finish_reason": choice.get("finish_reason"),
                     "completion_tokens": usage.get("completion_tokens"),
                     "prompt_tokens": usage.get("prompt_tokens"),

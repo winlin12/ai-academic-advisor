@@ -15,7 +15,7 @@ The planner remains the single source of truth for legality (prereqs, term offer
 caps). The model only reorders codes the planner already knows how to schedule; a hallucinated
 proposal degrades to a no-op because unknown codes and out-of-range caps are dropped on apply.
 
-The proposal is a structured output (``LlamaCppClient.propose`` with the PlanEditProposal
+The proposal is a structured output (``VllmClient.propose`` with the PlanEditProposal
 schema). llama.cpp's grammar-constrained ``response_format`` is stricter than Ollama's old
 syntax-only ``format=<schema>``, but still doesn't guarantee every schema keyword, so
 ``propose()`` itself retries once on a malformed response; the retry loop below is for a
@@ -38,7 +38,7 @@ from app.models.schemas import (
     RevisePlanResponse,
     StudentProfile,
 )
-from app.services.llamacpp_client import LlamaCppClient, ModelResponseError
+from app.services.vllm_client import VllmClient, ModelResponseError
 from app.services.planner import generate_plan
 
 logger = logging.getLogger(__name__)
@@ -263,7 +263,7 @@ async def propose_edit(
     plan: PlanResponse,
     feedback: str,
     *,
-    client: LlamaCppClient,
+    client: VllmClient,
     seed: int | None = None,
 ) -> PlanEditProposal:
     """MODE A, on its own: turn free-text feedback into a structured, grounded proposal.
@@ -310,7 +310,7 @@ async def revise_plan(
     catalog: list[Course],
     feedback: str,
     *,
-    client: LlamaCppClient,
+    client: VllmClient,
     max_iterations: int = DEFAULT_MAX_ITERATIONS,
     seed: int | None = None,
 ) -> RevisePlanResponse:
@@ -362,7 +362,7 @@ async def ai_revise_plan(
     feedback: str,
     current_plan: PlanResponse | None,
     *,
-    client: LlamaCppClient,
+    client: VllmClient,
     seed: int | None = None,
 ) -> RevisePlanResponse:
     """MODE A proposes, MODE B rebuilds. The chat's revise path when the plan came from the AI.

@@ -9,24 +9,44 @@ Everything else this harness measures — grounded QA, plan explanation, structu
 reliability — is secondary to that. The report is ordered accordingly.
 
 The harness depends on nothing in the app (no FastAPI, no pydantic, no Postgres). It needs
-Python 3.10+, PyYAML, and llama.cpp. It starts and stops `llama-server` itself.
+Python 3.10+, PyYAML, and a vLLM install it only ever talks to over HTTP. It starts and stops
+the vLLM server itself.
 
 ---
 
 ## What changed, and why (read this before comparing to old results)
 
-This used to be an Ollama text-to-SQL benchmark. Both halves of that are obsolete:
+### 2026-08-22 — llama.cpp → vLLM. **Nothing recorded before this date pools with anything after it.**
+
+The switch was made when the dual-card rig (RTX 3060 12 GB + RTX 2060 SUPER 8 GB, both
+power-limited to survive a 600 W PSU) was replaced by a single **RTX 3090 Ti 24 GB**.
 
 | Was | Is | Why |
 |---|---|---|
-| Ollama HTTP API (`/api/generate`) | llama.cpp `llama-server` (`/v1/chat/completions`) | The app moved to llama.cpp on 2026-07-21 (`backend/app/services/llamacpp_client.py`). Ollama's nanosecond timing fields, `think:` flag and `journalctl` offload parsing have no equivalent. |
-| Text-to-SQL against a stub SQLite schema | Plan of study + grounded QA | **The app never asks a model for SQL.** `services/rag/pipeline.py` does retrieval itself (exact course-code lookup + pgvector cosine search) and hands the model only the chunks it already found. Measuring SQL was measuring a call site that does not exist. |
-| `num_ctx` sent per request | `--ctx-size` fixed at launch | llama.cpp fixes context, KV type, GPU layers and reasoning mode when the process starts. The harness therefore owns the process — otherwise "every model saw identical settings" depends on whoever typed the last command line. |
-| Offload from `journalctl -u ollama` | Offload from llama-server's own stderr | Better data: build b10083 names the device for *every layer*, so offload is counted, not inferred. Requires `-lv 5`; at default verbosity llama-server prints no offload info at all. |
+| llama.cpp `llama-server` | vLLM OpenAI server (`vllm serve`) | The app is a web server: several students on a site at once is the shape of the product, and it is the one thing llama.cpp could not do here. |
+| GGUF Q4_K_M / Q6_K | W4A16 `compressed-tensors` (AWQ) | vLLM's native quantized path on Ampere, through Marlin kernels. **This is what makes quality numbers incomparable across the boundary** — different weights, not just a different runtime. |
+| `--ctx-size` split across `--parallel` slots | `--max-model-len` per request, paged KV | The heart of it. Under llama.cpp a second concurrent student *halved* the window each of them got, and four-way batching measured ~18% **slower** in aggregate than serving one at a time. vLLM allocates KV by the block, so concurrency costs KV headroom and nothing else. |
+| `--n-gpu-layers`, `--n-cpu-moe`, `--tensor-split`, `--mlock` | *(gone)* | Every one of them existed to fit a model across two mismatched cards. On one card the model fits or it does not. |
+| Speculative decoding via a 0.8B draft gguf | *(gone, not replaced)* | It paid by amortizing weight reads that no longer dominate. vLLM has `--speculative-config` if it is ever worth re-testing, and the Qwen checkpoint even ships an MTP head — see `config.yaml`. |
+| Per-layer offload from llama-server's stderr | KV-cache size from vLLM's startup log | The old failure to catch was "half the layers are secretly on the CPU". That cannot happen now — but a checkpoint that eats more of the card than expected silently shrinks the KV pool, which caps concurrency without erroring. `meta_*.json`'s `kv_cache` records it per model. |
+| `timings` from llama.cpp's own counters | Wall clock, split at first token | vLLM sends no timing block. Queue time and HTTP now land in TTFT where llama.cpp excluded them — the honest number for a server holding several students, but not the same measurement. Every record carries `timings_source`. |
+| Seven models | Two: `qwen3.8-27b`, `gemma4-26b` | The `12gb` bracket existed to fit the smaller of two cards and stopped meaning anything; the rest were previous generations of the two that remain. |
 
-The old SQL question set, stub schema and Ollama client are preserved under
-`results/archive_ollama_sql/`. Old `runs_*.jsonl` files are **not** comparable to new ones —
-different tasks, different prompts, different hashes.
+Results recorded on the old stack are preserved and **not** deleted:
+
+| Directory | Hardware | Engine |
+|---|---|---|
+| `results_full_3060/`, `results_full/`, `results_old/` | RTX 3060 + RTX 2060 SUPER | llama.cpp / GGUF |
+| `results_full_3090_llamacpp/` | RTX 3090 Ti | llama.cpp / GGUF |
+| `results/` | RTX 3090 Ti | vLLM / compressed-tensors |
+
+### Earlier — Ollama text-to-SQL → plan of study
+
+This used to be an Ollama text-to-SQL benchmark. **The app never asks a model for SQL** —
+`services/rag/pipeline.py` does retrieval itself (exact course-code lookup + pgvector cosine
+search) and hands the model only the chunks it already found, so measuring SQL was measuring a
+call site that does not exist. The old SQL question set, stub schema and Ollama client are
+preserved under `results/archive_ollama_sql/`.
 
 ---
 
@@ -35,35 +55,62 @@ different tasks, different prompts, different hashes.
 ```bash
 cd model_eval
 
-python run.py doctor              # local llama-server setup: binary, models, GPU (once, first)
-python run.py check               # program data, prompt sizes, gguf files, GPU visible
+python run.py doctor              # local vLLM setup: launcher, CUDA import, models, GPU (once)
+python run.py check               # program data, prompt sizes, checkpoints, GPU visible
 python run.py check --major "nursing"   # ...for any crawled program; --major works on `run` too
 python run.py run        # THE SWEEP: 2 curated majors per school + 2 random untested programs
                          # (config.yaml `sweep:`) — every model, every task (hours)
 python run.py report     # results/report.md
 
 # narrower runs
-python run.py run --brackets 8gb,coder            # deployment candidates only
-python run.py run --models qwen3.6-27b --tasks plan_b
+python run.py run --models qwen3.8-27b --tasks plan_b
 python run.py run --mitigate --models <champion>  # the free fixes, for before/after
 ```
 
 ### Requirements
 
-- Python 3.10+, `pip install pyyaml` (only dependency)
-- `llama-server` built from `../llama.cpp` (`cmake -B build -DGGML_CUDA=on && cmake --build
-  build --config Release -j`; lands at `llama.cpp/build/bin/llama-server`), GGUFs under
-  `../models/`
-- `nvidia-smi` (WSL ships it at `/usr/lib/wsl/lib/nvidia-smi`; absent = VRAM recorded as null)
+- Python 3.10+, `pip install pyyaml` (the harness's only dependency — it talks HTTP, nothing
+  more, so vLLM does not need to be importable in the interpreter that runs `run.py`)
+- vLLM in the project venv: `.venv/bin/pip install vllm==0.27.1`. It pulls torch and the CUDA
+  runtime libraries with it — several GB, and the install is the slow part of a fresh setup.
+- **`transformers` must be < 5.15.0** — `pip install "transformers==5.14.1"`. vLLM 0.27.1 only
+  requires `>=5.5.3` and will happily install 5.15.x, which **breaks `gemma4-26b` at config
+  parse**, before any GPU work:
+
+  ```
+  AmbiguousGlobalPerLayerAttributeError: 'head_dim' is a per-layer attribute and may vary
+  across layers.
+  ```
+
+  It is a real ambiguity, not a spurious guard: Gemma 4 declares `global_head_dim: 512` for its
+  full-attention layers and `head_dim: 256` for the sliding ones, and 5.15 stopped answering
+  `config.head_dim` globally. vLLM's `get_head_size()` asks globally anyway. BISECTED
+  2026-08-22 — 5.14.1 works, 5.15.0 is the first broken release; `qwen3.8-27b` is unaffected on
+  either. Output was verified coherent on 5.14.1 (correct arithmetic, sensible prose), so the
+  value it resolves is right; the newer transformers simply refuses to pick it.
+- Checkpoints under `../models/`, as Hugging Face **directories** (config.json + safetensors +
+  tokenizer), not single files the way the GGUFs were:
+
+  ```bash
+  .venv/bin/hf download philbert440/Qwen3.8-27B-W4A16-AWQ    --local-dir models/qwen3.8-27b-awq
+  .venv/bin/hf download cyankiwi/gemma-4-26B-A4B-it-qat-AWQ-INT4 --local-dir models/gemma4-26b-awq
+  ```
+
+- `nvidia-smi` on PATH (absent = VRAM recorded as null)
 - Models on **SSD** — an HDD cold-load pollutes latency and can blow the startup timeout
 
-`llama-server` runs as a native Linux process directly in this WSL box — no Windows interop,
-no cross-VM networking, so it binds plain loopback (`127.0.0.1`). `python run.py doctor`
-checks the binary, the models directory, GPU visibility and whether the configured port is
-already in use.
+The server runs as a native Linux process and binds plain loopback (`127.0.0.1`).
+`python run.py doctor` checks the launcher, that vLLM imports against a CUDA-visible GPU, the
+models directory, and whether the configured port is already in use.
 
-Note the eval port is **8099**, not llama.cpp's default 8080 — the `purdueio-api` container
-already owns 8080 on this box.
+Note the eval port is **8099**, not 8080 — the `purdueio-api` container already owns 8080 on
+this box, and the app's own vLLM server (`backend/app/services/model_manager.py`) uses 8080 so
+the two can run side by side.
+
+**Startup is slow, and that is normal.** Beyond reading ~17-19 GB of weights, vLLM profiles a
+forward pass to size the KV pool and captures CUDA graphs; a checkpoint's *first* launch also
+populates a compilation cache that later launches reuse. `vllm.startup_timeout_s` is 1800 for
+that reason — timing out mid-compile looks exactly like a broken model.
 
 ### WSL memory (lives outside this repo)
 
@@ -497,7 +544,7 @@ can make several round trips, but the student's wait starts once.
 
 All of it excludes model load. The warmup generations run before anything is measured and are
 discarded, so these are warm-server numbers; a student who hits a cold server also waits for
-the weights to page in from disk, which for the larger ggufs is minutes, not seconds.
+the weights to page in from disk and the engine to capture CUDA graphs — minutes, not seconds.
 
 ---
 
@@ -505,11 +552,11 @@ the weights to page in from disk, which for the larger ggufs is minutes, not sec
 
 | File | Responsibility |
 |---|---|
-| `config.yaml` | Every knob that could pollute a comparison: context size, KV type, GPU layers, sampling, per-model gguf paths and `think`/`mlock` flags, decision thresholds. |
+| `config.yaml` | Every knob that could pollute a comparison: context length, KV dtype, GPU memory fraction, max concurrent sequences, sampling, per-model checkpoint paths and `think` flags, decision thresholds. |
 | `harness/real_db.py` | **The scoring authority's source.** Reads one program out of the crawled `catalog_ingestion`/`advisor` Postgres, scopes and budget-trims it, and builds both what the model is shown (`CatalogDatabase`) and what it is scored against (`fixture_from_database`). Also owns program lookup for `--major` and the sweep. |
 | `questions.yaml` | Grounded-QA items with their retrieved chunks **pinned in the file** — retrieval belongs to the embedding model, so letting it vary would smear a retrieval difference across every model's score. |
-| `harness/server.py` | llama-server lifecycle as a native local process: builds argv from config, waits for `/health`, parses per-layer offload from stderr, stops between models. |
-| `harness/llamacpp_client.py` | Streaming stdlib client for `/v1/chat/completions`. TTFT from the stream, token counts from `usage`, timings from llama.cpp's own `timings`. |
+| `harness/server.py` | vLLM lifecycle as a native local process: builds argv from config, waits for `/health`, parses KV-cache size from the startup log, stops between models and **waits for the VRAM to actually come back** before the next one starts. |
+| `harness/vllm_client.py` | Streaming stdlib client for `/v1/chat/completions`. TTFT from the stream, token counts from `usage`, decode time from the wall clock (vLLM reports no timings). |
 | `harness/planner.py` | **Vendored copy** of the app's deterministic planner + `_apply_proposal`. Mode A can only measure production if these match — see the drift warning below. |
 | `harness/fixtures.py` | The harness's own types (`Fixture`/`Scenario`), the five synthesized students every program is evaluated against, and the port of `planner_catalog.select_remaining_courses` so Mode A starts from production's baseline. No longer loads anything from disk. |
 | `harness/plan_scorers.py` | Viability, requirement coverage, scenario assertions, proposal groundedness — against the fixture. Scores Mode A (legal by construction, by design) and Mode C (see the known-gap note on `convergence.py`, below). Not used for Mode B any more. |
@@ -521,10 +568,9 @@ the weights to page in from disk, which for the larger ggufs is minutes, not sec
 | `harness/convergence_report.py` | Mode C's tables and Kaplan-Meier estimator over right-censored data; progress traces per attempt. Own module because the record schema is a survival observation, not pass/fail — but `report.py` imports `mode_c_lines()` and splices it into the one `results/report.md`, not a separate file. |
 | `harness/report.py` | Plan tables first, validity guards, manual review queue. No composite score exists. |
 | `results/transcripts/` | One markdown file per (model, stage, item, replicate): system prompt, user prompt, raw output, verdict. The raw text is in the JSONL too, but a JSONL field is not something you can read — and reading what a model literally said is how you catch a metric measuring the wrong thing. Disable with `run.save_transcripts: false`. |
-| `setup/allow_wsl_llamacpp.ps1` | Leftover from the Windows-interop era; not needed now that llama-server runs natively in WSL. |
 
 Data flow: crawled Postgres → `real_db.py` (+ `questions.yaml`) → `prompts.py` → `server.py` +
-`llamacpp_client.py` → `plan_scorers.py` / `scorers.py` / `convergence.py` →
+`vllm_client.py` → `plan_scorers.py` / `scorers.py` / `convergence.py` →
 `results/runs_*.jsonl` → `report.py` (pulling in `convergence_report.mode_c_lines()`) →
 `results/report.md` + `results/review_queue.jsonl`.
 
@@ -541,15 +587,16 @@ Data flow: crawled Postgres → `real_db.py` (+ `questions.yaml`) → `prompts.p
 | **Structure OK** | **Automatic.** Under grammar-constrained decoding this should be ~100%; anything less is a real signal (truncation, a template mismatch, or a model that ignores the grammar). |
 | **Behavior OK (QA)** | **Automatic-ish.** Abstention is a phrase heuristic. A polite correction and a polite refusal look the same to it — read the adversarial items. |
 | **FAITHFULNESS** | **Manual, full stop.** The heuristic catches *entity* hallucination only (codes/numbers absent from the context). Relational hallucination ("X must come before Y") is not machine-checkable without a judge model, which is deliberately not here — judging small models with another model smuggles in a second unvalidated instrument. Quote your manual grade, not the flag rate. |
-| **LATENCY** | Automatic. Tiebreaker only, and **box-specific**. As of 2026-07-27 this box is an **RTX 2060 SUPER (8 GB)** running the native WSL build; earlier numbers in `results_*/` were taken on a 5070 Ti (16 GB) over Windows interop. Latency does not transfer between them — different architecture, bandwidth and thermals — and on an 8 GB card neither does the *offload fraction*, so re-read layers-offloaded from the env row rather than assuming. Only quality scores transfer between boxes. |
+| **LATENCY** | Automatic. Tiebreaker only, and **box-and-engine-specific**. As of 2026-08-22 this box is a single **RTX 3090 Ti (24 GB)** running vLLM; `results_full_3060/` and `results_full/` were taken on an RTX 3060 + RTX 2060 SUPER pair under llama.cpp, and `results_full_3090_llamacpp/` on this card but still under llama.cpp. Latency transfers across none of those boundaries — different bandwidth, a different KV allocator, and timings that are wall-clock derived here rather than engine-reported (`timings_source` on every record says which). Read `kv_cache` from the env row rather than assuming a concurrency ceiling. Only quality scores transfer between boxes, and **not even those across the GGUF → compressed-tensors requantization.** |
 
 ---
 
 ## Validity threats already defended against
 
-- One llama-server command line, built from config, applied identically to every model — and
+- One `vllm serve` command line, built from config, applied identically to every model — and
   `/props` is read back so "every model ran at `num_ctx`" is **verified**, not assumed
-- GPU offload counted per layer from llama-server's own stderr; `unverified` says so
+- KV-cache capacity read from vLLM's own startup log, so a model whose concurrency ceiling
+  collapsed is visible rather than silently slow; `unverified` says so
 - Warmup generations run and discarded; VRAM measured as an `nvidia-smi` delta after warmup
 - Server stopped between models so the next VRAM baseline is clean
 - Reasoning disabled at launch (`--reasoning off`) plus a per-request template kwarg, and any

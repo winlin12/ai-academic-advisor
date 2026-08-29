@@ -106,7 +106,7 @@ _REFERRAL_PHRASES = ("confirm with", "check with", "contact your")
 
 
 def strip_reasoning(text: str) -> str:
-    """Mirrors ``llamacpp_client.strip_reasoning`` in the app. Reasoning is disabled at server
+    """Mirrors ``vllm_client.strip_reasoning`` in the app. Reasoning is disabled at server
     launch (``--reasoning off``), so this should be a no-op — it stays because a leaked
     ``<think>`` block would otherwise be scored as hallucinated content."""
     return _THINK_RE.sub("", text).strip()

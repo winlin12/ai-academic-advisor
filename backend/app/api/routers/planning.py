@@ -31,9 +31,9 @@ from app.models.schemas import (
     StudentProfile,
 )
 from app.services.ai_planner import generate_ai_plan
-from app.services.llamacpp_client import (
-    LlamaCppClient,
-    LlamaCppConnectionError,
+from app.services.vllm_client import (
+    VllmClient,
+    VllmConnectionError,
     ModelResponseError,
 )
 from app.services.plan_editor import (
@@ -73,12 +73,12 @@ async def plan_ai_generate(req: AiPlanRequest):
     is not recoverable — there would be no catalog to plan from.
     """
     profile, catalog = resolve_for_ai_planning(req.profile)
-    client = LlamaCppClient()
+    client = VllmClient()
     try:
         result = await generate_ai_plan(
             profile, catalog, client=client, request=req.request, seed=req.seed
         )
-    except LlamaCppConnectionError as exc:
+    except VllmConnectionError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ModelResponseError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -112,13 +112,13 @@ async def plan_refine(req: RefinePlanRequest):
     profile, catalog = resolve_for_ai_planning(req.profile)
     semesters = [[course.code for course in semester.courses]
                  for semester in req.plan.semesters]
-    client = LlamaCppClient()
+    client = VllmClient()
     try:
         result, outcome = await refine_plan(
             profile, catalog, semesters, req.mode,
             client=client, seed=req.seed, attempt=req.attempt,
         )
-    except LlamaCppConnectionError as exc:
+    except VllmConnectionError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ModelResponseError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc

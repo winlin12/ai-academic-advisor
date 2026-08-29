@@ -51,7 +51,7 @@ from app.services.ai_planner import (
     plan_schema,
     profile_block,
 )
-from app.services.llamacpp_client import LlamaCppClient, ModelResponseError
+from app.services.vllm_client import VllmClient, ModelResponseError
 from app.services.plan_context import approx_tokens, render_program_context
 from app.services.plan_validation import (
     legal_slots,
@@ -221,7 +221,7 @@ def _system_for(catalog: ProgramCatalog, user: str, *, extra_rules: str = "") ->
     """
     rules = f"{PLAN_SYSTEM}\n\n{extra_rules}" if extra_rules else PLAN_SYSTEM
     spent = approx_tokens(rules) + approx_tokens(user)
-    available = (settings.llamacpp_context_tokens - spent - _DELTA_MAX_TOKENS
+    available = (settings.vllm_context_tokens - spent - _DELTA_MAX_TOKENS
                  - _WINDOW_SAFETY_TOKENS)
     budget = min(settings.plan_context_token_budget, max(available, 0))
     return f"{rules}\n\n{render_program_context(catalog, budget_tokens=budget)}"
@@ -322,7 +322,7 @@ def _merge_delta(
 
 
 async def _call(
-    client: LlamaCppClient,
+    client: VllmClient,
     system: str,
     user: str,
     catalog: ProgramCatalog,
@@ -332,15 +332,15 @@ async def _call(
 ) -> AiPlanDraft | None:
     """One grammar-constrained plan call. Returns None when nothing usable came back."""
     schema = plan_schema(planning_terms(), [c.code for c in catalog.courses])
-    room = (settings.llamacpp_context_tokens - approx_tokens(system) - approx_tokens(user)
+    room = (settings.vllm_context_tokens - approx_tokens(system) - approx_tokens(user)
             - _WINDOW_SAFETY_TOKENS)
-    max_tokens = min(settings.llamacpp_plan_max_tokens, max(room, 0))
+    max_tokens = min(settings.vllm_plan_max_tokens, max(room, 0))
     if max_tokens < _MIN_USEFUL_TOKENS:
         logger.warning("refine: prompt leaves only %d tokens for the plan; skipping the model",
                        max_tokens)
         return None
     if temperature is not None:
-        client = LlamaCppClient(temperature=temperature)
+        client = VllmClient(temperature=temperature)
     try:
         return await client.propose(
             system, user, AiPlanDraft, schema=schema, seed=seed, max_tokens=max_tokens
@@ -422,7 +422,7 @@ async def refine_plan(
     semesters: list[list[str]],
     mode: RefineMode,
     *,
-    client: LlamaCppClient,
+    client: VllmClient,
     seed: int | None = None,
     attempt: int = 1,
 ) -> tuple[AiPlanResult, RefineOutcome]:
@@ -441,7 +441,7 @@ async def _fill(
     catalog: ProgramCatalog,
     current: list[list[str]],
     *,
-    client: LlamaCppClient,
+    client: VllmClient,
     seed: int | None,
 ) -> tuple[AiPlanResult, RefineOutcome]:
     """Freeze what validates; ask the model only for what is missing."""
@@ -506,7 +506,7 @@ async def _regenerate(
     catalog: ProgramCatalog,
     current: list[list[str]],
     *,
-    client: LlamaCppClient,
+    client: VllmClient,
     seed: int | None,
 ) -> tuple[AiPlanResult, RefineOutcome]:
     """Tell the model what is wrong and make it fix the plan itself. Seed held FIXED."""
@@ -604,7 +604,7 @@ async def _start_over(
     profile: StudentProfile,
     catalog: ProgramCatalog,
     *,
-    client: LlamaCppClient,
+    client: VllmClient,
     seed: int | None,
     attempt: int,
 ) -> tuple[AiPlanResult, RefineOutcome]:
@@ -616,9 +616,9 @@ async def _start_over(
     """
     from app.services.ai_planner import generate_ai_plan
 
-    temperature = min(settings.llamacpp_temperature + TEMPERATURE_STEP * max(attempt - 1, 0),
+    temperature = min(settings.vllm_temperature + TEMPERATURE_STEP * max(attempt - 1, 0),
                       TEMPERATURE_MAX)
-    sampler = LlamaCppClient(model=client.model, temperature=temperature)
+    sampler = VllmClient(model=client.model, temperature=temperature)
     result = await generate_ai_plan(profile, catalog, client=sampler, seed=seed)
     outcome = RefineOutcome(
         mode="start-over",

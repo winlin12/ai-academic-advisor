@@ -1,7 +1,7 @@
 """Tests for the revise-plan agent.
 
 The model transport is stubbed (canned PlanEditProposal objects, mirroring what
-LlamaCppClient.propose returns after schema validation), so these run with no network — they
+VllmClient.propose returns after schema validation), so these run with no network — they
 exercise the proposal-application logic and the propose → re-plan loop against the seed
 catalog.
 """
@@ -11,11 +11,11 @@ import asyncio
 from app.models.schemas import PlanEditProposal, StudentProfile
 from app.services.advisor_agent import _apply_proposal, revise_plan
 from app.services.catalog import load_catalog
-from app.services.llamacpp_client import ModelResponseError
+from app.services.vllm_client import ModelResponseError
 
 
 class _StubClient:
-    """Stand-in for LlamaCppClient that returns canned proposals in order."""
+    """Stand-in for VllmClient that returns canned proposals in order."""
 
     def __init__(self, responses: list[PlanEditProposal]):
         self.model = "stub-model"
@@ -33,7 +33,7 @@ class _StubClient:
         # tag enums built from this student's own courses). Captured so a test can assert on it.
         self.schemas.append(schema)
         # `seed` and `max_tokens` are accepted and ignored — the stub is deterministic by
-        # construction, but the signature has to track LlamaCppClient.propose or a test suite
+        # construction, but the signature has to track VllmClient.propose or a test suite
         # goes green against a client the app cannot actually call.
         self.seeds.append(seed)
         return self._responses.pop(0)

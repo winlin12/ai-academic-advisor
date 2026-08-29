@@ -14,15 +14,19 @@ import httpx
 import pytest
 from pydantic import BaseModel
 
-from app.services.llamacpp_client import (
-    LlamaCppClient,
-    LlamaCppConnectionError,
+from app.services.vllm_client import (
+    VllmClient,
+    VllmConnectionError,
     ModelResponseError,
     is_local_model_endpoint,
     strip_reasoning,
 )
 
-_MODEL = "Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf"
+# A SERVED MODEL NAME, not a filename. Under llama.cpp the model simply WAS the gguf the
+# process was launched with, and /v1/models reported its path; vLLM takes
+# `--served-model-name` and reports that string verbatim, so the app and the server agree on
+# a short stable name and health() compares the two exactly.
+_MODEL = "gemma4-26b"
 
 
 class _Proposal(BaseModel):
@@ -30,8 +34,8 @@ class _Proposal(BaseModel):
     max_credits_per_semester: int | None = None
 
 
-def _mock_client(monkeypatch, handler) -> LlamaCppClient:
-    """A LlamaCppClient whose internal httpx.AsyncClient is transparently backed by a
+def _mock_client(monkeypatch, handler) -> VllmClient:
+    """A VllmClient whose internal httpx.AsyncClient is transparently backed by a
     MockTransport calling ``handler(request) -> httpx.Response``. Patches the shared
     ``httpx`` module object the client module imported, so no client code changes."""
     real_async_client = httpx.AsyncClient
@@ -41,7 +45,7 @@ def _mock_client(monkeypatch, handler) -> LlamaCppClient:
         return real_async_client(*args, **kwargs)
 
     monkeypatch.setattr(httpx, "AsyncClient", factory)
-    return LlamaCppClient(model=_MODEL, base_url="http://localhost:8080")
+    return VllmClient(model=_MODEL, base_url="http://localhost:8080")
 
 
 # --- pure helpers ---------------------------------------------------------------------------
@@ -76,9 +80,9 @@ def test_is_local_model_endpoint(url, expected):
 def test_local_only_guard_rejects_public_base_url(monkeypatch):
     from app.core.config import settings
 
-    monkeypatch.setattr(settings, "llamacpp_local_only", True)
+    monkeypatch.setattr(settings, "vllm_local_only", True)
     with pytest.raises(Exception, match="local or self-hosted"):
-        LlamaCppClient(base_url="http://api.example.com:8080")
+        VllmClient(base_url="http://api.example.com:8080")
 
 
 # --- generate() ------------------------------------------------------------------------------
@@ -223,8 +227,8 @@ def test_generate_raises_model_response_error_on_bad_status(monkeypatch):
 
 
 def test_generate_raises_connection_error_when_unreachable():
-    client = LlamaCppClient(model=_MODEL, base_url="http://localhost:19999")
-    with pytest.raises(LlamaCppConnectionError):
+    client = VllmClient(model=_MODEL, base_url="http://localhost:19999")
+    with pytest.raises(VllmConnectionError):
         asyncio.run(client.generate("system", "user"))
 
 
@@ -234,12 +238,11 @@ def test_generate_raises_connection_error_when_unreachable():
 def test_health_ok_when_loaded_model_matches(monkeypatch):
     def handler(req):
         if req.url.path == "/health":
-            return httpx.Response(200, json={"status": "ok"})
+            # vLLM answers /health with 200 and an EMPTY body; only the status code is
+            # meaningful. The client must not try to parse it.
+            return httpx.Response(200)
         assert req.url.path == "/v1/models"
-        return httpx.Response(
-            200,
-            json={"data": [{"id": f"/home/wylin/models/{_MODEL}"}]},
-        )
+        return httpx.Response(200, json={"data": [{"id": _MODEL}]})
 
     client = _mock_client(monkeypatch, handler)
     ok, detail = asyncio.run(client.health())
@@ -251,7 +254,7 @@ def test_health_false_when_loaded_model_does_not_match(monkeypatch):
     def handler(req):
         if req.url.path == "/health":
             return httpx.Response(200, json={"status": "ok"})
-        return httpx.Response(200, json={"data": [{"id": "/home/wylin/models/mistral-7b.gguf"}]})
+        return httpx.Response(200, json={"data": [{"id": "qwen3.8-27b"}]})
 
     client = _mock_client(monkeypatch, handler)
     ok, detail = asyncio.run(client.health())
@@ -272,7 +275,7 @@ def test_health_true_with_caveat_when_models_endpoint_fails(monkeypatch):
 
 
 def test_health_false_when_unreachable():
-    client = LlamaCppClient(model=_MODEL, base_url="http://localhost:19999")
+    client = VllmClient(model=_MODEL, base_url="http://localhost:19999")
     ok, detail = asyncio.run(client.health())
     assert ok is False
     assert "Cannot reach" in detail

@@ -29,7 +29,7 @@ async def lifespan(app: FastAPI):
     # llama-server's process lifecycle so a user can switch models from the UI.
     #
     # BACKGROUNDED, NOT AWAITED. A model launch can take anywhere from a few seconds to the
-    # full `llamacpp_startup_timeout_s` (180s default) — GPU contention, a cold disk read of a
+    # full `vllm_startup_timeout_s` (180s default) — GPU contention, a cold disk read of a
     # 15-20GB gguf, whatever. Awaiting it here would block uvicorn's own startup on it, which
     # means catalog browsing and the deterministic planner — routes that need no LLM at all —
     # would be unreachable for up to three minutes on every cold start. `GET /v1/models`

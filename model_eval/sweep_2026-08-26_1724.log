@@ -1,0 +1,171 @@
+real_db: dropping 7 requirement_options course(s) not in the current PurdueIO catalog (stale department listing, not a crawl bug): AGR 49500, ASEC 43110, ASEC 53100, FS 48400, HORT 45000, LA 45000, POL 23200
+real_db: dropping 7 requirement_options course(s) not in the current PurdueIO catalog (stale department listing, not a crawl bug): AGR 49500, ASEC 43110, ASEC 53100, FS 48400, HORT 45000, LA 45000, POL 23200
+real_db: dropping 8 requirement_options course(s) not in the current PurdueIO catalog (stale department listing, not a crawl bug): ACCT 24900, ACCT 51400, ACCT 55700, DSB 23500, FIN 25800, FIN 41500, FIN 41601, MKTG 22300
+real_db: dropping 7 requirement_options course(s) not in the current PurdueIO catalog (stale department listing, not a crawl bug): ACCT 24900, DSB 23500, FIN 25800, FIN 41250, FIN 41500, FIN 41601, FIN 41650
+real_db: dropping 1 requirement_options course(s) not in the current PurdueIO catalog (stale department listing, not a crawl bug): EDCI 23451
+
+[sweep] 16 program(s):
+  - agriculture    Animal Sciences: Pre-Veterinary Medicine Concentration  [animal-sciences-pre-veterinary-medicine] (curated)
+  - agriculture    Agricultural Economics: Applied Agricultural Economics Concentration  [agricultural-economics-applied-agricultural] (curated)
+  - business       Accounting  [accounting] (curated)
+  - business       Finance  [finance] (curated)
+  - education      Elementary Education  [elementary-education] (curated)
+  - education      English Education  [english-education] (curated)
+  - engineering    Electrical Engineering  [electrical-engineering] (curated)
+  - engineering    Mechanical Engineering  [mechanical-engineering] (curated)
+  - health_human_sciences Nursing  [nursing] (curated)
+  - health_human_sciences Psychological Sciences  [psychological-sciences] (curated)
+  - liberal_arts   Communication: General Communication Concentration  [communication-general-communication] (curated)
+  - liberal_arts   Political Science: American Politics Concentration  [political-science-american-politics] (curated)
+  - polytechnic    Computer and Information Technology  [computer-and-information-technology] (curated)
+  - polytechnic    Construction Management  [construction-management] (curated)
+  - science        Computer Science: Machine Intelligence  [computer-science-machine-intelligence] (curated)
+  - science        Biology  [biology] (curated)
+
+======================================================================
+PROGRAM: animal-sciences-pre-veterinary-medicine — Animal Sciences: Pre-Veterinary Medicine Concentration (agriculture, curated)
+======================================================================
+[real-db] loaded program 91c22dfd-8a19-4a79-b500-513d0871fbc5 from postgresql://catalog:catalog@localhost:5433/catalog_ingestion (2 required + 9 elective requirement group(s), 226 courses in the maximal universe)
+[fixture] Animal Sciences: Pre-Veterinary Medicine Concentration [animal-sciences-pre-veterinary-medicine] — 96 courses, 11 requirement groups, 5 synthesized students
+[run] 5 model(s), tasks=['explain', 'plan_a', 'plan_b', 'qa'] -> /home/wylin/ai-academic-advisor/model_eval/results/results_animal-sciences-pre-veterinary-medicine/runs_baseline.jsonl (mode=a)
+
+=== qwen3.8-flash-next (experimental) ===
+[env] qwen3.8-flash-next: vram_delta=[21027] kv_cache={'source': 'unverified', 'kv_cache_tokens': None, 'max_concurrency': None} n_ctx=16384
+  [qwen3.8-flash-next] replicate 1/1 done (concurrency 3)
+
+=== qwen3.8-27b (server) ===
+[env] qwen3.8-27b: vram_delta=[23375] kv_cache={'source': 'unverified', 'kv_cache_tokens': None, 'max_concurrency': None} n_ctx=16384
+  [qwen3.8-27b] replicate 1/1 done (concurrency 3)
+
+=== qwen3.8-27b-thinking (server) ===
+[env] qwen3.8-27b-thinking: vram_delta=[23375] kv_cache={'source': 'unverified', 'kv_cache_tokens': None, 'max_concurrency': None} n_ctx=16384
+  [qwen3.8-27b-thinking] replicate 1/1 done (concurrency 3)
+
+=== gemma4-26b (server) ===
+[env] gemma4-26b: vram_delta=[23659] kv_cache={'source': 'unverified', 'kv_cache_tokens': None, 'max_concurrency': None} n_ctx=16384
+  [gemma4-26b] replicate 1/1 done (concurrency 3)
+
+=== gemma4-26b-thinking (server) ===
+[env] gemma4-26b-thinking: vram_delta=[23659] kv_cache={'source': 'unverified', 'kv_cache_tokens': None, 'max_concurrency': None} n_ctx=16384
+  [gemma4-26b-thinking] replicate 1/1 done (concurrency 3)
+
+======================================================================
+PROGRAM: agricultural-economics-applied-agricultural — Agricultural Economics: Applied Agricultural Economics Concentration (agriculture, curated)
+======================================================================
+[real-db] loaded program 1d3ef99f-03de-4a61-8278-fa3cee3ae2fe from postgresql://catalog:catalog@localhost:5433/catalog_ingestion (3 required + 8 elective requirement group(s), 175 courses in the maximal universe)
+[fixture] Agricultural Economics: Applied Agricultural Economics Concentration [agricultural-economics-applied-agricultural] — 96 courses, 11 requirement groups, 5 synthesized students
+[run] 5 model(s), tasks=['explain', 'plan_a', 'plan_b', 'qa'] -> /home/wylin/ai-academic-advisor/model_eval/results/results_agricultural-economics-applied-agricultural/runs_baseline.jsonl (mode=a)
+
+=== qwen3.8-flash-next (experimental) ===
+[env] qwen3.8-flash-next: vram_delta=[21027] kv_cache={'source': 'unverified', 'kv_cache_tokens': None, 'max_concurrency': None} n_ctx=16384
+  [qwen3.8-flash-next] replicate 1/1 done (concurrency 3)
+
+=== qwen3.8-27b (server) ===
+[env] qwen3.8-27b: vram_delta=[23375] kv_cache={'source': 'unverified', 'kv_cache_tokens': None, 'max_concurrency': None} n_ctx=16384
+  [qwen3.8-27b] replicate 1/1 done (concurrency 3)
+
+=== qwen3.8-27b-thinking (server) ===
+[env] qwen3.8-27b-thinking: vram_delta=[23375] kv_cache={'source': 'unverified', 'kv_cache_tokens': None, 'max_concurrency': None} n_ctx=16384
+  [qwen3.8-27b-thinking] replicate 1/1 done (concurrency 3)
+
+=== gemma4-26b (server) ===
+[env] gemma4-26b: vram_delta=[23659] kv_cache={'source': 'unverified', 'kv_cache_tokens': None, 'max_concurrency': None} n_ctx=16384
+  [gemma4-26b] replicate 1/1 done (concurrency 3)
+
+=== gemma4-26b-thinking (server) ===
+[env] gemma4-26b-thinking: vram_delta=[23659] kv_cache={'source': 'unverified', 'kv_cache_tokens': None, 'max_concurrency': None} n_ctx=16384
+  [gemma4-26b-thinking] replicate 1/1 done (concurrency 3)
+
+======================================================================
+PROGRAM: accounting — Accounting (business, curated)
+======================================================================
+  [FAILED] accounting: LookupError: requirement_options names 3 required course(s) not in `courses`: DSB 23500, FIN 25800, MKTG 22300
+
+======================================================================
+PROGRAM: finance — Finance (business, curated)
+======================================================================
+  [FAILED] finance: LookupError: requirement_options names 2 required course(s) not in `courses`: DSB 23500, FIN 25800
+
+======================================================================
+PROGRAM: elementary-education — Elementary Education (education, curated)
+======================================================================
+[real-db] loaded program 5ef340e5-4771-4725-bfdd-13f40bcdc90e from postgresql://catalog:catalog@localhost:5433/catalog_ingestion (4 required + 8 elective requirement group(s), 111 courses in the maximal universe)
+[fixture] Elementary Education [elementary-education] — 107 courses, 12 requirement groups, 5 synthesized students
+[run] 5 model(s), tasks=['explain', 'plan_a', 'plan_b', 'qa'] -> /home/wylin/ai-academic-advisor/model_eval/results/results_elementary-education/runs_baseline.jsonl (mode=a)
+
+=== qwen3.8-flash-next (experimental) ===
+[env] qwen3.8-flash-next: vram_delta=[21027] kv_cache={'source': 'unverified', 'kv_cache_tokens': None, 'max_concurrency': None} n_ctx=16384
+  [qwen3.8-flash-next] replicate 1/1 done (concurrency 3)
+
+=== qwen3.8-27b (server) ===
+[env] qwen3.8-27b: vram_delta=[23375] kv_cache={'source': 'unverified', 'kv_cache_tokens': None, 'max_concurrency': None} n_ctx=16384
+  [qwen3.8-27b] replicate 1/1 done (concurrency 3)
+
+=== qwen3.8-27b-thinking (server) ===
+[env] qwen3.8-27b-thinking: vram_delta=[23375] kv_cache={'source': 'unverified', 'kv_cache_tokens': None, 'max_concurrency': None} n_ctx=16384
+Traceback (most recent call last):
+  File "/home/wylin/ai-academic-advisor/model_eval/harness/runner.py", line 1491, in _run_pool
+    for future in as_completed(futures):
+                  ~~~~~~~~~~~~^^^^^^^^^
+  File "/usr/lib/python3.14/concurrent/futures/_base.py", line 237, in as_completed
+    waiter.event.wait(wait_timeout)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/usr/lib/python3.14/threading.py", line 670, in wait
+    signaled = self._cond.wait(timeout)
+  File "/usr/lib/python3.14/threading.py", line 369, in wait
+    waiter.acquire()
+    ~~~~~~~~~~~~~~^^
+  File "/home/wylin/ai-academic-advisor/model_eval/run.py", line 72, in _raise_keyboard_interrupt
+    raise KeyboardInterrupt
+KeyboardInterrupt
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/wylin/ai-academic-advisor/model_eval/run.py", line 1183, in <module>
+    main()
+    ~~~~^^
+  File "/home/wylin/ai-academic-advisor/model_eval/run.py", line 183, in main
+    _run(args)
+    ~~~~^^^^^^
+  File "/home/wylin/ai-academic-advisor/model_eval/run.py", line 308, in _run
+    _run_sweep(args)
+    ~~~~~~~~~~^^^^^^
+  File "/home/wylin/ai-academic-advisor/model_eval/run.py", line 414, in _run_sweep
+    _run_single(school_args,
+    ~~~~~~~~~~~^^^^^^^^^^^^^
+                results_dir_override=f"{root_dir}/results_{pick['slug']}")
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/wylin/ai-academic-advisor/model_eval/run.py", line 351, in _run_single
+    run_eval(
+    ~~~~~~~~^
+        ROOT,
+        ^^^^^
+    ...<3 lines>...
+        mitigate=args.mitigate,
+        ^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/home/wylin/ai-academic-advisor/model_eval/harness/runner.py", line 1732, in run_eval
+    run_model(ctx, model_cfg, out, tasks=task_set, mitigate=mitigate)
+    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/wylin/ai-academic-advisor/model_eval/harness/runner.py", line 1637, in run_model
+    _run_pool(list(ctx.questions), one_question,
+    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+              concurrency=concurrency, label="qa")
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/wylin/ai-academic-advisor/model_eval/harness/runner.py", line 1489, in _run_pool
+    with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix=label) as pool:
+         ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.14/concurrent/futures/_base.py", line 667, in __exit__
+    self.shutdown(wait=True)
+    ~~~~~~~~~~~~~^^^^^^^^^^^
+  File "/usr/lib/python3.14/concurrent/futures/thread.py", line 273, in shutdown
+    t.join()
+    ~~~~~~^^
+  File "/usr/lib/python3.14/threading.py", line 1133, in join
+    self._os_thread_handle.join(timeout)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^
+  File "/home/wylin/ai-academic-advisor/model_eval/run.py", line 72, in _raise_keyboard_interrupt
+    raise KeyboardInterrupt
+KeyboardInterrupt

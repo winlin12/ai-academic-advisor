@@ -58,7 +58,7 @@ services:
 
   # FastAPI web server (the app's backend). Reads the catalog_ingestion database over
   # the compose network, calls a local llama.cpp server (running on the HOST, outside this
-  # compose network — see the LLAMACPP_BASE_URL override below) for chat, and serves the
+  # compose network — see the VLLM_BASE_URL override below) for chat, and serves the
   # /academic/*, /catalog/*, /plan/*, /advisor/* endpoints. The Next.js client
   # (clients/web) calls this at http://localhost:8000.
   backend:
@@ -85,8 +85,11 @@ services:
       # "localhost" from backend/.env means the CONTAINER's own loopback here, which is
       # wrong. host.docker.internal (mapped below via extra_hosts so this also works on
       # Linux/podman, not just Docker Desktop) reaches the host's llama-server instead. This
-      # deliberately overrides whatever LLAMACPP_BASE_URL is set to in backend/.env.
-      LLAMACPP_BASE_URL: http://host.docker.internal:8080
+      # deliberately overrides whatever VLLM_BASE_URL is set to in backend/.env.
+      # RENAMED 2026-08-22 with the move to vLLM — as LLAMACPP_BASE_URL this override was
+      # silently ignored (Settings uses extra="ignore"), leaving the container dialling its
+      # OWN loopback for a model server that lives on the host.
+      VLLM_BASE_URL: http://host.docker.internal:8080
     extra_hosts:
       # Docker Desktop (Mac) already resolves this; Linux Docker 20.10+/podman need it
       # explicit. host-gateway = the special value that means "the host's real IP".

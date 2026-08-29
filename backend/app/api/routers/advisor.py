@@ -20,9 +20,9 @@ from app.models.schemas import (
     RevisePlanResponse,
 )
 from app.services.advisor_agent import ai_revise_plan, revise_plan
-from app.services.llamacpp_client import (
-    LlamaCppClient,
-    LlamaCppConnectionError,
+from app.services.vllm_client import (
+    VllmClient,
+    VllmConnectionError,
     ModelResponseError,
 )
 from app.services.rag.embeddings import EmbeddingError
@@ -30,7 +30,7 @@ from app.services.rag.pipeline import answer_question
 
 router = APIRouter(prefix="/advisor", tags=["advisor"])
 
-_LlmError = LlamaCppConnectionError | ModelResponseError
+_LlmError = VllmConnectionError | ModelResponseError
 
 
 def _llm_http_error(exc: _LlmError) -> HTTPException:
@@ -41,14 +41,14 @@ def _llm_http_error(exc: _LlmError) -> HTTPException:
     the output was unusable (empty, non-2xx, or still-invalid JSON after propose()'s internal
     retry). There is no upstream rate limit to map (no cloud vendor).
     """
-    if isinstance(exc, LlamaCppConnectionError):
+    if isinstance(exc, VllmConnectionError):
         return HTTPException(status_code=503, detail=str(exc))
     return HTTPException(status_code=502, detail=str(exc))
 
 
 @router.post("/explain-plan", response_model=ExplainPlanResponse)
 async def explain_plan(req: ExplainPlanRequest):
-    client = LlamaCppClient()
+    client = VllmClient()
 
     system_prompt = """
 You are an AI academic planning assistant.
@@ -73,7 +73,7 @@ Explain the plan clearly. Focus on prerequisites, semester sequencing, warnings,
         answer = await client.generate(
             system_prompt=system_prompt, user_prompt=user_prompt, seed=req.seed
         )
-    except (LlamaCppConnectionError, ModelResponseError) as exc:
+    except (VllmConnectionError, ModelResponseError) as exc:
         raise _llm_http_error(exc) from exc
 
     return ExplainPlanResponse(answer=answer)
@@ -95,7 +95,7 @@ async def revise_plan_route(req: RevisePlanRequest):
     since Mode B has no catalog to plan from without one. Error ladder: 503 (llama-server
     down), 502 (bad output).
     """
-    client = LlamaCppClient()
+    client = VllmClient()
 
     if req.planner == "ai" and req.profile.program_id:
         profile, program_catalog = resolve_for_ai_planning(req.profile)
@@ -104,13 +104,13 @@ async def revise_plan_route(req: RevisePlanRequest):
                 profile, program_catalog, req.feedback, req.current_plan,
                 client=client, seed=req.seed,
             )
-        except (LlamaCppConnectionError, ModelResponseError) as exc:
+        except (VllmConnectionError, ModelResponseError) as exc:
             raise _llm_http_error(exc) from exc
 
     profile, catalog = resolve_for_planning(req.profile)
     try:
         return await revise_plan(profile, catalog, req.feedback, client=client, seed=req.seed)
-    except (LlamaCppConnectionError, ModelResponseError) as exc:
+    except (VllmConnectionError, ModelResponseError) as exc:
         raise _llm_http_error(exc) from exc
 
 
@@ -128,7 +128,7 @@ async def advisor_ask(req: AdvisorAskRequest):
 
     Error ladder: 503 (database / llama-server down), 502 (embedding/output).
     """
-    client = LlamaCppClient()
+    client = VllmClient()
 
     try:
         result = await answer_question(req.question, client=client, seed=req.seed)
@@ -136,7 +136,7 @@ async def advisor_ask(req: AdvisorAskRequest):
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     except psycopg.Error as exc:
         raise academic_db_unavailable(exc) from exc
-    except (LlamaCppConnectionError, ModelResponseError) as exc:
+    except (VllmConnectionError, ModelResponseError) as exc:
         raise _llm_http_error(exc) from exc
 
     return AdvisorAskResponse(

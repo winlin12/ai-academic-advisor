@@ -66,7 +66,7 @@ from typing import Any
 
 from . import plan_scorers
 from .fixtures import Fixture, Scenario
-from .llamacpp_client import LlamaCppClient, LlamaCppError
+from .vllm_client import VllmClient, VllmError
 from .planner import Profile, generate_plan
 from .real_scoring import RealScore
 
@@ -209,7 +209,7 @@ def _tokens_per_s(eval_count: int | None, predicted_ms: float | None) -> float |
 
 def run_case(
     ctx,
-    client: LlamaCppClient,
+    client: VllmClient,
     model_cfg: dict,
     scenario: Scenario,
     *,
@@ -310,8 +310,8 @@ def run_convergence(
     against a differently-configured server is not comparable to anything, including itself.
     """
     from .runner import _env_record, _run_lock, _warmup, load_context
-    from .llamacpp_client import LlamaCppClient
-    from .server import gpu_memory_used_mb, start_server
+    from .vllm_client import VllmClient
+    from .server import backend_cfg, engine, gpu_memory_used_mb, start_server
 
     ctx = load_context(root)
     conv_cfg = dict(ctx.cfg.get("convergence") or {})
@@ -390,7 +390,7 @@ def run_convergence(
                         {"model": name, "stage": "error", "error": str(exc)}) + "\n")
                     out.flush()
                     continue
-                client = LlamaCppClient(handle.base_url,
+                client = VllmClient(handle.base_url,
                                         timeout_s=ctx.cfg["run"]["request_timeout_s"])
                 try:
                     _warmup(ctx, client, model_cfg)
@@ -399,7 +399,7 @@ def run_convergence(
                     out.write(json.dumps(env, default=str) + "\n")
                     out.flush()
                     print(f"[env] {name}: vram_delta={env['vram_delta_mb']} "
-                          f"offload={env['offload']} n_ctx={env['server_n_ctx']}")
+                          f"kv_cache={env['kv_cache']} n_ctx={env['server_n_ctx']}")
                     for variant in variant_list:
                         for scenario in cases:
                             rec = run_case(
@@ -412,12 +412,14 @@ def run_convergence(
                                   f"{rec['wall_clock_s']:.0f}s")
                 finally:
                     handle.stop(
-                        trim_log_lines=ctx.cfg["llamacpp"].get("keep_log_lines", 400))
-                    time.sleep(ctx.cfg["llamacpp"].get("cooldown_s", 5))
+                        trim_log_lines=backend_cfg(ctx.cfg).get("keep_log_lines", 400))
+                    time.sleep(backend_cfg(ctx.cfg).get("cooldown_s", 5))
     return out_path
 
 
 def _write_meta(ctx, conv_cfg, selected, variants, cases) -> None:
+    from .server import engine  # noqa: PLC0415
+
     meta = {
         "tag": "convergence",
         "mode": "D",
@@ -427,7 +429,9 @@ def _write_meta(ctx, conv_cfg, selected, variants, cases) -> None:
         "variants": list(variants),
         "scenarios": [s.id for s in cases],
         "run": ctx.cfg["run"],
-        "llamacpp": ctx.cfg["llamacpp"],
+        "engine": engine(ctx.cfg),
+        "vllm": ctx.cfg.get("vllm"),
+        "llamacpp": ctx.cfg.get("llamacpp"),
         "convergence": conv_cfg,
         "fixture": {
             "path": ctx.fixture.path.name,

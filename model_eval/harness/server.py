@@ -1,67 +1,82 @@
-"""llama-server process lifecycle.
+"""vLLM OpenAI-server process lifecycle.
 
-WHY THE HARNESS OWNS THE PROCESS. Under Ollama, one long-lived daemon served every model and
-``num_ctx`` travelled with each request. llama.cpp inverts that: one process serves exactly
-one model, and context size, KV-cache type, GPU-layer count and reasoning mode are all fixed
-at launch. If the harness merely *connected* to whatever server happened to be running, the
-central promise — "every model sees identical settings" — would depend on whoever typed the
-last command line. So the harness starts and stops the server itself, from ``config.yaml``,
-and records the resulting command line in ``meta_*.json``.
+WHY THE HARNESS OWNS THE PROCESS. Unchanged from the llama.cpp era, and for the same reason:
+one process serves exactly one model, and the settings that decide what the comparison means
+— context length, KV dtype, how much of the card the engine may claim, how many sequences may
+run at once — are all fixed at launch. If the harness merely *connected* to whatever server
+happened to be running, the central promise ("every model saw identical settings") would
+depend on whoever typed the last command line. So the harness starts and stops the server
+itself, from ``config.yaml``, and records the resulting command line in ``meta_*.json``.
 
-TWO SUPPORTED TOPOLOGIES, picked from whether ``server_exe`` ends in ``.exe``:
+WHAT CHANGED WHEN vLLM CAME IN, 2026-08-22. The old backend was chosen when this box
+had two mismatched, power-limited cards (RTX 3060 12 GB + RTX 2060 SUPER 8 GB) and the whole
+game was fitting a model across them: ``--n-gpu-layers``, ``--n-cpu-moe``, ``--tensor-split``,
+and a log parser that counted per-layer device assignments because a model silently running
+half on the CPU posts terrible latency and identical quality. A single RTX 3090 Ti 24 GB
+replaced both, and every one of those knobs became a no-op — the model either fits or it does
+not. What is left over is bandwidth and headroom, which is exactly what the old stack could
+not spend:
 
-1. NATIVE LINUX — a binary built from ./llama.cpp, running in this WSL box. Loopback works,
-   paths are passed through unchanged, SIGTERM stops it. Nothing special happens.
+  * PAGED KV. llama.cpp pre-allocated ``--ctx-size`` and DIVIDED it between ``--parallel``
+    slots, so simulating four students meant giving each of them a quarter of the window.
+    MEASURED on this workload (see config.yaml's `parallel`), four-way batching came out ~18%
+    slower in aggregate than serving one student at a time. vLLM allocates KV by the block as
+    sequences actually grow, so ``--max-model-len`` is what EVERY concurrent request gets and
+    raising ``--max-num-seqs`` costs no context at all. For a thing that is a web server at
+    the end of the day, that is the difference that matters.
+  * PREFIX CACHING. Every request this harness sends opens with the same system prompt and,
+    within a program, the same rendered requirement database. vLLM reuses those blocks across
+    requests instead of re-prefilling them per call.
 
-2. WINDOWS BINARY OVER WSL INTEROP — the b10083 CUDA build on D:. This box has no CUDA
-   toolkit in WSL, so this is the topology that actually runs today. Three things differ, and
-   all three are silent failures if you get them wrong:
+WHAT WAS GIVEN UP, recorded so nobody rediscovers it as a surprise. The weights are now
+W4A16 ``compressed-tensors`` rather than GGUF Q4_K_M, which means NO QUALITY NUMBER RECORDED
+HERE POOLS WITH ANYTHING IN ``results_full_3060/``. That is a fresh series, not a continuation
+— see README. Speculative decoding is gone with the llama.cpp draft-model plumbing; vLLM has
+its own (``--speculative-config``) and it is deliberately not wired up, because the draft that
+paid on the old hardware paid by amortizing weight reads that no longer dominate.
 
-     - PATHS. The .exe cannot open ``/mnt/d/...``; every path on the command line is
-       translated to ``D:\\...`` via ``wslpath -w``.
-     - NETWORKING. WSL2 is NAT'd here (no ``networkingMode=mirrored`` in .wslconfig), so the
-       server is NOT on loopback from this side. It binds 0.0.0.0 on the Windows side and the
-       harness connects to the default-route gateway. Verified 2026-07-25: 127.0.0.1 refuses,
-       172.30.192.1 answers, and Windows Firewall does not block it.
-     - TERMINATION. SIGTERM kills only the Linux-side interop proxy — MEASURED, the .exe
-       survived it still holding 4.7 GB of VRAM and the port. Stopping therefore goes through
-       ``taskkill.exe``, or every model after the first would launch into an occupied port and
-       a polluted VRAM baseline.
+BOTH MODELS ARE MULTIMODAL CHECKPOINTS used text-only. The vision tower is in the weights
+whether or not it is used (~1.5 GB of the Qwen checkpoint's 19.5 GB, and no int4 quant on the
+Hub strips it), but the per-request multimodal PREPROCESSOR memory is avoidable, and
+``--limit-mm-per-prompt`` is what avoids it. See ``build_argv``.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
-import struct
 import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .llamacpp_client import LlamaCppClient
+from .vllm_client import VllmClient
 
-# Offload truth from llama-server's own stderr. The Ollama harness had to shell out to
-# journalctl and parse a summary line; here it is the server's own output, and this build
-# (b10083) is more precise than the old summary: it names the device for EVERY layer, so
-# "how much is on the card" is counted rather than inferred.
+# KV-CACHE CAPACITY FROM THE ENGINE'S OWN STARTUP LOG. This is the direct replacement for the
+# llama.cpp-era offload check, and it answers the question that actually decides whether a run
+# means anything on this stack: how many tokens of KV did the engine end up with after the
+# weights were loaded?
 #
-#   load_tensors: layer  27 assigned to device CUDA0, is_swa = 0
+# Under llama.cpp the failure to catch was "half the layers are secretly on the CPU". Here the
+# model is always fully resident or the server does not start at all — but a checkpoint that
+# eats more of the card than expected silently shrinks the KV pool instead, and a shrunken pool
+# does not error. It caps concurrency, which is the one thing this whole migration was for. A
+# run whose KV pool collapsed to one sequence's worth would post perfectly good quality numbers
+# and a completely misleading throughput story.
 #
-# Those lines are debug-level and need `-lv 5` (see log_verbosity in config.yaml) — at the
-# default verbosity llama-server prints no offload information at all, which is precisely how
-# a partially-offloaded model would otherwise sneak into the results unnoticed.
-_LAYER_RE = re.compile(r"layer\s+(\d+) assigned to device (\w+)")
-# Older/other builds print only a summary; kept so the parser doesn't depend on one build.
-_OFFLOAD_RE = re.compile(r"offloaded\s+(\d+)\s*/\s*(\d+)\s+layers to GPU")
-_GPU_DEVICE_PREFIXES = ("CUDA", "ROCM", "HIP", "METAL", "VULKAN", "SYCL")
-_NVIDIA_SMI = "/usr/lib/wsl/lib/nvidia-smi"  # WSL's CUDA shim; falls back to PATH
+#   GPU KV cache size: 87,024 tokens
+#   Maximum concurrency for 16,384 tokens per request: 5.31x
+#
+_KV_TOKENS_RE = re.compile(r"GPU KV cache size:\s*([\d,]+)\s*tokens", re.I)
+_MAX_CONCURRENCY_RE = re.compile(
+    r"Maximum concurrency for\s*([\d,]+)\s*tokens per request:\s*([\d.]+)x", re.I)
 
 
 def gpu_memory_used_mb() -> list[int] | None:
-    exe = _NVIDIA_SMI if Path(_NVIDIA_SMI).exists() else shutil.which("nvidia-smi")
+    exe = shutil.which("nvidia-smi")
     if not exe:
         return None
     try:
@@ -74,309 +89,38 @@ def gpu_memory_used_mb() -> list[int] | None:
         return None
 
 
-# Enough of the GGUF header to answer one question: how many blocks (transformer layers) does
-# this model have? Needed because llama.cpp counts MoE offload from the BOTTOM of the stack
-# (see resolve_n_cpu_moe) and the harness wants to express it from the top. Hand-rolled rather
-# than importing llama.cpp/gguf-py: that package is a submodule with its own numpy dependency,
-# and this reads one integer out of the first few KB of the file.
-#
-# Layout: "GGUF" | u32 version | u64 tensor_count | u64 kv_count | kv_count x (key, type, value)
-# where a key is u64 length + utf-8 bytes, and a value is typed by the enum below.
-_GGUF_SCALAR_FMT = {
-    0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i",
-    6: "<f", 7: "<?", 10: "<Q", 11: "<q", 12: "<d",
-}
-_GGUF_STRING, _GGUF_ARRAY = 8, 9
+def gpu_total_mb() -> int | None:
+    """Total VRAM on the first card, for sizing checks that run before any server starts.
 
-
-def _gguf_scan(path: str | Path, wanted: tuple[str, ...]) -> dict[str, int]:
-    """Read the gguf header once and return ``{suffix: value}`` for the requested key suffixes.
-
-    SCALARS yield their value; ARRAYS yield their element COUNT, which is the useful number for
-    the one array anybody asks about here (``tokenizer.ggml.tokens``'s length *is* the
-    vocabulary size — gguf stores no separate vocab_size key). Keys are matched by suffix
-    because most are architecture-prefixed (``gemma4.block_count``, ``qwen3moe.block_count``).
-
-    Scanning stops as soon as every wanted key has been found, so the common case still reads
-    only the first few KB. A malformed or truncated header yields whatever was found before the
-    error rather than raising — the caller decides whether it actually needed the number.
+    `run.py check` uses it to answer "will these weights leave room for a KV cache?" without
+    spending the several minutes a real launch costs to find out.
     """
-    found: dict[str, int] = {}
-    try:
-        with open(path, "rb") as f:
-            if f.read(4) != b"GGUF":
-                return found
-            _version, _n_tensors, n_kv = struct.unpack("<IQQ", f.read(20))
-
-            def read(fmt: str) -> Any:
-                return struct.unpack(fmt, f.read(struct.calcsize(fmt)))[0]
-
-            def skip_value(vtype: int) -> None:
-                if vtype in _GGUF_SCALAR_FMT:
-                    f.seek(struct.calcsize(_GGUF_SCALAR_FMT[vtype]), 1)
-                elif vtype == _GGUF_STRING:
-                    f.seek(read("<Q"), 1)
-                elif vtype == _GGUF_ARRAY:
-                    elem_type, count = read("<I"), read("<Q")
-                    if elem_type == _GGUF_STRING:      # tokenizer vocab lives here — 150k+
-                        for _ in range(count):         # entries, each length-prefixed
-                            f.seek(read("<Q"), 1)
-                    elif elem_type in _GGUF_SCALAR_FMT:
-                        f.seek(struct.calcsize(_GGUF_SCALAR_FMT[elem_type]) * count, 1)
-                    else:
-                        raise ValueError(f"unsupported gguf array element type {elem_type}")
-                else:
-                    raise ValueError(f"unsupported gguf value type {vtype}")
-
-            for _ in range(n_kv):
-                key = f.read(read("<Q")).decode("utf-8", "replace")
-                vtype = read("<I")
-                match = next((w for w in wanted if key.endswith(w)), None)
-                if match is None or match in found:
-                    skip_value(vtype)
-                    continue
-                if vtype in _GGUF_SCALAR_FMT:
-                    found[match] = int(read(_GGUF_SCALAR_FMT[vtype]))
-                elif vtype == _GGUF_ARRAY:
-                    # Peek the element count, then rewind and skip the array properly — the
-                    # count is what an array-valued key means to every caller here.
-                    where = f.tell()
-                    _elem_type, count = read("<I"), read("<Q")
-                    found[match] = int(count)
-                    f.seek(where)
-                    skip_value(vtype)
-                else:
-                    skip_value(vtype)
-                if len(found) == len(wanted):
-                    break
-    except (OSError, struct.error, ValueError):
-        return found
-    return found
-
-
-def gguf_block_count(path: str | Path) -> int | None:
-    """The model's layer count from its own gguf metadata, or None if unreadable."""
-    return _gguf_scan(path, (".block_count",)).get(".block_count")
-
-
-def gguf_vocab_size(path: str | Path) -> int | None:
-    """How many tokens this gguf's tokenizer has, or None if unreadable.
-
-    THE ONE NUMBER THAT DECIDES whether a draft model can serve a target one (see
-    `resolve_draft`): llama.cpp refuses to start a speculative pair whose vocabularies differ
-    by more than a hundred tokens, and it refuses at *load* time, minutes in — which without
-    this check reads as "that model is broken" rather than "that draft doesn't belong to it".
-    """
-    return _gguf_scan(path, ("tokenizer.ggml.tokens",)).get("tokenizer.ggml.tokens")
-
-
-def resolve_n_cpu_moe(
-    run: dict[str, Any], model_cfg: dict[str, Any], gguf_path: str | Path
-) -> int | None:
-    """Turn whichever MoE-offload knob was configured into the ``--n-cpu-moe N`` llama.cpp wants.
-
-    llama.cpp has exactly one MoE-offload count and it points the wrong way for comparing
-    models: ``--n-cpu-moe N`` keeps the experts of the FIRST N layers in system RAM, so N is
-    "how much is *not* on the card" and its meaning changes with the model's depth. 35 is a
-    saturating no-op on a 30-block model and leaves half the experts resident on a 64-block
-    one — the same config line describing two different machines.
-
-    ``n_gpu_moe`` states the other end: keep the experts of N layers on the GPU. That is the
-    quantity VRAM is actually spent on, so it is the one that transfers between models, and
-    the harness resolves it per model as ``block_count - n_gpu_moe``.
-
-    Per-model entries override the run-level default; the two knobs are mutually exclusive
-    within a level, since they would otherwise silently disagree about the same split.
-    """
-    for source, where in ((model_cfg, f"model {model_cfg.get('name', '?')}"), (run, "run")):
-        n_gpu_moe, n_cpu_moe = source.get("n_gpu_moe"), source.get("n_cpu_moe")
-        if n_gpu_moe is not None and n_cpu_moe is not None:
-            raise ValueError(
-                f"{where} sets both n_gpu_moe ({n_gpu_moe}) and n_cpu_moe ({n_cpu_moe}); "
-                "they describe the same split from opposite ends — set one."
-            )
-        if n_cpu_moe is not None:
-            return int(n_cpu_moe)
-        if n_gpu_moe is not None:
-            blocks = gguf_block_count(gguf_path)
-            if blocks is None:
-                raise ValueError(
-                    f"{where} sets n_gpu_moe={n_gpu_moe}, which needs the model's layer count, "
-                    f"but no block_count could be read from {gguf_path}. Use n_cpu_moe instead."
-                )
-            # Clamped, not an error: n_gpu_moe >= depth is the legitimate way to say "all
-            # experts on the card", and 0 is --cpu-moe.
-            return max(0, blocks - int(n_gpu_moe))
-    return None
-
-
-# --- speculative decoding -----------------------------------------------------------------
-#
-# A small draft model proposes `spec.n_max` tokens, the big one verifies them in ONE batched
-# forward pass, and every token the big model would have produced anyway is kept. Generation
-# stays memory-bandwidth-bound on this box, so verifying four tokens costs barely more than
-# decoding one — the speedup is real, and it is entirely a launch-flag concern (see
-# `build_argv`), which is why it lives here and not in the client.
-#
-# OPT-IN PER MODEL, NOT A RUN-LEVEL DEFAULT APPLIED TO EVERYTHING. The draft has to share the
-# target's vocabulary; llama.cpp checks that at load time and aborts the server if it doesn't,
-# so a draft applied blindly to every entry in config.yaml would not degrade gracefully — it
-# would turn every non-Qwen model into a `[SKIP] ... exited during startup`, minutes into the
-# load. Hence `speculative.draft_gguf` (the shared default) plus a per-model `draft:` opt-in.
-#
-# ⚠ A SPECULATIVE RUN IS NOT TOKEN-IDENTICAL TO A NON-SPECULATIVE ONE. llama.cpp accepts a
-# drafted token when the target's own sampler agrees with it, and `--spec-draft-p-min` lets it
-# stop drafting early; at temperature > 0 that is a *near*, not exact, reproduction of the
-# unspeculated sampling path. Same model, same prompt, same seed can therefore land on a
-# different plan. That is why the setting is recorded in `meta_{tag}.json` and in every `env`
-# record: quality numbers from a speculative sweep and a non-speculative one describe two
-# different sampling paths and must not be pooled. `run.py run --no-spec` turns it off for a
-# run that needs to be comparable to the pre-2026-08-11 results.
-
-
-def speculative_enabled(cfg: dict[str, Any]) -> bool:
-    """Is speculative decoding on for this process?
-
-    `MODEL_EVAL_SPECULATIVE` (0/1) wins over `config.yaml`'s `speculative.enabled` — the same
-    env-override pattern `run.py` already uses for MODEL_EVAL_PLAN_FIXTURE and friends, chosen
-    for the same reason: it reaches `run_eval`, `run_convergence` and `run_thinking_experiment`
-    alike without threading a new parameter through three call chains and their signatures.
-    """
-    override = os.environ.get("MODEL_EVAL_SPECULATIVE")
-    if override is not None:
-        return override.strip().lower() in ("1", "true", "yes", "on")
-    return bool((cfg.get("speculative") or {}).get("enabled", False))
-
-
-def resolve_draft(cfg: dict[str, Any], model_cfg: dict[str, Any]) -> Path | None:
-    """The draft gguf this model should be served with, or None for plain decoding.
-
-    A model's own `draft:` entry decides: `true` takes `speculative.draft_gguf`, a string names
-    its own gguf (relative to `models_root`, like every other gguf path here), and absent or
-    `false` means this model does not speculate. Returns a path that may not exist — `check`
-    reports a missing draft as a problem; failing here would take down a whole sweep over one
-    misconfigured entry.
-    """
-    if not speculative_enabled(cfg):
+    exe = shutil.which("nvidia-smi")
+    if not exe:
         return None
-    draft = model_cfg.get("draft")
-    if not draft:
-        return None
-    spec = cfg.get("speculative") or {}
-    rel = spec.get("draft_gguf") if draft is True else str(draft)
-    if not rel:
-        raise ValueError(
-            f"model {model_cfg.get('name', '?')} sets `draft: true` but config.yaml's "
-            f"`speculative.draft_gguf` is unset — there is no default draft model to use."
-        )
-    return Path(cfg["llamacpp"]["models_root"]) / rel
-
-
-def draft_argv(cfg: dict[str, Any], model_cfg: dict[str, Any], *, windows: bool) -> list[str]:
-    """The `-md ...` half of the command line, or [] when this model doesn't speculate.
-
-    `--spec-type draft-simple` is passed EXPLICITLY. This build defaults `--spec-type` to
-    `none`, and the failure mode of leaving it out is the expensive kind: the server starts,
-    loads both models, serves every request correctly — and never drafts a single token, so the
-    only symptom is that the speedup you added a whole model to get is missing.
-    """
-    draft_local = resolve_draft(cfg, model_cfg)
-    if draft_local is None:
-        return []
-    spec = cfg.get("speculative") or {}
-    argv = [
-        "--spec-type", "draft-simple",
-        "-md", to_server_path(draft_local, windows=windows),
-        # How many tokens to propose per verification pass. Too few wastes the batched
-        # forward pass; too many spends draft time on tokens the target will reject anyway.
-        "--spec-draft-n-max", str(spec.get("n_max", 4)),
-        "--spec-draft-n-min", str(spec.get("n_min", 0)),
-        # Stop drafting once the draft model's own confidence falls below this — a cheap way
-        # to not pay for a speculation that is about to be rejected.
-        "--spec-draft-p-min", str(spec.get("p_min", 0.75)),
-        # The draft's KV cache is quantized like the target's (config's own defaults), because
-        # its whole job is to be small: an f16 cache for a 0.8B draft would cost more VRAM
-        # than the weights it drafts with.
-        "--spec-draft-type-k", str(spec.get("cache_type_k", cfg["run"]["cache_type_k"])),
-        "--spec-draft-type-v", str(spec.get("cache_type_v", cfg["run"]["cache_type_v"])),
-    ]
-    # KEEP THE DRAFT OFF THE SPLIT unless told otherwise. The target models here are hand-sized
-    # against a two-card `--tensor-split`; letting the draft land wherever the fit pass wants
-    # would silently re-balance memory the target's split was tuned around. `device_draft`
-    # pins it to one device (`CUDA0`), `n_gpu_layers_draft` decides how much of it is resident.
-    ngl_draft = spec.get("n_gpu_layers_draft")
-    if ngl_draft is not None:
-        argv += ["-ngld", str(ngl_draft)]
-    device_draft = spec.get("device_draft")
-    if device_draft:
-        argv += ["--spec-draft-device", str(device_draft)]
-    argv += [str(a) for a in spec.get("extra_args", [])]
-    return argv
-
-
-def is_windows_exe(server_exe: str | Path | None) -> bool:
-    """Which of the two topologies in the module docstring we are in."""
-    return bool(server_exe) and str(server_exe).lower().endswith(".exe")
-
-
-def to_server_path(path: str | Path, *, windows: bool) -> str:
-    """Render a path the way the *server process* will have to open it.
-
-    Under interop the .exe is a Windows program handed a Linux command line: ``/mnt/d/...``
-    is not a path it can resolve. ``wslpath -w`` is the authority on the translation rather
-    than a hand-rolled /mnt/<drive> rewrite, so unusual mounts keep working.
-    """
-    if not windows:
-        return str(path)
-    try:
-        return subprocess.run(
-            ["wslpath", "-w", str(path)],
-            capture_output=True, text=True, timeout=15, check=True,
-        ).stdout.strip()
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise RuntimeError(f"could not translate {path} to a Windows path: {exc}") from exc
-
-
-def _default_gateway() -> str | None:
-    """The Windows host's address on the NAT network, from the default route."""
     try:
         out = subprocess.run(
-            ["ip", "route"], capture_output=True, text=True, timeout=10, check=True,
+            [exe, "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=15, check=True,
         ).stdout
-    except (OSError, subprocess.SubprocessError):
+        return int(out.split()[0])
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
         return None
-    for line in out.splitlines():
-        parts = line.split()
-        if len(parts) >= 3 and parts[0] == "default" and parts[1] == "via":
-            return parts[2]
-    return None
 
 
-def resolve_host(configured: str, server_exe: str | Path | None = None) -> str:
-    """The address the *harness* connects to (not necessarily the one the server binds).
+def resolve_host(configured: str, _server_exe: str | Path | None = None) -> str:
+    """The address the harness connects to. ``auto`` -> loopback.
 
-    Native Linux: ``auto`` -> loopback, anything else literal.
+    ONE TOPOLOGY NOW. The llama.cpp era carried a second one — a Windows CUDA build driven
+    over WSL interop, which needed ``wslpath`` translation on every path, a bind on 0.0.0.0
+    because WSL2's NAT put the server off this box's loopback, and ``taskkill.exe`` to stop it
+    because SIGTERM reached only the Linux-side proxy. That machinery is deleted: the box is
+    native Linux with a native CUDA toolchain, and the second topology existed solely because
+    there was no CUDA build available in it.
 
-    Windows interop: ``auto`` -> the NAT gateway, because under NAT the Windows host is not on
-    this box's loopback and dialling 127.0.0.1 fails as a connection refusal several minutes
-    into a model load — which reads like a broken model rather than a broken address.
-
-    AN EXPLICIT VALUE IS ALWAYS HONOURED, including 127.0.0.1. That is not an oversight:
-    setup/allow_wsl_llamacpp.ps1 documents `networkingMode=mirrored` + `host: 127.0.0.1` as the
-    supported firewall-free alternative, and under mirrored networking loopback is exactly
-    right. Overriding it here would break that configuration for the sake of catching a typo.
+    An explicit value is still honoured, for pointing the harness at a server on another host.
     """
-    if configured and configured != "auto":
-        return configured
-    if is_windows_exe(server_exe):
-        gateway = _default_gateway()
-        if not gateway:
-            raise RuntimeError(
-                "server_exe is a Windows binary but no default route was found, so the "
-                "address of the Windows host is unknown. Set llamacpp.host explicitly."
-            )
-        return gateway
-    return "127.0.0.1"
+    return configured if configured and configured != "auto" else "127.0.0.1"
 
 
 @dataclass
@@ -386,8 +130,6 @@ class ServerHandle:
     argv: list[str]
     base_url: str
     started_at: float = field(default_factory=time.time)
-    # True when `process` is only the interop proxy for a Windows .exe; changes how stop() works.
-    windows: bool = False
 
     def log_text(self) -> str:
         try:
@@ -395,49 +137,48 @@ class ServerHandle:
         except OSError:
             return ""
 
-    def offload(self) -> dict[str, Any]:
+    def kv_cache(self) -> dict[str, Any]:
+        """What the engine actually had left for KV after loading the weights.
+
+        Recorded per model into ``meta_*.json`` the way ``offload()`` used to be. ``blocks``
+        is reported in TOKENS rather than vLLM's internal 16-token pages, because tokens is
+        the unit every other number in this harness is already in (``num_ctx``,
+        ``max_plan_tokens``, ``prompt_eval_count``).
+
+        ``max_concurrency`` is the engine's own arithmetic — KV tokens divided by
+        ``--max-model-len`` — and it is the honest ceiling on how many students this model can
+        serve at once at full context. It is a FLOOR on real concurrency, not a cap: it assumes
+        every sequence runs to the full window, and with prefix caching on, shared prompt
+        blocks are counted once rather than per sequence.
+
+        Not knowing is reported as not knowing, exactly as before — the report needs to be
+        able to say which of the two it is looking at.
+        """
         log = self.log_text()
-
-        # Preferred: count the per-layer device assignments. Last assignment wins, since a
-        # model can be re-laid-out during load.
-        assignments: dict[int, str] = {}
-        for index, device in _LAYER_RE.findall(log):
-            assignments[int(index)] = device.upper()
-        if assignments:
-            total = len(assignments)
-            on_gpu = sum(
-                1 for d in assignments.values()
-                if d.startswith(_GPU_DEVICE_PREFIXES)
-            )
-            cpu_layers = sorted(i for i, d in assignments.items()
-                                if not d.startswith(_GPU_DEVICE_PREFIXES))
-            return {
-                "source": "llama_server_layer_assignment",
-                "layers": f"{on_gpu}/{total}",
-                "fully_offloaded": on_gpu == total,
-                "cpu_layers": cpu_layers[:20],
-            }
-
-        matches = _OFFLOAD_RE.findall(log)
-        if matches:
-            on_gpu, total = map(int, matches[-1])
-            return {
-                "source": "llama_server_summary_line",
-                "layers": f"{on_gpu}/{total}",
-                "fully_offloaded": on_gpu == total,
-            }
-
-        # Not knowing is reported as not knowing. A model silently running half on the CPU
-        # would post terrible latency and identical quality, and the report needs to be able
-        # to say which of those it is looking at.
-        return {"source": "unverified", "layers": None, "fully_offloaded": None}
+        tokens = _KV_TOKENS_RE.findall(log)
+        concurrency = _MAX_CONCURRENCY_RE.findall(log)
+        if not tokens:
+            return {"source": "unverified", "kv_cache_tokens": None, "max_concurrency": None}
+        return {
+            "source": "vllm_startup_log",
+            "kv_cache_tokens": int(tokens[-1].replace(",", "")),
+            "max_concurrency": float(concurrency[-1][1]) if concurrency else None,
+            "per_request_tokens": (
+                int(concurrency[-1][0].replace(",", "")) if concurrency else None),
+        }
 
     def stop(self, timeout: float = 30.0, *, trim_log_lines: int | None = None) -> None:
-        # Under interop, terminate() reaches only the Linux-side proxy: MEASURED 2026-07-25,
-        # the .exe outlived it holding 4.7 GB of VRAM and port 8099. Kill the Windows process
-        # FIRST, so the proxy's own exit is the confirmation rather than a hopeful guess.
-        if self.windows:
-            self._taskkill()
+        """SIGTERM, then SIGKILL, then wait for the VRAM to actually come back.
+
+        THE WAIT IS NOT PARANOIA. vLLM's API server is a parent to engine-core worker
+        processes, and the CUDA context those workers hold is released when they exit, not
+        when the parent does. Starting the next model while the previous one's workers are
+        still tearing down means its `--gpu-memory-utilization` is measured against a card that
+        is still several GB occupied, and the engine sizes a too-small KV pool from it — which
+        does not error, it just quietly caps concurrency for that model only. That is precisely
+        the cross-model contamination this harness exists to prevent, so the handle does not
+        report itself stopped until the card is actually back to baseline.
+        """
         if self.process.poll() is None:
             self.process.terminate()
             try:
@@ -445,36 +186,33 @@ class ServerHandle:
             except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait(timeout=timeout)
+        self._await_vram_release()
         if trim_log_lines:
             self.trim_log(trim_log_lines)
 
     @staticmethod
-    def _taskkill() -> None:
-        """Kill llama-server.exe by image name.
+    def _await_vram_release(settle_mb: int = 1024, timeout: float = 120.0) -> None:
+        """Block until the card reports less than `settle_mb` in use, or `timeout` passes.
 
-        BY IMAGE NAME, NOT PID, and that is deliberate: llama-server does not report its
-        Windows PID anywhere the harness can read, and a tasklist diff would race. The harness
-        already claims exclusive ownership of the server lifecycle and of port 8099, so "every
-        llama-server.exe on this box" and "the one I started" are the same set — but note that
-        this WILL take down a llama-server.exe you started by hand in another window.
+        A timeout is NOT raised. If something else on the box legitimately holds VRAM, failing
+        the sweep here would be worse than proceeding — the KV-cache size that results is
+        recorded in `meta_*.json` either way, so a squeezed run is visible in the report
+        rather than silent.
         """
-        exe = "/mnt/c/Windows/System32/taskkill.exe"
-        if not Path(exe).exists():
-            exe = shutil.which("taskkill.exe") or "taskkill.exe"
-        try:
-            subprocess.run([exe, "/IM", "llama-server.exe", "/F"],
-                           capture_output=True, timeout=60)
-        except (OSError, subprocess.SubprocessError):
-            pass  # nothing left to do; startup of the next model reports the port if it stuck
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            used = gpu_memory_used_mb()
+            if used is None or max(used) < settle_mb:
+                return
+            time.sleep(2)
 
     def trim_log(self, keep_lines: int) -> None:
         """Keep the startup header, drop the per-request firehose.
 
-        `-lv 5` is mandatory to get per-layer offload out of this build, but it also logs
-        every slot operation of every request — ~90 MB per model, which is over a gigabyte for
-        a full sweep and buys nothing once offload has been recorded. Everything diagnostic
-        (device selection, layer assignment, context size, chat template) is in the first few
-        hundred lines. Trim only after the process has exited, so nothing is appending.
+        Everything diagnostic — the resolved engine args, the quantization method actually
+        chosen, the KV-cache size, the chat template — is in the first few hundred lines. The
+        rest is one line per request. Trim only after the process has exited, so nothing is
+        appending.
         """
         try:
             lines = self.log_path.read_text(errors="replace").splitlines()
@@ -484,19 +222,45 @@ class ServerHandle:
             self.log_path.write_text(
                 "\n".join(lines[:keep_lines])
                 + f"\n\n[harness] trimmed {dropped} lines of per-request logging; "
-                  f"the startup header above is what carries the offload/context evidence.\n"
+                  f"the startup header above is what carries the KV-cache/context evidence.\n"
             )
         except OSError:
             pass
 
 
 def slot_context(run: dict[str, Any]) -> int:
-    """The context ONE request actually gets: ``num_ctx // parallel``.
+    """The context ONE request actually gets.
 
-    The number that matters for "does my prompt plus my token budget fit", and the one that is
-    easy to get wrong, because config names `num_ctx` and llama.cpp reports the slot's share.
+    UNDER vLLM THIS IS JUST ``num_ctx``, AND THE DIVISION IS GONE. It used to return
+    ``num_ctx // parallel``, because llama.cpp cut a fixed pre-allocated window into
+    ``--parallel`` equal slots and a request only ever saw its own share (MEASURED: ``-c 16384
+    --parallel 2`` reported ``n_ctx 8192`` per slot). Every caller that asks "does my prompt
+    plus my token budget fit" was therefore asking about a number that SHRANK as concurrency
+    rose, which is why raising ``parallel`` used to be a way to silently truncate every plan
+    request at once.
+
+    PagedAttention removes the tradeoff rather than moving it: KV is allocated per block as a
+    sequence grows, so concurrency is bounded by the size of the KV pool (see
+    ``ServerHandle.kv_cache``) and not by the per-request window. The function is KEPT, rather
+    than inlined at its call sites, because "the context one request gets" is still a real
+    concept that the runner and the report both need to name — it simply has a different
+    answer now.
+
+    UNDER llama.cpp THE DIVISION IS BACK, because the engine is back. `_build_argv_llamacpp`
+    asks for `-c num_ctx * parallel` and llama.cpp cuts that single pre-allocated pool between
+    the `--parallel` slots, so one request still sees only `num_ctx`. Returning the divided
+    figure is what lets `check_slot_context` fail a run BEFORE it truncates every plan request
+    — the failure mode this function was written for in the first place.
+
+    SO THE ANSWER IS `num_ctx` UNDER BOTH ENGINES, but for opposite reasons, and the
+    distinction matters when a launch fails. vLLM pages KV, so the window is free of
+    concurrency. llama.cpp does not, so `_build_argv_llamacpp` BUYS the same guarantee by
+    asking for `num_ctx * parallel` up front — and that allocation is what can refuse to fit.
+    A llama.cpp run therefore fails at LOAD (`CUDA error: out of memory`) rather than at
+    request time with a truncated window, which is the trade this harness wants: the old
+    `num_ctx // parallel` behaviour silently shrank every request instead.
     """
-    return int(run["num_ctx"]) // max(1, int(run.get("parallel", 1)))
+    return int(run["num_ctx"])
 
 
 # Chars per token for THIS harness's prompts, measured rather than assumed. The usual "4" is an
@@ -506,6 +270,10 @@ def slot_context(run: dict[str, Any]) -> int:
 # prompt_eval_count 11,458, i.e. 2.94 chars/token, against the 8,400 that /4 predicted. A 36%
 # underestimate is not a rounding error here: it is the difference between `check` passing and a
 # run silently truncating every plan request against the context.
+#
+# CARRIED OVER UNCHANGED, and it is worth saying why that is legitimate: the figure is a
+# property of the PROMPTS and the tokenizer family, not of the inference engine. Both models
+# kept their tokenizers across the GGUF -> compressed-tensors requantization.
 CHARS_PER_TOKEN = 2.9
 
 
@@ -514,12 +282,11 @@ def approx_tokens(text: str) -> int:
 
 
 def check_slot_context(run: dict[str, Any], longest_prompt_tokens: int) -> str | None:
-    """Complain if a slot cannot hold the longest prompt plus the biggest token budget.
+    """Complain if the context cannot hold the longest prompt plus the biggest token budget.
 
-    Returns a message, or None when it fits. This is the failure `--parallel` invites: at
-    num_ctx 16384 two slots is 8192 and still fits a ~2.9k prompt with a 4096 budget, but four
-    slots is 4096 — smaller than the budget alone — and every plan request would be truncated by
-    the context rather than by the budget, silently, on every model at once.
+    Returns a message, or None when it fits. This is now purely a ``num_ctx`` question:
+    concurrency no longer shrinks it (see ``slot_context``), so the only way to fail is to
+    genuinely ask for more window than was configured.
     """
     slot = slot_context(run)
     budget = max(int(run.get("max_plan_tokens", 0)), int(run.get("max_output_tokens", 0)))
@@ -527,153 +294,600 @@ def check_slot_context(run: dict[str, Any], longest_prompt_tokens: int) -> str |
     if needed <= slot:
         return None
     return (
-        f"per-slot context is {slot} tokens (num_ctx {run['num_ctx']} / parallel "
-        f"{run.get('parallel', 1)}), but the longest prompt (~{longest_prompt_tokens}) plus the "
-        f"largest token budget ({budget}) needs ~{needed}. Requests would be cut off by the "
-        f"CONTEXT instead of the budget — which is not a model fault and is scored as if it "
-        f"were. Lower `parallel`, raise `num_ctx`, or lower the token budgets."
+        f"context is {slot} tokens (num_ctx {run['num_ctx']}), but the longest prompt "
+        f"(~{longest_prompt_tokens}) plus the largest token budget ({budget}) needs ~{needed}. "
+        f"Requests would be cut off by the CONTEXT instead of the budget — which is not a "
+        f"model fault and is scored as if it were. Raise `num_ctx`, or lower the token "
+        f"budgets. Note that raising `num_ctx` costs KV-cache headroom and therefore "
+        f"concurrency; `parallel` no longer costs context at all."
     )
 
 
-def build_argv(
-    cfg: dict[str, Any], model_cfg: dict[str, Any], host: str, *,
-    thinking_budget: int | None = None,
-) -> list[str]:
-    """The single place a llama-server command line is constructed.
+def engine(cfg: dict[str, Any]) -> str:
+    """Which inference server this run launches: ``"llamacpp"`` (default) or ``"vllm"``.
+
+    MODEL_EVAL_ENGINE WINS OVER config.yaml, the same precedence `--spec`/MODEL_EVAL_SPEC has
+    and for the same reason: `run.py --engine` has to reach every server launch in the process
+    and they do not share a call chain.
+    """
+    env = os.environ.get("MODEL_EVAL_ENGINE")
+    name = (env or cfg.get("engine") or "llamacpp").strip().lower()
+    if name not in ("llamacpp", "vllm"):
+        raise SystemExit(f"unknown engine {name!r} — expected 'llamacpp' or 'vllm'")
+    return name
+
+
+def effective_parallel(cfg: dict[str, Any], model_cfg: dict[str, Any] | None = None) -> int:
+    """How many requests this run actually keeps in flight — `run.parallel`, unless the active
+    engine caps it.
+
+    WHY AN ENGINE MAY CAP IT. `run.parallel` is a statement about the WORKLOAD ("how many
+    students are on the site at once"), and under vLLM it costs only KV out of a pool sized at
+    runtime. Under llama.cpp it is a LOAD-TIME ALLOCATION of `num_ctx * parallel` tokens, so on
+    a card this full the workload figure can simply be unbuyable: MEASURED 2026-08-26,
+    qwen3.8-27b UD-Q6_K_M loads at parallel 3 (23,388 MiB) and does not load at 4.
+
+    CAPPING IS NOT SILENT AND DOES NOT POLLUTE QUALITY. `runner` records the resolved number as
+    `simulated_users` on every env record, which is the field that already exists to say which
+    concurrency regime a file was written in — the same convention that keeps `parallel: 1` and
+    `parallel: 4` vLLM runs apart. Latency columns do not pool across the setting; the sampler,
+    prompts and schemas are identical, so quality does.
+    """
+    want = max(1, int(cfg["run"].get("parallel", 1)))
+    for cap in (backend_cfg(cfg).get("max_parallel"),
+                (model_cfg or {}).get("max_parallel")):
+        # A MODEL MAY BE TIGHTER THAN ITS ENGINE. qwen3.8-flash-next holds ~56 GB of weights in
+        # page cache and cannot use quantized KV, so every extra slot costs f16 KV against RAM
+        # that is already gone — the engine-wide cap of 3 is unaffordable for that one entry.
+        if cap and want > int(cap):
+            want = int(cap)
+    return want
+
+
+def backend_cfg(cfg: dict[str, Any]) -> dict[str, Any]:
+    """The `llamacpp:` or `vllm:` block, whichever this run is using."""
+    return cfg[engine(cfg)]
+
+
+def model_dir(cfg: dict[str, Any], model_cfg: dict[str, Any]) -> Path:
+    """Where this model's weights live on disk — a DIRECTORY under vLLM, a FILE under
+    llama.cpp.
+
+    The two engines do not load the same artifact and that is not cosmetic: vLLM wants a
+    Hugging Face checkpoint directory (config.json plus safetensors shards, W4A16
+    compressed-tensors here), llama.cpp wants one quantized `.gguf`. A model entry therefore
+    carries both `model_path` and `gguf`, and which one is real depends on `engine`.
+    """
+    root = Path(backend_cfg(cfg)["models_root"])
+    if engine(cfg) == "llamacpp":
+        rel = model_cfg.get("model_path")
+        if not rel:
+            raise SystemExit(
+                f"model {model_cfg['name']!r} has no `model_path:` in config.yaml — under "
+                f"--engine llamacpp that is the .gguf to load, relative to models_root."
+            )
+        return root / rel
+    # A MODEL MAY BE llama.cpp-ONLY. `qwen3.8-flash-next` has no vLLM-loadable checkpoint at
+    # any size, so it carries no `model_path_vllm:` — say that, rather than raising KeyError
+    # three frames deep in a launch.
+    rel = model_cfg.get("model_path_vllm")
+    if not rel:
+        raise SystemExit(
+            f"model {model_cfg['name']!r} has no `model_path_vllm:` in config.yaml, so it "
+            f"cannot run under --engine vllm — it is a GGUF-only entry. Run it with "
+            f"--engine llamacpp, or exclude it with --models / --brackets."
+        )
+    return root / rel
+
+
+def build_argv(cfg: dict[str, Any], model_cfg: dict[str, Any], host: str) -> list[str]:
+    """The single place a server command line is constructed, for whichever engine is active."""
+    if engine(cfg) == "llamacpp":
+        return _build_argv_llamacpp(cfg, model_cfg, host)
+    return _build_argv_vllm(cfg, model_cfg, host)
+
+
+def _spec_argv_llamacpp(cfg: dict[str, Any], model_cfg: dict[str, Any]) -> list[str]:
+    """Speculative-decoding flags for `llama-server`, or `--spec-type none`.
+
+    RESTORED 2026-08-26 from the pre-vLLM harness, where it was measured to pay:
+    qwen3.6-27b went 18.65 -> 25.04 tok/s (+34%) at 96.7% draft acceptance on the ~1841-token
+    plan JSON this harness actually produces. That gain scales with how expensive the TARGET is
+    per token, which is why it was worth more on the 27B than on the 9B (+2.7%) — and why it is
+    worth most of all on qwen3.8-flash-next, whose decode is bound by reading expert weights
+    over DDR4 at ~22 tok/s.
+
+    TWO FAMILIES, AND THE CHEAP ONE FITS THIS WORKLOAD BEST:
+
+      draft-simple  a second small model proposes tokens. Costs VRAM for the draft's weights
+                    and requires an IDENTICAL VOCABULARY — llama.cpp aborts at load otherwise,
+                    which is why `draft:` is opt-in per model rather than global.
+      ngram-*       proposes continuations copied from the PROMPT. Costs no weights, no VRAM
+                    and no second model. It wins exactly when the output echoes the input, and
+                    this harness's plan stages emit course codes that appear verbatim in the
+                    rendered requirement database — the case it is built for.
+
+    ⚠ QUALITY NUMBERS DO NOT POOL ACROSS THIS SETTING. Accepting a drafted token requires the
+    target's sampler to agree with the proposal, so at temperature 0.15 a speculative run is a
+    near — not exact — reproduction of the unspeculated path. The old harness CONFIRMED this,
+    not theorised it: two 27B runs with identical prompt and seed returned different plans.
+    `MODEL_EVAL_SPEC` (i.e. `run.py run --spec ...`) overrides the config per invocation.
+    """
+    spec = (cfg.get("llamacpp") or {}).get("speculative") or {}
+    method = os.environ.get("MODEL_EVAL_SPEC") or model_cfg.get("spec_method") \
+        or spec.get("method") or "none"
+    # `--spec` on the CLI speaks the vLLM vocabulary (none/mtp/ngram/draft); map it onto
+    # llama.cpp's richer `--spec-type` so one flag drives both engines.
+    method = {"none": "none", "mtp": "draft-mtp", "ngram": "ngram-cache",
+              "draft": "draft-simple"}.get(method, method)
+
+    if method == "none":
+        return ["--spec-type", "none"]
+
+    # PER-MODEL OVERRIDES, because the right draft depth is a property of the TARGET's cost per
+    # token, not of the proposer. MEASURED 2026-08-26 on qwen3.8-flash-next (IQ3_XXS, n_cpu_moe
+    # 32, 12,255-token prompt): n_max 4 -> 23.7 tok/s, 8 -> 26.4, 16 -> 30.5, with acceptance
+    # never dropping below 99.5%. A target whose every token costs a round-trip to system RAM
+    # amortises a deep draft that a GPU-resident model would not.
+    def _p(key, default):
+        v = model_cfg.get(f"spec_{key}")
+        return spec.get(key, default) if v is None else v
+
+    argv = ["--spec-type", method,
+            "--spec-draft-n-max", str(_p("n_max", 4)),
+            "--spec-draft-n-min", str(_p("n_min", 0)),
+            "--spec-draft-p-min", str(_p("p_min", 0.75))]
+
+    if method.startswith("ngram"):
+        # No draft model, no VRAM, nothing else to configure.
+        return argv
+
+    # A DRAFT MODEL IS A HARD DEPENDENCY, and a missing one is a load-time abort rather than a
+    # graceful fallback — say so here instead of letting the server die with the draft's path
+    # in a C++ error.
+    draft = model_cfg.get("draft_gguf") or spec.get("draft_gguf")
+    if not model_cfg.get("draft") or not draft:
+        return ["--spec-type", "none"]
+    draft_path = Path(cfg["llamacpp"]["models_root"]) / draft
+    if not draft_path.is_file():
+        raise SystemExit(
+            f"model {model_cfg['name']!r} asks for {method} speculation but its draft gguf "
+            f"{draft_path} does not exist. Download it, set `draft: false` on the entry, or "
+            f"run with --spec none."
+        )
+    argv += [
+        "-md", str(draft_path),
+        # The draft's own KV. f16 by default: its whole job is to be small and fast, and a 0.8B
+        # draft's cache is negligible either way.
+        "-ctkd", str(spec.get("cache_type_k", "f16")),
+        "-ctvd", str(spec.get("cache_type_v", "f16")),
+    ]
+    # ALL THE DRAFT'S LAYERS ON THE CARD. A partially-offloaded draft would add CPU-speed
+    # latency to EVERY verification pass, which is the one thing speculation cannot afford.
+    ngld = spec.get("n_gpu_layers_draft")
+    if ngld is not None:
+        argv += ["-ngld", str(ngld)]
+    if spec.get("device_draft"):
+        argv += ["-devd", str(spec["device_draft"])]
+    argv += [str(a) for a in spec.get("extra_args", [])]
+    return argv
+
+
+def _build_argv_llamacpp(cfg: dict[str, Any], model_cfg: dict[str, Any],
+                         host: str) -> list[str]:
+    """`llama-server` command line.
+
+    THE ONE THING THAT DIFFERS IN KIND FROM vLLM IS `-c`. llama.cpp pre-allocates a single KV
+    pool of `-c` tokens and the `--parallel` slots SHARE it (the server logs
+    `kv_unified = 'true'`), so a run that wants `parallel` concurrent requests each seeing
+    `num_ctx` has to ask for `num_ctx * parallel`. MEASURED 2026-08-26: at `-c 16384
+    --parallel 4`, four ~8.7k-token prompts died with `decode: Context size has been exceeded`;
+    at `-c 65536 --parallel 4` the model would not load at all (`CUDA error: out of memory`,
+    21.49 GiB of weights plus that pool against 23.55 GiB). Both failures are loud, which is
+    the only mercy here — `slot_context` divides so `check_slot_context` predicts them first.
+    """
+    lc = cfg["llamacpp"]
+    run = cfg["run"]
+    parallel = effective_parallel(cfg, model_cfg)
+
+    argv = [
+        lc["server_exe"],
+        "-m", str(model_dir(cfg, model_cfg)),
+        # The name the client sees on /v1/models, pinned to the harness's short name so records
+        # say `qwen3.8-27b` and not a path — same reason as vLLM's --served-model-name.
+        "--alias", model_cfg["name"],
+        "--host", host,
+        "--port", str(lc["port"]),
+        # THE WHOLE SHARED POOL, not the per-request window. See the docstring.
+        "-c", str(int(run["num_ctx"]) * parallel),
+        "--parallel", str(parallel),
+        "-ngl", str(model_cfg.get("n_gpu_layers", lc.get("n_gpu_layers", 99))),
+        # FLASH ATTENTION IS REQUIRED TO QUANTIZE THE V CACHE, not merely a speed knob — this
+        # is why the pre-vLLM harness passed it unconditionally. Per-model because an
+        # architecture whose attention llama.cpp implements specially may not support it;
+        # qwen3.8-flash-next's hybrid Gated-DeltaNet/sparse path is exactly that shape.
+        "-fa", str(model_cfg.get("flash_attn") or lc.get("flash_attn", "on")),
+        "-ctk", str(model_cfg.get("cache_type_k") or lc.get("cache_type_k", "q8_0")),
+        "-ctv", str(model_cfg.get("cache_type_v") or lc.get("cache_type_v", "q8_0")),
+        "--seed", str(run["seed"]),
+        # HOW THE WEIGHTS GET INTO MEMORY. `--mlock`/`--no-mmap` are deprecated in this build in
+        # favour of one `--load-mode`. THE CHOICE IS PER MODEL AND IT MATTERS BOTH WAYS:
+        #   mmap+mlock  pins weights in RAM — right for a model that FITS, wrong for one that
+        #               does not, where it OOMs the box instead of paging.
+        #   auto/mmap   lets the OS evict — the only survivable mode for qwen3.8-flash-next,
+        #               whose 72.5-82 GB sits against ~61 GB of RAM plus the card.
+        "-lm", str(model_cfg.get("load_mode") or lc.get("load_mode", "auto")),
+        # Debug verbosity is REQUIRED, not optional: it is the only level at which this build
+        # logs per-layer device assignment, and without that the harness cannot tell a fully
+        # offloaded model from one silently running half on the CPU. Costs a few MB of log.
+        "-lv", str(lc.get("log_verbosity", 5)),
+        # The web UI is dead weight for a harness that only speaks HTTP, and its assets are
+        # fetched at BUILD time — a build without them logs an error and serves a broken page.
+        "--no-webui",
+    ]
+
+    # BATCH SIZES. Prefill is submitted `-b` tokens at a time and computed `-ub` at a time, and
+    # on a model whose experts live in system RAM the physical batch decides how much work each
+    # round of expert reads amortises. Left at llama.cpp's defaults (2048/512) unless a model
+    # says otherwise, because raising `-ub` also raises the compute buffer — the allocation that
+    # OOMs at long prompts.
+    for flag, key in (("-b", "batch_size"), ("-ub", "ubatch_size"), ("-t", "threads")):
+        val = model_cfg.get(key, lc.get(key))
+        if val:
+            argv += [flag, str(val)]
+
+    # EXPERTS INTO SYSTEM RAM. The llama.cpp equivalent of vLLM's `--cpu-offload-gb`, but far
+    # better targeted: it moves only the MoE expert tensors, which for an A4B/A6B model are the
+    # bulk of the weights and the part that is READ SPARSELY (a handful of experts per token
+    # rather than every byte every step). This is the flag that makes a checkpoint larger than
+    # VRAM viable at all, and the reason a GGUF side-car exists next to vLLM.
+    n_cpu_moe = model_cfg.get("n_cpu_moe")
+    if n_cpu_moe:
+        argv += ["-ncmoe", str(n_cpu_moe)]
+
+    # PER-TENSOR PLACEMENT, the escape hatch `-ncmoe` is a shorthand for. `-ncmoe N` moves the
+    # first N layers' experts wholesale; a regex here can put, say, only the `ffn_down_exps` of
+    # every layer on the CPU and keep the rest resident. Unset by default because it is easy to
+    # write one that silently matches nothing.
+    for ot in model_cfg.get("override_tensor", []) or []:
+        argv += ["-ot", str(ot)]
+
+    # REASONING. llama.cpp keeps the launch-time switch vLLM dropped, so unlike the vLLM path
+    # this genuinely turns the channel off rather than only deciding how it is parsed.
+    budget = int(run.get("reasoning_budget", 0) or 0)
+    if budget > 0:
+        argv += ["--reasoning-budget", str(budget)]
+    elif model_cfg.get("think") is False:
+        argv += ["-rea", "off", "--reasoning-budget", "0"]
+
+    argv += _spec_argv_llamacpp(cfg, model_cfg)
+    argv += [str(a) for a in model_cfg.get("extra_args_llamacpp", [])]
+    return argv
+
+
+def _build_argv_vllm(cfg: dict[str, Any], model_cfg: dict[str, Any], host: str) -> list[str]:
+    """The single place a vLLM command line is constructed.
 
     Everything that could differ between models and pollute the comparison is read from
     ``config.yaml`` and applied identically; only ``--model`` and the per-model overrides
     explicitly declared in the model's own entry vary.
     """
-    llama = cfg["llamacpp"]
+    vllm = cfg["vllm"]
     run = cfg["run"]
-    windows = is_windows_exe(llama["server_exe"])
-    gguf_local = Path(llama["models_root"]) / model_cfg["gguf"]   # readable from this side
-    gguf = to_server_path(gguf_local, windows=windows)            # openable by the server
-
-    # The bind address is not the connect address under interop: the server binds on the
-    # Windows side, where this box's loopback means the wrong machine. 0.0.0.0 is what makes
-    # it reachable across the NAT boundary; `host` (the gateway) is what the client dials.
-    bind_host = "0.0.0.0" if windows else host
 
     argv = [
-        llama["server_exe"],
-        "-m", gguf,
-
-        "--host", bind_host,
-        "--port", str(llama["port"]),
-        "-c", str(run["num_ctx"]),       # fixed at launch under llama.cpp — the whole reason
-        "--flash-attn", "on",            # required to quantize the V cache
-        "--cache-type-k", run["cache_type_k"],
-        "--cache-type-v", run["cache_type_v"],
-        "--jinja",                       # each gguf's own chat template, exactly like the app
-        # SLOTS. llama.cpp divides the context between them — the per-request window is
-        # `--ctx-size / --parallel`, not `--ctx-size` (MEASURED: -c 16384 --parallel 2 reports
-        # n_ctx 8192 per slot). So raising this silently shrinks what a single request may use,
-        # and `slot_context()` below is what stops that going unnoticed.
+        vllm["server_exe"], "serve", str(model_dir(cfg, model_cfg)),
+        # The name the client sees on /v1/models and sends as `model`. Pinned to the harness's
+        # own short name so records, logs and config all say `qwen3.8-27b` rather than an
+        # absolute path that changes if the checkpoint moves.
+        "--served-model-name", model_cfg["name"],
+        "--host", host,
+        "--port", str(vllm["port"]),
+        # THE PER-REQUEST WINDOW, and under vLLM every concurrent request gets all of it.
+        # Both checkpoints declare max_position_embeddings 262144; pinning it here is what
+        # makes the models comparable to each other and keeps the KV pool from being sized
+        # against a window nothing in this harness ever uses.
+        "--max-model-len", str(run["num_ctx"]),
+        # HOW MANY STUDENTS MAY BE IN FLIGHT AT ONCE. Under llama.cpp this was `--parallel`
+        # and it stole context from every request; here it is a scheduler bound and costs
+        # nothing but KV, which is the point of the migration. `runner.run_model` keeps
+        # exactly `run.parallel` requests in flight, so this stays in step with it.
+        "--max-num-seqs", str(effective_parallel(cfg, model_cfg)),
+        # HOW MUCH OF THE CARD THE ENGINE MAY CLAIM, weights and KV together. Not a tuning
+        # knob to raise casually: vLLM profiles a forward pass to size the KV pool, and
+        # anything left to the rest of the box has to cover the CUDA context and fragmentation.
+        "--gpu-memory-utilization", str(vllm.get("gpu_memory_utilization", 0.92)),
+        # THE DIRECT DESCENDANT of `--cache-type-k/v q8_0`. Halves KV bytes per token, which on
+        # a 24 GB card holding a ~19.5 GB checkpoint is the difference between two concurrent
+        # full-context sequences and five. Ampere has no native FP8 arithmetic, so this is a
+        # STORAGE format that is dequantized into the kernel — the saving is memory, not math.
         #
-        # AS OF 2026-08-11 THE RUNNER ACTUALLY FILLS THESE. This used to read "the runner issues
-        # one request at a time, so anything above 1 sits idle while costing context" — true
-        # then, and the reason `parallel` was left at 1. `runner.run_model` now keeps exactly
-        # `parallel` requests in flight (`_run_pool`), so the slot count is the simulated
-        # concurrent-user count and the eval measures queueing the way the deployment will.
-        "--parallel", str(run.get("parallel", 1)),
-        "--no-mmap",
-        "--no-webui",
-        # Debug verbosity is REQUIRED, not optional: it is the only level at which this build
-        # logs per-layer device assignment, and without that the harness cannot tell a fully
-        # offloaded model from one silently running half on the CPU. Costs a few MB of log.
-        "-lv", str(llama.get("log_verbosity", 5)),
+        # PER-MODEL, BECAUSE IT IS NOT A PROPERTY OF THE CARD ALONE. It depends on which
+        # attention backend the model's shape selects, and that varies per architecture:
+        #
+        #   ValueError: FP8 KV cache is not supported by the Triton attention backend on
+        #   NVIDIA GeForce RTX 3090 Ti (compute capability 8.6)
+        #
+        # MEASURED 2026-08-22: qwen3.8-27b lands on FlashInfer and takes fp8 happily;
+        # gemma4-26b lands on Triton attention and refuses it outright at engine start. This
+        # is one of the few settings that legitimately differs between models here — the
+        # comparison it could pollute is throughput, and a model that will not start pollutes
+        # it worse.
+        "--kv-cache-dtype",
+        str(model_cfg.get("kv_cache_dtype") or vllm.get("kv_cache_dtype", "fp8")),
+        # TEXT-ONLY, DECLARED. Both checkpoints are multimodal (Qwen3_5ForConditionalGeneration,
+        # Gemma4ForConditionalGeneration) and this harness never sends an image or an audio
+        # clip. Left at its default, vLLM sizes and reserves multimodal preprocessor/encoder
+        # memory for a modality that will never arrive, and takes it straight out of the KV
+        # pool. Zeroing the limits does NOT unload the vision tower — that is in the weights on
+        # disk — it just stops paying for the path at runtime.
+        "--limit-mm-per-prompt", '{"image":0,"video":0,"audio":0}',
+        # Reproducibility, matching the sampler seed the client sends per request.
+        "--seed", str(run["seed"]),
+        # PREFIX CACHING, stated rather than left to the default. Every request here opens with
+        # the same system prompt, and within a program with the same rendered requirement
+        # database — thousands of tokens that would otherwise be re-prefilled per call. This is
+        # the second reason the switch pays, after paged KV, and it is worth being explicit
+        # about because it is also the reason TTFT here is not comparable to the llama.cpp-era
+        # numbers: a cache hit skips work the old stack always did.
+        "--enable-prefix-caching",
     ]
-    # OMITTING --n-gpu-layers IS A DELIBERATE SETTING, not an oversight. llama.cpp runs a
-    # `--fit` pass that sizes the offload to the memory actually free on each device, and that
-    # pass refuses to run against an explicit -ngl:
-    #
-    #   common_fit_params: failed to fit params to free device memory:
-    #                      n_gpu_layers already set by user to 999, abort
-    #
-    # With the hardcoded 999 that used to live here, an over-subscribed split did not get
-    # trimmed — it died with a raw `cudaMalloc failed: out of memory` partway through loading,
-    # which is how the 35B looked like a broken model rather than a mis-sized split.
-    #
-    # AUTO-FIT IS ALL-OR-NOTHING, so unsetting this is only half of it: with -ngl unset but
-    # `--n-cpu-moe` pinned, the fit pass still declines to size the split and falls back to the
-    # default VRAM-proportional one (MEASURED: n_cpu_moe 10 and 14 both then retried the same
-    # 8225 MiB allocation on the 8 GB card and OOMed, exactly as -ngl 999 did). A model that
-    # pins n_cpu_moe must therefore hand-size --tensor-split too; see qwen3.6-35b-a3b in
-    # config.yaml. Pinning nothing yields a split that always loads but is not tuned — 17.03
-    # tok/s against 23.50 for the hand-sized one on that model.
-    n_gpu_layers = run.get("n_gpu_layers")
-    if n_gpu_layers is not None:
-        argv += ["--n-gpu-layers", str(n_gpu_layers)]
 
-    # MoE expert offload to CPU. A no-op on dense models, so it is applied uniformly rather
-    # than conditionally — one fewer axis on which models differ. Configured either as
-    # `n_cpu_moe` (llama.cpp's own bottom-up count) or `n_gpu_moe` (layers of experts kept on
-    # the card, resolved against this model's depth); see resolve_n_cpu_moe.
-    n_cpu_moe = resolve_n_cpu_moe(run, model_cfg, gguf_local)
-    if n_cpu_moe is not None:
-        argv += ["--n-cpu-moe", str(n_cpu_moe)]
-    # Reasoning off at launch: the only switch that behaves the same across Qwen3, gpt-oss
-    # and GLM templates. Per-request chat_template_kwargs is a backstop in the client.
+    # CPU WEIGHT OFFLOAD, per model. Streams the overflow of a checkpoint that does not fit in
+    # VRAM from system RAM, over PCIe, on every forward pass. It is a LAST RESORT and the only
+    # entry that uses it says why: qwen3.6-35b-a3b's usable quants are 25 GB against a 22.1 GB
+    # budget, and the one small enough to fit (20.5 GB) left too little for a KV cache and did
+    # not load anyway.
     #
-    # THINKING_BUDGET OVERRIDES ALL OF THIS, on purpose. It exists for exactly one caller —
-    # `runner.run_thinking_experiment`, the Mode B pre-plan-reasoning experiment — which needs
-    # a server launched with reasoning ENABLED and capped, not disabled. It is a separate
-    # server process from every baseline run (own `start_server` call, own model lifetime), so
-    # this can never leak into a `--reasoning off` baseline launch; the two are simply
-    # different `argv`s built at different times.
-    if thinking_budget is not None:
-        argv += ["--reasoning-budget", str(thinking_budget)]
-    elif int(run.get("reasoning_budget") or 0) > 0:
-        # RUN-WIDE BUDGET, 2026-08-13. The advising stages (QA, explain) are allowed to reason;
-        # the plan stages still ask for `enable_thinking: false` per request. Reasoning has to
-        # be enabled at LAUNCH for either to be possible — `--reasoning off` cannot be undone
-        # per request — so the switch lives here and the per-stage choice lives in
-        # `runner._stage_thinking`.
-        argv += ["--reasoning-budget", str(int(run["reasoning_budget"]))]
-    elif model_cfg.get("think") is False:
-        argv += ["--reasoning", "off", "--reasoning-budget", "0"]
-    # --mlock OOMs on models larger than this box's RAM; see config's mlock_max_gb.
-    if model_cfg.get("mlock", True):
-        argv.append("--mlock")
-    # BEFORE the model's own extra_args, so a per-model override still gets the last word on
-    # any flag the speculative block also sets.
-    argv += draft_argv(cfg, model_cfg, windows=windows)
+    # IT COSTS BANDWIDTH, WHICH IS THE THING DECODE IS ALREADY BOUND BY, so a model using this
+    # is not latency-comparable to one that does not — expect it to be the slowest row in the
+    # table by a wide margin, and read its latency columns as a property of the offload rather
+    # than of the model. An A3B MoE is the best case for it (~3B of 35B parameters active per
+    # token, so most of what sits in system RAM is not read on any given step), which is the
+    # only reason it is worth trying at all.
+    offload = model_cfg.get("cpu_offload_gb")
+    if offload:
+        argv += ["--cpu-offload-gb", str(offload)]
+
+    # REASONING. Under llama.cpp this was `--reasoning off --reasoning-budget 0` at launch,
+    # because that was the only switch that behaved the same across every chat template. vLLM
+    # has no launch-time off switch — a template that wants to reason will reason — so the
+    # control moved entirely to the per-request `chat_template_kwargs: {enable_thinking: false}`
+    # the client already sends, and this flag only decides whether the output arrives SPLIT
+    # into a `reasoning_content` channel or inline in `content` as raw <think> tags.
+    #
+    # Naming a parser is therefore not "turning thinking on": it is making sure that if a model
+    # emits reasoning anyway, it lands in the channel `GenerationResult.reasoning_text` reads
+    # and the scorers do not have to strip tags out of the answer. The `plan_b_thinking` arm
+    # that used to be the other caller of this was removed 2026-08-24; `run.advising_thinking`
+    # is the only switch left that asks any stage to reason.
+    parser = model_cfg.get("reasoning_parser") or vllm.get("reasoning_parser")
+    if parser:
+        argv += ["--reasoning-parser", str(parser)]
+
+
+    # TOOLS. Only the QA/explain stages offer any (see the client's tools section); a model
+    # with no parser configured simply never emits a parseable call and the stage answers
+    # without one, which is the same degradation the old stack had.
+    tool_parser = model_cfg.get("tool_call_parser") or vllm.get("tool_call_parser")
+    if tool_parser:
+        argv += ["--enable-auto-tool-choice", "--tool-call-parser", str(tool_parser)]
+
+    # SPECULATIVE DECODING. Off unless a model declares it (or MODEL_EVAL_SPEC overrides), and
+    # it is per-model because only one of these two models has anything to speculate WITH.
+    #
+    # THE llama.cpp ERA'S VERSION OF THIS IS GONE, not ported: that used a separate 0.8B draft
+    # gguf, and it paid by amortizing weight reads on hardware where the target model was split
+    # across two power-limited cards. The equivalents here are different in kind:
+    #
+    #   "mtp"   — the multi-token-prediction head shipped INSIDE the qwen3.8-27b checkpoint
+    #             (`model-mtp.safetensors`). vLLM resolves the draft from the target model
+    #             itself, so no second checkpoint is configured. Costs ~0.85 GB of weights,
+    #             which comes straight out of the KV pool and therefore out of concurrency.
+    #   "ngram" — prompt-lookup decoding. Proposes continuations copied from the prompt, so it
+    #             costs NO VRAM at all and wins exactly when the output echoes the input. This
+    #             harness's plan stages emit course codes that appear verbatim in the rendered
+    #             requirement database, which is the case it is built for.
+    #
+    # ⚠ SPECULATION AND BATCHING COMPETE FOR THE SAME SPARE COMPUTE. A drafted token is only
+    # cheap while the GPU has idle capacity during decode, and `run.parallel > 1` is already
+    # spending that capacity on other students. Measure this at LOW concurrency or the result
+    # will say "speculation does not help" when what it means is "batching got there first".
+    spec = _speculative_config(cfg, model_cfg)
+    if spec:
+        argv += ["--speculative-config", json.dumps(spec)]
+
     argv += [str(a) for a in model_cfg.get("extra_args", [])]
     return argv
 
 
+def _has_mtp_head(cfg: dict[str, Any], model_cfg: dict[str, Any]) -> bool:
+    """Does this checkpoint actually carry a multi-token-prediction head?
+
+    CHECKED ON DISK rather than assumed from the model name. A model without one fails at
+    engine start, which through a sweep is an expensive way to learn a static fact — the
+    config.json key and the weight file are both readable in microseconds.
+    """
+    path = model_dir(cfg, model_cfg)
+    if list(path.glob("*mtp*.safetensors")):
+        return True
+    try:
+        cfg_json = json.loads((path / "config.json").read_text())
+    except (OSError, ValueError):
+        return False
+    text = cfg_json.get("text_config", cfg_json)
+    return any("mtp" in k.lower() or "nextn" in k.lower() for k in text)
+
+
+def _speculative_config(cfg: dict[str, Any], model_cfg: dict[str, Any]) -> dict[str, Any] | None:
+    """The `--speculative-config` payload for this model, or None for plain decoding.
+
+    `MODEL_EVAL_SPEC` wins over config.yaml so one sweep can be re-run under a different
+    proposer without editing the file — the same override shape `--major` uses, and the reason
+    it is an env var is that it has to reach every server launch in the process (the sweep's,
+    and the thinking experiment's) and they do not share a call chain. `none` forces it off.
+    """
+    override = os.environ.get("MODEL_EVAL_SPEC")
+    method = override if override else (model_cfg.get("speculative") or {}).get("method")
+    if not method or method == "none":
+        return None
+    spec = dict((model_cfg.get("speculative") or {}))
+    spec.pop("method", None)
+    defaults = {"ngram": {"num_speculative_tokens": 4, "prompt_lookup_max": 8,
+                          "prompt_lookup_min": 2},
+                "mtp": {"num_speculative_tokens": 2},
+                "draft_model": {"num_speculative_tokens": 4}}
+    if method == "mtp" and not _has_mtp_head(cfg, model_cfg):
+        # DEGRADE, DO NOT RAISE — same reasoning as the missing-draft branch below. Only
+        # qwen3.8-27b ships a multi-token-prediction head; asking gemma4-26b for `mtp` would
+        # die at engine start and, because `_run_sweep` catches per PROGRAM rather than per
+        # model, take the other model's records down with it.
+        print(f"[spec] {model_cfg['name']} has no MTP head in its checkpoint — running it "
+              f"with plain decoding for this arm")
+        return None
+
+    if method in ("draft", "draft_model"):
+        # A SEPARATE SMALL MODEL PROPOSES, the big one verifies — the direct descendant of the
+        # llama.cpp `-md` draft gguf, and the only speculative method here that needs its own
+        # checkpoint on disk.
+        #
+        # THE DRAFT MUST SHARE THE TARGET'S TOKENIZER, not merely its vocabulary SIZE. It
+        # proposes token IDs that the target then scores, so a draft trained on a different
+        # tokenization proposes ids that mean something else and every one gets rejected —
+        # which costs time and returns nothing. `run.py check` verifies this by encoding the
+        # same string with both tokenizers and comparing the ids, rather than trusting that two
+        # models from the same family agree.
+        method = "draft_model"
+        draft = model_cfg.get("draft_model")
+        if not draft:
+            # DEGRADE, DO NOT RAISE. `--spec draft` is a request about HOW to decode, and only
+            # some models have a tokenizer-compatible small sibling to decode with. Raising
+            # here failed the whole PROGRAM — `_run_sweep` catches per program, not per model —
+            # so one model lacking a draft cost the other model its results too. MEASURED
+            # 2026-08-22: a `--spec draft` sweep produced 0-1 records per program across four
+            # programs, because gemma4-26b aborted each one before qwen3.8-27b's records were
+            # written.
+            #
+            # Falling back to plain decoding keeps that model in the run and measurable. The
+            # env record's `speculative` field says which models actually speculated, so a
+            # mixed run is still readable — and a silently-unspeculated model is exactly what
+            # that field exists to make visible.
+            print(f"[spec] {model_cfg['name']} has no `draft_model:` — running it with plain "
+                  f"decoding for this arm (only models with a tokenizer-compatible small "
+                  f"sibling can draft)")
+            return None
+        spec["model"] = str(Path(cfg["vllm"]["models_root"]) / draft)
+    out = {**defaults.get(method, {}), **spec, "method": method}
+    return out
+
+
+def _server_env(cfg: dict[str, Any]) -> dict[str, str]:
+    """The environment vLLM is launched into: this process's, plus the venv's `bin/` on PATH.
+
+    THE VENV IS NOT ACTIVATED, deliberately — the harness invokes `vllm` by absolute path so it
+    does not care which interpreter is running `run.py`. But vLLM SHELLS OUT to build tools
+    during engine startup, and those are console scripts installed alongside `vllm` in the same
+    `bin/`. Without this, the launch dies minutes in with
+
+        FileNotFoundError: [Errno 2] No such file or directory: 'ninja'
+        RuntimeError: Engine core initialization failed.
+
+    which is a PATH problem wearing the costume of a broken model: it happens after the weights
+    load and the compile begins, and the only clue is one line buried in ~400 of traceback.
+    MEASURED here 2026-08-22 on the very first vLLM launch attempt.
+
+    Prepended rather than appended, so the venv's tools win over any system copy — the same
+    precedence activating the venv would give.
+    """
+    env = dict(os.environ)
+    exe = Path(backend_cfg(cfg)["server_exe"]).resolve()
+    env["PATH"] = str(exe.parent) + os.pathsep + env.get("PATH", "")
+
+    # llama.cpp NEEDS THE CUDA LIBRARIES ON LD_LIBRARY_PATH, and they are not where a linker
+    # would look. There is no system CUDA on this box and no sudo to install one, so the build
+    # links against a toolkit assembled out of pip wheels (see `.llamacpp-env.sh`, which the
+    # build itself sources). `llama-server` therefore starts with
+    #
+    #     error while loading shared libraries: libcudart.so.13
+    #
+    # unless the same directory is exported here. Same class of failure as the `ninja` one
+    # above: it looks like a broken binary and it is a path problem.
+    if engine(cfg) == "llamacpp":
+        libdir = cfg["llamacpp"].get("cuda_lib_dir") or str(
+            Path("/home/wylin/ai-academic-advisor/.cudatoolkit/lib64"))
+        if Path(libdir).is_dir():
+            env["LD_LIBRARY_PATH"] = libdir + os.pathsep + env.get("LD_LIBRARY_PATH", "")
+    return env
+
+
 def start_server(
     cfg: dict[str, Any], model_cfg: dict[str, Any], log_dir: Path, *, host: str | None = None,
-    thinking_budget: int | None = None,
 ) -> ServerHandle:
-    windows = is_windows_exe(cfg["llamacpp"]["server_exe"])
-    host = host or resolve_host(cfg["llamacpp"].get("host", "auto"),
-                                cfg["llamacpp"]["server_exe"])
-    argv = build_argv(cfg, model_cfg, host, thinking_budget=thinking_budget)
-    base_url = f"http://{host}:{cfg['llamacpp']['port']}"
+    eng = engine(cfg)
+    backend = backend_cfg(cfg)
+    host = host or resolve_host(backend.get("host", "auto"))
+    argv = build_argv(cfg, model_cfg, host)
+    base_url = f"http://{host}:{backend['port']}"
 
-    # A survivor from an earlier crashed run owns the port and skews the VRAM baseline that
-    # the next model's delta is measured against. Cheap to rule out, expensive to debug.
-    if windows:
-        ServerHandle._taskkill()
-        time.sleep(2)
+    # WHAT EACH ENGINE LOADS IS A DIFFERENT KIND OF THING ON DISK — a checkpoint directory for
+    # vLLM, one .gguf file for llama.cpp — so the "missing weights" check is per-engine too.
+    path = model_dir(cfg, model_cfg)
+    if eng == "llamacpp":
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"model {model_cfg['name']} points at {path}, which is not a file. "
+                f"llama.cpp loads a single quantized .gguf, not a checkpoint directory — "
+                f"check the entry's `gguf:` path, or run with --engine vllm."
+            )
+    elif not path.is_dir():
+        raise FileNotFoundError(
+            f"model {model_cfg['name']} points at {path}, which is not a directory. "
+            f"vLLM loads a Hugging Face checkpoint DIRECTORY (config.json + safetensors "
+            f"shards), not a single quantized file the way llama.cpp loads a .gguf — "
+            f"`run.py check` reports which entries are missing."
+        )
 
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / f"llama-server_{model_cfg['name']}.log"
+    log_path = log_dir / f"{eng}_{model_cfg['name']}.log"
     log_file = log_path.open("w")
-    process = subprocess.Popen(argv, stdout=log_file, stderr=subprocess.STDOUT)
-    handle = ServerHandle(process=process, log_path=log_path, argv=argv, base_url=base_url,
-                          windows=windows)
+    process = subprocess.Popen(argv, stdout=log_file, stderr=subprocess.STDOUT,
+                               env=_server_env(cfg))
+    handle = ServerHandle(process=process, log_path=log_path, argv=argv, base_url=base_url)
 
-    client = LlamaCppClient(base_url)
-    deadline = time.time() + cfg["llamacpp"].get("startup_timeout_s", 900)
+    client = VllmClient(base_url)
+    # STARTUP IS SLOW AND THAT IS NORMAL, so the timeout is generous. Beyond loading ~19 GB of
+    # weights, vLLM profiles a forward pass to size the KV pool and compiles/captures CUDA
+    # graphs; the first launch of a given model also populates a compilation cache, so a cold
+    # first start can be minutes longer than every start after it.
+    deadline = time.time() + backend.get("startup_timeout_s", 1800)
     while time.time() < deadline:
         if process.poll() is not None:
-            tail = "\n".join(handle.log_text().splitlines()[-25:])
+            tail = "\n".join(handle.log_text().splitlines()[-30:])
+            # THE ONE FAILURE WORTH TRANSLATING. llama.cpp pre-allocates `num_ctx * parallel`
+            # tokens of KV at load, so raising `parallel` can make a model that ran fine stop
+            # loading at all — and it reports that as a bare `CUDA error: out of memory` with
+            # no hint that concurrency, not the model, is what got too big. MEASURED
+            # 2026-08-26 on qwen3.8-27b UD-Q6_K_M (21.49 GiB) against 23.55 GiB:
+            # parallel 3 loads at 23,388 MiB, parallel 4 does not load.
+            if eng == "llamacpp" and "out of memory" in tail.lower():
+                parallel = effective_parallel(cfg, model_cfg)
+                num_ctx = int(cfg["run"]["num_ctx"])
+                raise RuntimeError(
+                    f"llama.cpp ran out of VRAM loading {model_cfg['name']}.\n\n"
+                    f"It pre-allocates ONE KV pool of num_ctx * parallel = "
+                    f"{num_ctx} * {parallel} = {num_ctx * parallel} tokens at load, on top of "
+                    f"the weights — unlike vLLM, which pages KV and pays for concurrency out "
+                    f"of a pool it sizes at runtime. Either:\n"
+                    f"  - lower `run.parallel` (3 fits qwen3.8-27b UD-Q6_K_M on this card, "
+                    f"4 does not), or\n"
+                    f"  - use a smaller quant for this model's `gguf:`, or\n"
+                    f"  - set this model's `n_gpu_layers` below {model_cfg.get('n_gpu_layers', 99)} "
+                    f"to spill layers to RAM, or `n_cpu_moe` if it is an MoE, or\n"
+                    f"  - run this model under --engine vllm.\n\n"
+                    f"Last lines:\n{tail}"
+                )
             raise RuntimeError(
-                f"llama-server exited during startup for {model_cfg['name']} "
+                f"{eng} exited during startup for {model_cfg['name']} "
                 f"(code {process.returncode}). Last lines:\n{tail}"
             )
         if client.health():
@@ -681,8 +895,8 @@ def start_server(
         time.sleep(2)
 
     handle.stop()
-    tail = "\n".join(handle.log_text().splitlines()[-25:])
+    tail = "\n".join(handle.log_text().splitlines()[-30:])
     raise TimeoutError(
-        f"llama-server for {model_cfg['name']} never became healthy at {base_url}. "
+        f"{eng} for {model_cfg['name']} never became healthy at {base_url}. "
         f"Last lines:\n{tail}"
     )

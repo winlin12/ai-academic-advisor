@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Evaluation harness CLI. Standalone: Python 3.10+, PyYAML and psycopg, nothing from the app.
 
-  python run.py doctor                      diagnose local llama-server reachability
+  python run.py doctor                      diagnose local vLLM reachability
   python run.py check                       validate the program's data, prompts, GPU, models
   python run.py check --major "nursing"        same, against any program in the catalog —
                                              matches `programs.name` or its slug (substring,
@@ -10,7 +10,7 @@
                                              requirement groups and students all come from the
                                              database now, so nothing has to be hand-authored
                                              first (see harness/fixtures.py)
-  python run.py serve <model>               launch llama-server for one model and hold it
+  python run.py serve <model>               launch vLLM for one model and hold it
   python run.py run                         THE SWEEP: two curated majors from every school
                                              (config.yaml `sweep.curated`) plus two random
                                              programs never run here before, each into its own
@@ -18,32 +18,24 @@
   python run.py run --major cs              just one program (see `check --major` above)
   python run.py run [--models a,b] [--brackets 8gb,coder] [--tasks plan_a,plan_b,qa]
   python run.py run --mitigate --models X   mitigation pass (multi-iteration revise loop)
-  python run.py run --no-spec               same sweep with SPECULATIVE DECODING off. On by
-                                             default (config.yaml's `speculative:` block) for
-                                             the models that declare a `draft:`; turn it off
-                                             when the run has to be token-comparable to results
-                                             recorded before it existed — accepting a drafted
-                                             token depends on the target's sampler agreeing,
-                                             so quality numbers do not pool across the setting
   python run.py run --major cs --tasks converge --preflight   MODE C only: check every
                                              scenario is solvable, spend no GPU time
   python run.py run --major cs --tasks converge [--variants blind,feedback] [--scenarios id]
-  python run.py run --major cs --tasks plan_b_thinking   Mode B with reasoning ON, budget-
-                                             capped at config.yaml's thinking.budget_tokens —
-                                             own server, own results/runs_thinking.jsonl,
-                                             never mixed with the --reasoning off baseline.
-                                             OPT-IN: measured 2026-08-21, did not pay
   python run.py report                      results/report.md for the CURRENTLY CONFIGURED
                                              program: plan tables, Mode C, validity guards,
                                              review queue — one file, every mode
   python run.py report --all                results/summary.md aggregating every
                                              results/results_<slug>/ the sweep wrote — every
-                                             arm in one file, thinking included
+                                             arm in one file
   python run.py parity                      check the vendored planner against the app's
 
-The harness starts and stops llama-server itself (see harness/server.py): under llama.cpp,
-context size and GPU/KV settings are launch flags, so "every model saw identical settings"
-is only true if one place owns the command line.
+The harness starts and stops the vLLM server itself (see harness/server.py): context length,
+KV dtype, the memory fraction and the concurrent-sequence bound are all launch flags, so
+"every model saw identical settings" is only true if one place owns the command line.
+
+BACKEND SWITCHED TO vLLM 2026-08-22, from llama.cpp. Nothing recorded before that date pools
+with anything recorded after it — different engine, different weights (W4A16
+compressed-tensors, not GGUF), different timing source. See config.yaml's `vllm:` block.
 """
 
 from __future__ import annotations
@@ -51,6 +43,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
 import socket
 import sys
@@ -67,7 +60,7 @@ def _install_sigterm_handler() -> None:
     `run.py serve`'s `except KeyboardInterrupt: handle.stop()` and `run_eval`'s
     `try/finally: handle.stop()` / `_run_lock`'s `try/finally: lock.unlink()` all work under
     Ctrl-C. SIGTERM gets no such treatment by default — the process dies immediately, the
-    finally blocks never run, and the llama-server subprocess (holding several GB of VRAM) and
+    finally blocks never run, and the vLLM subprocess (holding several GB of VRAM) and
     the `.{tag}.lock` file are both left behind. `timeout <n> run.py ...` and a plain
     `kill <pid>` both send SIGTERM, not SIGINT, and the harness's own launch pattern (nohup +
     disown, run in the background) means there is no terminal for Ctrl-C to reach even when a
@@ -88,7 +81,7 @@ def main() -> None:
     )
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("doctor", help="diagnose local llama-server setup")
+    doctorp = sub.add_parser("doctor", help="diagnose the local inference server setup")
     checkp = sub.add_parser("check", help="validate the program data, prompts, GPU, models")
     checkp.add_argument(
         "--major", help="match any crawled program by name or slug (substring, case-"
@@ -99,13 +92,8 @@ def main() -> None:
                          help="aggregate every results/results_<slug>/ into results/summary.md "
                               "instead of reporting on the single currently-configured fixture")
     sub.add_parser("parity", help="check the vendored planner against the app's")
-    servep = sub.add_parser("serve", help="launch llama-server for one model and hold it")
+    servep = sub.add_parser("serve", help="launch the vLLM server for one model and hold it")
     servep.add_argument("model", help="model name from config.yaml")
-    serve_spec = servep.add_mutually_exclusive_group()
-    serve_spec.add_argument("--spec", dest="spec", action="store_true", default=None,
-                            help="force speculative decoding ON, overriding config.yaml")
-    serve_spec.add_argument("--no-spec", dest="spec", action="store_false",
-                            help="force speculative decoding OFF")
 
     runp = sub.add_parser(
         "run", help="the curated + random sweep by default (results/results_<slug>/ each); "
@@ -113,25 +101,22 @@ def main() -> None:
     runp.add_argument("--models", help="comma-separated model names (default: all)")
     runp.add_argument("--brackets", help="comma-separated brackets: 8gb,coder,server,reference")
     runp.add_argument(
-        "--tasks", help="comma-separated: plan_a,plan_b,qa,explain,converge,plan_b_thinking "
-                        "(default: config.yaml's run.default_tasks; plan_b_thinking is NOT in "
-                        "it — measured 2026-08-21 and it did not pay, see the `thinking:` block)")
+        "--tasks", help="comma-separated: plan_a,plan_b,qa,explain,converge "
+                        "(default: config.yaml's run.default_tasks)")
     runp.add_argument("--mitigate", action="store_true",
                       help="mitigation mode: multi-iteration revise loop; writes "
                            "runs_mitigated.jsonl (plan_a/plan_b/qa/explain only)")
     runp.add_argument("--major", help="run one program instead of the sweep — see "
                                       "`check --major`")
-    # SPECULATIVE DECODING (config.yaml's `speculative:` block; harness/server.py builds the
-    # flags). On by default there for the models that declare a `draft:`; --no-spec forces it
-    # off for a run that has to be comparable to results recorded before it existed, and --spec
-    # forces it on for a config.yaml that has it disabled. Both reach converge and
-    # plan_b_thinking too, since all three launch their servers through the same `build_argv`.
-    spec_group = runp.add_mutually_exclusive_group()
-    spec_group.add_argument("--spec", dest="spec", action="store_true", default=None,
-                            help="force speculative decoding ON, overriding config.yaml")
-    spec_group.add_argument("--no-spec", dest="spec", action="store_false",
-                            help="force speculative decoding OFF — use this when the run must "
-                                 "be token-comparable to a non-speculative one")
+    # SPECULATIVE DECODING, per run. config.yaml carries each model's own setting; this
+    # overrides it for one invocation so the same sweep can be re-run under a different
+    # proposer without editing the file. `none` forces plain decoding, which is what you want
+    # for a run that has to be token-comparable to one recorded before speculation existed —
+    # accepting a drafted token depends on the target's sampler agreeing, so quality numbers
+    # do not pool across the setting.
+    runp.add_argument("--spec", choices=["none", "mtp", "ngram", "draft"], default=None,
+                      help="override config.yaml's speculative method for this run")
+
     # converge-only knobs. No-ops unless "converge" is in --tasks.
     runp.add_argument("--variants", help="converge only: comma-separated blind,feedback "
                                          "(default: config.yaml's convergence.enabled_variants)")
@@ -140,6 +125,16 @@ def main() -> None:
     runp.add_argument("--preflight", action="store_true",
                       help="converge only: validate locked slots and print the prereq-risk "
                            "note, then stop — spends no GPU time and runs no other task")
+
+    # WHICH ENGINE, for every subcommand that launches or inspects a server. Added to the
+    # PARSER ROOT rather than to `run` alone so `doctor`, `check` and `serve` all answer about
+    # the engine you are actually going to use — a `doctor` that always reported on vLLM while
+    # `run` launched llama.cpp would be worse than no doctor.
+    for p in (runp, checkp, servep, doctorp):
+        p.add_argument(
+            "--engine", choices=["llamacpp", "vllm"], default=None,
+            help="inference server to use (default: config.yaml's `engine:`, currently "
+                 "llamacpp). llama.cpp loads the model's `gguf:`; vLLM loads its `model_path:`")
 
     args = ap.parse_args()
 
@@ -160,14 +155,23 @@ def main() -> None:
         print(f"[major] {args.major!r} -> {program['name']} "
               f"[{program['slug']}] ({program['n_options']} requirement options)")
 
-    # SAME PATTERN, SAME REASON as the fixture/program env vars above: `--spec`/`--no-spec` has
-    # to reach every server launch in this process — run_eval's, run_convergence's and
-    # run_thinking_experiment's — and they do not share a call chain. `harness.server.
-    # speculative_enabled` reads this and lets it win over config.yaml's `speculative.enabled`.
+    # SAME PATTERN, SAME REASON as `--major` above: `--spec` has to reach every server launch
+    # in this process, and they do not share a call
+    # chain. `harness.server._speculative_config` reads this and lets it win over config.yaml.
+    # ALWAYS EXPORTED, resolved or defaulted — not only when `--engine` is passed. Several
+    # readers (notably `harness.server.slot_context`, which every caller hands `cfg["run"]` and
+    # not the whole config) can only see this through the environment, so leaving it unset when
+    # the flag is absent would make them silently assume a default that config.yaml may have
+    # overridden.
+    _cfg_engine = (_cfg().get("engine") or "llamacpp")
+    os.environ["MODEL_EVAL_ENGINE"] = getattr(args, "engine", None) or _cfg_engine
+    if getattr(args, "engine", None):
+        print(f"[engine] {args.engine!r} for this run (config.yaml's {_cfg_engine!r} overridden)")
+
     if getattr(args, "spec", None) is not None:
-        os.environ["MODEL_EVAL_SPECULATIVE"] = "1" if args.spec else "0"
-        print(f"[spec] speculative decoding forced {'ON' if args.spec else 'OFF'} "
-              f"for this run (config.yaml overridden)")
+        os.environ["MODEL_EVAL_SPEC"] = args.spec
+        print(f"[spec] speculative decoding forced to {args.spec!r} for this run "
+              f"(config.yaml overridden)")
 
     if args.cmd == "doctor":
         doctor()
@@ -199,6 +203,13 @@ def main() -> None:
 # catalog and hand-written scenarios that only existed for nineteen programs. Both now come from
 # the crawl, so the fixture files — and the ceiling they imposed on which majors could be
 # evaluated at all — are gone.
+
+
+def _llamacpp_env(cfg: dict) -> dict:
+    """`llama-server`'s environment for a one-shot probe — the CUDA libs from the pip-wheel
+    toolkit, which are not on the system linker path. Mirrors `harness.server._server_env`."""
+    from harness.server import _server_env  # noqa: PLC0415
+    return _server_env(cfg)
 
 
 def _pg_url() -> str:
@@ -317,15 +328,10 @@ def _run_single(args, *, results_dir_override: str | None = None) -> None:
         raise SystemExit("No tasks left to run.")
 
     do_converge = "converge" in task_set
-    # `plan_b_thinking` — the pre-plan-reasoning experiment (see `harness.runner.
-    # run_thinking_experiment`). Same special-casing as `converge`: it needs its own server
-    # launch (reasoning ON, budget-capped) and own results file, so it cannot go through
-    # `run_eval`'s normal per-model loop, which launches every model with the baseline's
-    # `--reasoning off`. IT RUNS PER PROGRAM, right after that program's other tasks — not
-    # after the whole sweep — so the first school's thinking results land without waiting for
-    # the last school's. Now part of `run.default_tasks`, so a bare `run.py run` includes it.
-    do_thinking = "plan_b_thinking" in task_set
-    eval_tasks = task_set - {"converge", "plan_b_thinking"}
+    # `plan_b_thinking` REMOVED 2026-08-24 — the pre-plan-reasoning experiment. See
+    # config.yaml's `thinking:` note for the measurements that retired it. A stale `--tasks
+    # plan_b_thinking` is now simply an unknown task and falls out of `task_set` below.
+    eval_tasks = task_set - {"converge"}
 
     if args.preflight:
         # Spends no GPU time, by contract — never falls through to `run_eval` even if other
@@ -339,7 +345,7 @@ def _run_single(args, *, results_dir_override: str | None = None) -> None:
     if results_dir_override is not None:
         os.environ["MODEL_EVAL_RESULTS_DIR"] = results_dir_override
 
-    from harness.runner import ConcurrentRunError, run_eval, run_thinking_experiment
+    from harness.runner import ConcurrentRunError, run_eval
     try:
         if eval_tasks:
             run_eval(
@@ -351,12 +357,6 @@ def _run_single(args, *, results_dir_override: str | None = None) -> None:
             )
         if do_converge:
             _converge_run(args)
-        if do_thinking:
-            run_thinking_experiment(
-                ROOT,
-                models=args.models.split(",") if args.models else None,
-                brackets=args.brackets.split(",") if args.brackets else None,
-            )
     except ConcurrentRunError as exc:
         # A guard, not a crash — print the reason and the fix, not a traceback.
         print(f"refusing to start: {exc}")
@@ -402,7 +402,17 @@ def _run_sweep(args) -> None:
         school_args = copy.copy(args)
         school_args.tasks = ",".join(sorted(task_set)) if task_set else ""
         try:
-            _run_single(school_args, results_dir_override=f"results/results_{pick['slug']}")
+            # RESULTS ROOT IS OVERRIDABLE so two arms of one experiment can be kept apart.
+            # `_run_single` sets MODEL_EVAL_RESULTS_DIR per program, which silently CLOBBERS an
+            # outer MODEL_EVAL_RESULTS_DIR — so setting that env var around a full sweep did
+            # nothing and both arms wrote to the same `results/results_<slug>/` paths.
+            # MEASURED 2026-08-25: an advising-thinking A/B appended both arms into one file
+            # and the comparison had to be reconstructed from `reasoning_chars`.
+            # `MODEL_EVAL_RESULTS_ROOT` is the knob that actually works; it defaults to
+            # `results`, so a plain `run.py run` is unchanged.
+            root_dir = os.environ.get("MODEL_EVAL_RESULTS_ROOT", "results")
+            _run_single(school_args,
+                        results_dir_override=f"{root_dir}/results_{pick['slug']}")
         except SystemExit as exc:
             print(f"  [FAILED] {pick['slug']}: {exc}")
             failed.append(pick["slug"])
@@ -467,29 +477,156 @@ def _converge_run(args) -> None:
 # --- doctor ------------------------------------------------------------------------------------
 
 
+def _check_draft_models(cfg: dict, models_root: Path) -> list[str]:
+    """Is every `draft_model:` pairing one that can actually speculate for its target?
+
+    THE FAILURE THIS EXISTS TO MOVE EARLIER, and it is worse here than it was under llama.cpp.
+    There, a draft whose vocabulary did not match its target aborted the server at load — loud,
+    immediate, unmissable. vLLM does not abort: a draft with a different tokenization proposes
+    token IDS that mean something else to the target, every proposal is rejected, and the run
+    completes normally having spent extra compute to produce exactly the baseline's output. The
+    symptom is "speculative decoding did nothing", which reads as a property of the workload
+    rather than as a broken pairing.
+
+    CHECKED BY ENCODING, NOT BY COUNTING. Two models can report the same `vocab_size` and still
+    tokenize differently — same size is necessary, not sufficient — so this runs a real string
+    through both tokenizers and compares the ids.
+
+    Only models that declare a `draft_model:` are checked; the rest simply cannot use
+    `--spec draft` and `server._speculative_config` says so when asked.
+    """
+    problems: list[str] = []
+    pairs = [(m, m.get("draft_model")) for m in cfg["models"] if m.get("draft_model")]
+    if not pairs:
+        print("\ndraft models: none configured (`--spec draft` unavailable; ngram needs none)")
+        return problems
+
+    print("\ndraft models:")
+    probe = ("Place CS 25100 in semester 3; prerequisites CS 18200 and CS 24000 "
+             "must come earlier.")
+    for model, draft in pairs:
+        path = models_root / draft
+        if not path.is_dir():
+            problems.append(
+                f"model {model['name']} declares draft_model {draft}, which is not on disk at "
+                f"{path}. Download it, or drop `draft_model:` from that entry."
+            )
+            print(f"  {model['name']:16s} MISSING {path}")
+            continue
+        # THE TOKENIZER LIVES IN THE HF CHECKPOINT, NOT THE GGUF. `model_path` is the .gguf
+        # under the default engine and `AutoTokenizer` cannot read one, so this deliberately
+        # reads `model_path_vllm` regardless of which engine is active — the question it asks
+        # ("do target and draft tokenize identically") is a property of the weights, not of the
+        # server. Speculative decoding is a vLLM feature anyway; llama.cpp entries simply have
+        # nothing to verify here.
+        tok_dir = model.get("model_path_vllm")
+        if not tok_dir:
+            print(f"  {model['name']:16s} draft {draft} (UNVERIFIED — no model_path_vllm, "
+                  f"so no tokenizer to compare)")
+            continue
+        try:
+            from transformers import AutoTokenizer  # noqa: PLC0415 - heavy, only needed here
+            a = AutoTokenizer.from_pretrained(str(models_root / tok_dir))
+            b = AutoTokenizer.from_pretrained(str(path))
+            same = a(probe)["input_ids"] == b(probe)["input_ids"]
+        except Exception as exc:  # noqa: BLE001 - an unreadable tokenizer is not a hard failure
+            print(f"  {model['name']:16s} draft {draft} (UNVERIFIED — {type(exc).__name__})")
+            continue
+        if not same:
+            problems.append(
+                f"model {model['name']} cannot be drafted for by {draft}: the two tokenize the "
+                f"same string differently, so every proposal would be rejected and the run "
+                f"would silently measure the baseline at extra cost."
+            )
+            print(f"  {model['name']:16s} TOKENIZER MISMATCH vs {draft}")
+        else:
+            gb = sum(f.stat().st_size for f in path.glob("*.safetensors")) / 1e9
+            print(f"  {model['name']:16s} draft {draft} ({gb:.1f} GB, tokenizer ✓)")
+    return problems
+
+
+def _check_transformers(version: str) -> None:
+    """Warn about a transformers new enough to break `gemma4-26b`.
+
+    CHECKED HERE BECAUSE THE REAL FAILURE IS UNREADABLE. vLLM 0.27.1 requires only
+    `transformers>=5.5.3`, so a fresh `pip install vllm` pulls whatever is newest — and from
+    5.15.0 onward that refuses to answer `config.head_dim` globally for architectures that
+    declare it per layer. Gemma 4 does (`global_head_dim: 512` on its full-attention layers,
+    `head_dim: 256` on the sliding ones), vLLM's `get_head_size()` asks globally anyway, and
+    the result is `AmbiguousGlobalPerLayerAttributeError` several hundred lines into a
+    traceback — which through `model_manager` (stderr to DEVNULL) is not visible at all and
+    surfaces only as a model switch that times out after ten minutes.
+
+    BISECTED 2026-08-22: 5.14.1 works, 5.15.0 is the first broken release, qwen3.8-27b is
+    unaffected on either. A WARNING rather than a hard failure — a future release may well fix
+    it from the vLLM side, and this should not block a run that would have worked.
+    """
+    try:
+        parts = tuple(int(x) for x in version.split(".")[:2])
+    except ValueError:
+        return
+    if parts >= (5, 15):
+        print(f"  ⚠ transformers {version} is >= 5.15.0, which breaks gemma4-26b at config "
+              f"parse (AmbiguousGlobalPerLayerAttributeError on 'head_dim'). "
+              f"Pin it: pip install 'transformers==5.14.1'")
+
+
 def doctor() -> None:
     """The most likely reasons a run fails on this box, diagnosed explicitly.
 
-    llama-server now runs as a native Linux process in this same WSL box (built from
-    ./llama.cpp), so there is no cross-VM networking to diagnose — just: does the binary
-    exist, is a GPU visible, and is the configured port free (or already serving what you
-    expect).
+    vLLM runs as a native Linux process here, driven by `vllm serve` out of the project venv,
+    so there is no cross-machine networking to diagnose — just: is the launcher there, can it
+    import vLLM against a CUDA-visible GPU, and is the configured port free (or already
+    serving what you expect).
     """
-    from harness.server import gpu_memory_used_mb, resolve_host
+    from harness.server import backend_cfg, engine, gpu_memory_used_mb, resolve_host
 
     cfg = _cfg()
-    port = cfg["llamacpp"]["port"]
-    host = resolve_host(cfg["llamacpp"].get("host", "auto"),
-                        cfg["llamacpp"].get("server_exe"))
-    print("=== local llama-server setup ===\n")
+    eng = engine(cfg)
+    backend = backend_cfg(cfg)
+    port = backend["port"]
+    host = resolve_host(backend.get("host", "auto"))
+    print(f"=== local {eng} setup ===\n")
 
-    exe = Path(cfg["llamacpp"]["server_exe"])
-    print(f"llama-server: {'found' if exe.exists() else 'NOT FOUND at ' + str(exe)}")
-    if not exe.exists():
-        print("  Build it: cd llama.cpp && cmake -B build -DGGML_CUDA=on && "
-              "cmake --build build --config Release -j")
+    exe = Path(backend["server_exe"])
+    print(f"{eng} launcher: {'found' if exe.exists() else 'NOT FOUND at ' + str(exe)}")
+    if not exe.exists() and eng == "llamacpp":
+        print("  Build it: source .llamacpp-env.sh && cmake -B build -DGGML_CUDA=ON \\")
+        print("              -DCMAKE_CUDA_ARCHITECTURES=86 && cmake --build build -j 6")
+    elif not exe.exists():
+        print("  Install it into the project venv: .venv/bin/pip install vllm==0.27.1")
+    elif eng == "llamacpp":
+        # THE REAL CHECK FOR llama.cpp IS THAT IT CAN FIND ITS CUDA LIBRARIES, since they come
+        # from pip wheels rather than a system install — `--version` fails outright if not.
+        import subprocess
+        probe = subprocess.run([str(exe), "--version"], capture_output=True, text=True,
+                               timeout=60, env=_llamacpp_env(cfg))
+        out = (probe.stdout + probe.stderr).strip().splitlines()
+        print(f"  {out[0] if out else 'no output'}")
+        dev = subprocess.run([str(exe), "--list-devices"], capture_output=True, text=True,
+                             timeout=60, env=_llamacpp_env(cfg))
+        for line in (dev.stdout + dev.stderr).splitlines():
+            if "CUDA" in line or "no devices" in line.lower():
+                print(f"  {line.strip()}")
+    else:
+        # IMPORTING vLLM IS THE REAL CHECK, not the launcher's existence. The wheel is
+        # torch-plus-CUDA-libraries deep, and the way this fails on a box whose driver, CUDA
+        # runtime and torch build have drifted apart is an ImportError several seconds into a
+        # `vllm serve` that then looks like a model problem. Better to find it here.
+        import subprocess
+        probe = subprocess.run(
+            [str(exe.parent / "python"), "-c",
+             "import vllm, torch, transformers; print(vllm.__version__, torch.__version__, "
+             "torch.cuda.is_available(), torch.cuda.get_device_name(0) "
+             "if torch.cuda.is_available() else 'no-cuda', transformers.__version__)"],
+            capture_output=True, text=True, timeout=180)
+        if probe.returncode == 0:
+            print(f"  imports OK: {probe.stdout.strip()}")
+            _check_transformers(probe.stdout.split()[-1])
+        else:
+            print(f"  IMPORT FAILED: {probe.stderr.strip().splitlines()[-1:]}")
 
-    models_root = Path(cfg["llamacpp"]["models_root"])
+    models_root = Path(backend["models_root"])
     print(f"models_root: {'found' if models_root.exists() else 'NOT FOUND at ' + str(models_root)}")
 
     gpu = gpu_memory_used_mb()
@@ -525,7 +662,7 @@ def check() -> None:
     from harness.plan_scorers import score_plan, plan_to_semesters
     from harness.prompts import PromptBuilder
     from harness.real_db import fixture_from_database, load_real_db
-    from harness.server import gpu_memory_used_mb, slot_context
+    from harness.server import gpu_memory_used_mb, gpu_total_mb, slot_context
 
     cfg = _cfg()
     # Per-SLOT, matching `runner.load_context` exactly — see its comment for why deriving this
@@ -698,8 +835,21 @@ def check() -> None:
     # total context is four students' worth, and a prompt is only ever shown to one of them.
     slot = slot_context(cfg["run"])
     budget = slot - cfg["run"]["max_plan_tokens"]
-    print(f"\nper-slot context: {slot} tokens "
-          f"(num_ctx {cfg['run']['num_ctx']} / parallel {cfg['run'].get('parallel', 1)}), "
+    # PER REQUEST, and not divided by the concurrency under EITHER engine — but for different
+    # reasons, and the line says which. vLLM pages KV, so the window is simply free of
+    # concurrency. llama.cpp buys the same guarantee by pre-allocating `num_ctx * parallel`,
+    # which is why the resolved parallel (see `effective_parallel`) is what gets printed: it is
+    # the number that had to fit in VRAM, and it may be lower than `run.parallel`.
+    from harness.server import effective_parallel, engine  # noqa: PLC0415
+    eng = engine(cfg)
+    par = effective_parallel(cfg)
+    if eng == "llamacpp":
+        how = (f"{par} slot(s) pre-allocated as -c {cfg['run']['num_ctx'] * par}"
+               + ("" if par == cfg["run"].get("parallel", 1)
+                  else f", trimmed from run.parallel {cfg['run'].get('parallel', 1)}"))
+    else:
+        how = f"max_num_seqs {par} does not divide it under paged KV"
+    print(f"\nper-request context: {slot} tokens (num_ctx {cfg['run']['num_ctx']}; {how}), "
           f"minus max_plan_tokens {cfg['run']['max_plan_tokens']} = "
           f"{slot - cfg['run']['max_plan_tokens']} left for the prompt")
     system, user, _ = prompts.plan_freeform(scenario)
@@ -710,36 +860,193 @@ def check() -> None:
             f"the mode B prompt (~{approx} tok) does not leave room to generate within "
             f"num_ctx={cfg['run']['num_ctx']}. Raise num_ctx, or shrink the database export."
         )
-    # Does ONE request still fit? `--parallel` divides the context, so this catches
-    # "parallel 4 quietly made every plan request truncate against the context".
+    # Does ONE request still fit? Under vLLM this is purely a `num_ctx` question — paged KV
+    # means concurrency no longer divides the window the way llama.cpp's `--parallel` did —
+    # but the check is still worth running: the Mode B prompt grows with the program, and a
+    # dual-major scenario has overrun the context before.
     slot_problem = check_slot_context(cfg["run"], approx)
     if slot_problem:
         problems.append(slot_problem)
 
-    # Two entries pointing at the same gguf benchmark ONE model under two names and report a
-    # fake head-to-head. The report's duplicate-NAME guard cannot see this: the names differ.
-    # It is an easy copy-paste mistake — and it has already happened once in this file.
-    by_gguf: dict[str, list[str]] = {}
+    # Two entries pointing at the same checkpoint AND CONFIGURED IDENTICALLY benchmark one
+    # model under several names and report a fake head-to-head. The report's duplicate-NAME
+    # guard cannot see that: the names differ. It is an easy copy-paste mistake — and it has
+    # already happened once in this file.
+    #
+    # SHARING A CHECKPOINT IS LEGITIMATE WHEN THE ENTRIES DIFFER, and since 2026-08-25 that is
+    # how the advising-reasoning comparison is expressed: `qwen3.8-27b` and
+    # `qwen3.8-27b-thinking` are the same weights with `advising_think` flipped, so ONE
+    # `run.py run` produces both arms and every report table shows them as adjacent rows. So
+    # the check is for entries that share a checkpoint and have nothing else to tell them
+    # apart, which is the actual mistake.
+    VARIANT_KEYS = ("advising_think", "think", "speculative", "draft_model", "kv_cache_dtype",
+                    "cpu_offload_gb", "extra_args", "reasoning_parser", "tool_call_parser")
+    by_path: dict[str, list[dict]] = {}
     for model in cfg["models"]:
-        by_gguf.setdefault(model["gguf"], []).append(model["name"])
-    for gguf, names in by_gguf.items():
-        if len(names) > 1:
-            problems.append(
-                f"models {', '.join(names)} all point at the same gguf ({gguf}) — they would "
-                f"benchmark one model under several names and fabricate a head-to-head."
-            )
+        if not model.get("model_path"):
+            continue
+        by_path.setdefault(model["model_path"], []).append(model)
+    for model_path, entries in by_path.items():
+        if len(entries) < 2:
+            continue
+        seen: dict[tuple, str] = {}
+        for m in entries:
+            key = tuple(repr(m.get(k)) for k in VARIANT_KEYS)
+            if key in seen:
+                problems.append(
+                    f"models {seen[key]} and {m['name']} share checkpoint {model_path} and "
+                    f"differ in none of {', '.join(VARIANT_KEYS)} — they would benchmark one "
+                    f"model under two names and fabricate a head-to-head."
+                )
+            seen[key] = m["name"]
 
-    print("\nmodel files:")
-    root = Path(cfg["llamacpp"]["models_root"])
+    # A vLLM MODEL IS A DIRECTORY, not a file — config.json plus safetensors shards plus a
+    # tokenizer — so "does it exist" is three questions, and the two that are not the
+    # directory itself are the ones that produce a confusing failure. A directory holding only
+    # the small files (a download that was interrupted after the metadata, which is the order
+    # `hf download` fetches them in) starts a server that dies minutes later on a missing
+    # tensor; a directory with no config.json fails inside transformers with an error about
+    # the model TYPE rather than about the path.
+    print("\nmodel checkpoints:")
+    from harness.server import backend_cfg, engine, model_dir  # noqa: PLC0415
+    eng = engine(cfg)
+    root = Path(backend_cfg(cfg)["models_root"])
     missing = 0
     for model in cfg["models"]:
-        path = root / model["gguf"]
-        if not path.exists():
+        # WHAT COUNTS AS PRESENT DEPENDS ON THE ENGINE: llama.cpp wants one .gguf FILE, vLLM a
+        # checkpoint DIRECTORY. Checking the wrong one reports every model missing.
+        if eng == "llamacpp":
+            if not model.get("model_path"):
+                missing += 1
+                print(f"  NO PATH  {model['name']}: no `model_path:` in config.yaml "
+                      f"(cannot run under --engine llamacpp)")
+                continue
+            path = model_dir(cfg, model)
+            if not path.is_file():
+                missing += 1
+                print(f"  MISSING  {model['name']}: {path}")
+                continue
+            # A SHARDED GGUF IS ONLY AS PRESENT AS ITS LAST SHARD. `gguf:` names shard 1 and
+            # llama.cpp resolves the rest by filename, so statting the named file alone reports
+            # a 72.5 GB model as "ok, 0.0 GB" while it is still downloading — the check would
+            # greenlight exactly the state it exists to catch. Count the set instead, and say
+            # so when it is short.
+            shards, expected = [path], 1
+            m = re.search(r"-(\d{5})-of-(\d{5})\.gguf$", path.name)
+            if m:
+                expected = int(m.group(2))
+                stem = path.name[: m.start()]
+                shards = sorted(path.parent.glob(f"{stem}-*-of-{m.group(2)}.gguf"))
+            size_gb = sum(f.stat().st_size for f in shards) / 1e9
+            if len(shards) < expected:
+                missing += 1
+                print(f"  PARTIAL  {model['name']}: {len(shards)}/{expected} shards, "
+                      f"{size_gb:.1f} GB so far")
+                continue
+            label = f"{path.name}" if expected == 1 else f"{expected} shards"
+            print(f"  ok       {model['name']}: {label} ({size_gb:.1f} GB)")
+            continue
+        if not model.get("model_path_vllm"):
+            print(f"  n/a      {model['name']}: GGUF-only entry, no vLLM checkpoint "
+                  f"(run it with --engine llamacpp)")
+            continue
+        path = root / model["model_path_vllm"]
+        if not path.is_dir():
             missing += 1
             print(f"  MISSING  {model['name']}: {path}")
-    print(f"  {len(cfg['models']) - missing}/{len(cfg['models'])} gguf files present")
+            continue
+        if not (path / "config.json").exists():
+            missing += 1
+            problems.append(
+                f"model {model['name']} points at {path}, which has no config.json — that is "
+                f"a directory, but not a Hugging Face checkpoint."
+            )
+            print(f"  NO CONFIG {model['name']}: {path}")
+            continue
+        shards = list(path.glob("*.safetensors"))
+        gb = sum(f.stat().st_size for f in shards) / 1e9
+        if not shards:
+            missing += 1
+            problems.append(
+                f"model {model['name']} at {path} has a config.json but no .safetensors "
+                f"shards — an interrupted download looks exactly like this, and the server "
+                f"will not fail until it is several minutes into loading."
+            )
+            print(f"  NO WEIGHTS {model['name']}: {path}")
+            continue
+        quant = "?"
+        try:
+            import json as _json
+            quant = ((_json.loads((path / "config.json").read_text())
+                      .get("quantization_config") or {}).get("quant_method") or "unquantized")
+        except (OSError, ValueError):
+            pass
+        print(f"  {model['name']:16s} {len(shards)} shard(s), {gb:5.1f} GB, {quant}")
+    print(f"  {len(cfg['models']) - missing}/{len(cfg['models'])} checkpoints present")
 
-    problems += _check_speculative(cfg, root)
+    # WILL THE BIGGEST ONE EVEN FIT? Weights plus KV have to live inside
+    # `gpu_memory_utilization` of the card, and the failure mode when they nearly do is not a
+    # crash — vLLM sizes a tiny KV pool and serves one sequence at a time, which reads as a
+    # slow model rather than a misconfiguration.
+    gpu_total = gpu_total_mb()
+    if gpu_total:
+        # THE BUDGET IS AN ENGINE-SPECIFIC NUMBER, and using vLLM's under llama.cpp produced
+        # four false alarms: it flagged qwen3.8-27b's 23.1 GB gguf against a "22.1 GB budget"
+        # and predicted concurrency capped at one request, while the model MEASURABLY loads at
+        # 22,322 MiB and serves three slots. vLLM reserves `gpu_memory_utilization` of the card
+        # up front and sizes its KV pool inside that; llama.cpp allocates weights and KV as it
+        # needs them and simply fails if they do not fit, so the whole card is the budget, less
+        # what the layers it spills to CPU do not occupy.
+        # ⚠ GiB THROUGHOUT. `gpu_total_mb()` returns MiB, so `/1024` is GiB — but file sizes
+        # were being divided by 1e9, which is decimal GB, and the two were compared directly.
+        # That is a 7.4% error in the direction of false alarms: qwen3.8-27b's gguf is 23.1 GB
+        # = 21.5 GiB, and against a "24.0" that was really 23.99 GiB it was reported as nearly
+        # overflowing a card it MEASURABLY loads into at 22,322 MiB with room for three slots.
+        if eng == "llamacpp":
+            budget_gib = gpu_total / 1024
+        else:
+            budget_gib = gpu_total / 1024 * float(cfg["vllm"].get("gpu_memory_utilization", 0.92))
+        for model in cfg["models"]:
+            if eng == "llamacpp":
+                if not model.get("model_path"):
+                    continue
+                path = model_dir(cfg, model)
+                if not path.is_file():
+                    continue
+                weights_gib = path.stat().st_size / 2**30
+                # SHARDS COUNT TOGETHER, and offloaded experts do not count at all: an entry
+                # with `n_cpu_moe` deliberately keeps most of its weights in system RAM, so
+                # comparing the full checkpoint size against VRAM would flag exactly the models
+                # that are configured correctly. qwen3.8-flash-next is 72.5 GB on disk and
+                # occupies 21.5 GB of card.
+                m_sh = re.search(r"-(\d{5})-of-(\d{5})\.gguf$", path.name)
+                if m_sh:
+                    stem = path.name[: m_sh.start()]
+                    weights_gib = sum(f.stat().st_size for f in
+                                      path.parent.glob(f"{stem}-*-of-{m_sh.group(2)}.gguf")) / 2**30
+                if model.get("n_cpu_moe"):
+                    continue
+            else:
+                if not model.get("model_path_vllm"):
+                    continue
+                path = root / model["model_path_vllm"]
+                if not path.is_dir():
+                    continue
+                weights_gib = sum(f.stat().st_size for f in path.glob("*.safetensors")) / 2**30
+            if weights_gib and weights_gib > budget_gib * 0.9:
+                problems.append(
+                    f"model {model['name']} is ~{weights_gib:.1f} GiB of weights against a "
+                    f"~{budget_gib:.1f} GiB budget on a {gpu_total / 1024:.1f} GiB card"
+                    + ("" if eng == "llamacpp" else
+                       f" (gpu_memory_utilization "
+                       f"{cfg['vllm'].get('gpu_memory_utilization', 0.92)})")
+                    + f". What is left for the KV cache will cap concurrency; "
+                      f"check `kv_cache` in the run's meta_*.json before believing any "
+                      f"throughput number from it."
+                )
+
+
+    problems += _check_draft_models(cfg, root)
 
     gpu = gpu_memory_used_mb()
     print(f"\nnvidia-smi: {'available, ' + str(gpu) + ' MB used' if gpu else 'NOT available'}")
@@ -752,75 +1059,6 @@ def check() -> None:
     print("\n✅ check passed. Run `python run.py doctor` before the first run on a new box.")
 
 
-def _check_speculative(cfg: dict, models_root: Path) -> list[str]:
-    """Is every model's draft pairing one llama-server will actually accept?
-
-    THE FAILURE THIS EXISTS TO MOVE EARLIER. A draft whose vocabulary doesn't match its target's
-    is not a warning in llama.cpp — the server aborts, and it aborts at load time, several
-    minutes into the run, once per model, where it reads as "that model is broken" rather than
-    "that draft doesn't belong to it". Vocabulary sizes come from the ggufs' own headers
-    (`gguf_vocab_size`), so this checks the files on disk rather than trusting config.yaml's
-    comment about which families share a tokenizer.
-
-    The 100-token tolerance is llama.cpp's own (`SPEC_VOCAB_MAX_SIZE_DIFFERENCE`): a draft may
-    differ by a handful of added special tokens, but not by a whole tokenizer.
-    """
-    from harness.server import gguf_vocab_size, resolve_draft, speculative_enabled
-
-    problems: list[str] = []
-    if not speculative_enabled(cfg):
-        print("\nspeculative decoding: OFF "
-              "(config.yaml `speculative.enabled: false`, or MODEL_EVAL_SPECULATIVE=0)")
-        return problems
-
-    spec = cfg.get("speculative") or {}
-    print(f"\nspeculative decoding: ON — draft {spec.get('draft_gguf')!r} "
-          f"(n_max {spec.get('n_max', 4)}, p_min {spec.get('p_min', 0.75)})")
-    vocab_cache: dict[Path, int | None] = {}
-
-    def vocab(path: Path) -> int | None:
-        if path not in vocab_cache:
-            vocab_cache[path] = gguf_vocab_size(path)
-        return vocab_cache[path]
-
-    for model in cfg["models"]:
-        try:
-            draft_path = resolve_draft(cfg, model)
-        except ValueError as exc:
-            problems.append(str(exc))
-            continue
-        if draft_path is None:
-            print(f"  {model['name']:22s} no draft — plain decoding")
-            continue
-        if not draft_path.exists():
-            problems.append(
-                f"model {model['name']} speculates against {draft_path}, which does not exist. "
-                f"Download it, or drop `draft:` from that entry."
-            )
-            print(f"  {model['name']:22s} MISSING DRAFT {draft_path}")
-            continue
-        target_vocab, draft_vocab = vocab(models_root / model["gguf"]), vocab(draft_path)
-        if target_vocab is None or draft_vocab is None:
-            # Unreadable header. Not a hard failure — the ggufs may still be fine and only the
-            # cheap metadata scan gave up — but say so rather than implying it was verified.
-            print(f"  {model['name']:22s} draft {draft_path.name} "
-                  f"(vocab UNVERIFIED — could not read a gguf header)")
-            continue
-        delta = abs(target_vocab - draft_vocab)
-        if delta > 100:
-            problems.append(
-                f"model {model['name']} (vocab {target_vocab}) cannot be drafted for by "
-                f"{draft_path.name} (vocab {draft_vocab}) — llama.cpp allows a difference of "
-                f"at most 100 tokens and aborts the server at load otherwise. Use a draft from "
-                f"the same model family, or drop `draft:` from that entry."
-            )
-            print(f"  {model['name']:22s} VOCAB MISMATCH {target_vocab} vs {draft_vocab}")
-        else:
-            print(f"  {model['name']:22s} draft {draft_path.name} "
-                  f"(vocab {target_vocab}{'' if delta == 0 else f' vs {draft_vocab}'} ✓)")
-    return problems
-
-
 def _load_questions(cfg: dict) -> list:
     import yaml
     path = ROOT / cfg["paths"]["questions"]
@@ -831,7 +1069,7 @@ def _load_questions(cfg: dict) -> list:
 
 
 def serve(model_name: str) -> None:
-    """Launch llama-server for one model with the harness's exact settings and hold it.
+    """Launch the vLLM server for one model with the harness's exact settings and hold it.
 
     Useful for eyeballing a model by hand, or pointing the real backend at an eval model
     without hand-copying flags out of config.yaml.
@@ -846,10 +1084,10 @@ def serve(model_name: str) -> None:
         sys.exit(1)
 
     handle = start_server(cfg, matches[0], ROOT / "results" / "server_logs")
-    print(f"llama-server up: {handle.base_url}")
+    print(f"vLLM up: {handle.base_url}")
     print(f"  argv: {' '.join(handle.argv)}")
     print(f"  log:  {handle.log_path}")
-    print(f"  offload: {handle.offload()}")
+    print(f"  kv cache: {handle.kv_cache()}")
     print("\nCtrl-C to stop.")
     try:
         handle.process.wait()

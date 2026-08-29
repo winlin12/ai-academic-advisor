@@ -1,34 +1,46 @@
-"""llama.cpp HTTP client for the advisor's chat side (replaces the Ollama transport).
+"""vLLM HTTP client for the advisor's chat side (replaces the llama.cpp transport, which
+replaced Ollama before it).
 
-Production target: the FastAPI process and llama.cpp's server (``llama-server``) run on the
-SAME box (the RTX 2060 Super server, 24/7) — so the default base URL is plain ``localhost``.
-This is not a "local for dev only" shortcut; it is the real production topology.
+Production target: the FastAPI process and the vLLM server run on the SAME box (now a single
+RTX 3090 Ti 24GB, replacing the RTX 3060 + RTX 2060 Super pair) — so the default base URL is
+loopback. This is not a "local for dev only" shortcut; it is the real production topology.
 
-Talks to llama-server's OpenAI-compatible ``/v1/chat/completions`` endpoint — the model's own
-chat template (Qwen2.5's ChatML) is applied server-side from the gguf's embedded metadata, so
-callers only ever hand over system/user text, never a hand-rolled prompt string. Same surface
-as the Ollama client it replaces, so callers (``advisor_agent.py``, ``rag/pipeline.py``, the
-``advisor`` router) barely change:
+WHY THE ENGINE CHANGED, 2026-08-22. llama.cpp pre-allocated its context window and DIVIDED it
+between `--parallel` slots, so serving a second student concurrently halved the window each of
+them got — and measured ~18% slower in aggregate than serving them one at a time (see
+model_eval/config.yaml's `parallel`). The deployed server therefore ran one slot, and a second
+student simply queued. vLLM pages the KV cache by the block: every concurrent request gets the
+full `--max-model-len`, and concurrency is bounded by the size of the KV pool instead. For an
+app whose entire shape is "several students on a site at once", that is the difference that
+matters. Prefix caching is the second win — every request here opens with the same system
+prompt and the same rendered requirement export, which is now prefilled once rather than per
+call.
+
+Talks to the OpenAI-compatible ``/v1/chat/completions`` endpoint — the model's own chat
+template is applied server-side from the checkpoint's tokenizer config, so callers only ever
+hand over system/user text, never a hand-rolled prompt string. The surface is unchanged from
+the llama.cpp client, so callers (``advisor_agent.py``, ``rag/pipeline.py``, the ``advisor``
+router) needed no logic changes:
 
     generate()  -- free-text answer (ask / explain-plan).
-    propose()   -- schema-enforced structured output (revise-plan). llama.cpp's grammar-
-                   constrained decoding (``response_format={"type": "json_schema", ...}``)
-                   converts the schema to a GBNF grammar server-side — stricter than Ollama's
-                   format=<schema>, which only constrained JSON *syntax* — but still doesn't
-                   enforce every schema keyword (e.g. minLength/pattern), so ``propose()``
-                   keeps the same Pydantic-validate-then-retry-once mitigation.
+    propose()   -- schema-enforced structured output (revise-plan). vLLM constrains decoding
+                   to the schema through xgrammar rather than llama.cpp's GBNF, but the
+                   contract is the same and so is the caveat: it does not enforce every schema
+                   keyword (e.g. minLength/pattern), so ``propose()`` keeps the same
+                   Pydantic-validate-then-retry-once mitigation.
     health()    -- reachability + "is the loaded model the configured one" probe, zero
                    inference (hits /health and /v1/models, never /v1/chat/completions).
 
-Unlike Ollama, llama.cpp's context size and the loaded model are fixed when ``llama-server``
-is *launched* (``--ctx-size``, ``--model``) — there is no per-request num_ctx override and no
-dynamic model pull/unload. If the configured LLAMACPP_MODEL doesn't match what the running
-server was started with, health() flags it; fixing it means restarting llama-server, not
-changing a request payload.
+The context size and the loaded model are still fixed when the server is *launched*
+(``--max-model-len``, ``--model``) — there is no per-request context override and no dynamic
+model pull/unload. If the configured VLLM_MODEL doesn't match what the running server was
+started with, health() flags it; fixing it means relaunching the server (see
+services/model_manager.py, which owns that), not changing a request payload.
 
-Model default is ``Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf`` — model_eval/'s verdict for the
-2060 Super's 8GB budget: best quality among the 8GB-class models tried, and code-tuned
-pretraining measurably helped this app's SQL-shaped retrieval/summarization tasks.
+TWO TIMING NOTES for anyone reading the logs. There is no ``timings`` block in a vLLM response
+— llama.cpp's ``prompt_ms``/``predicted_ms`` are simply gone — so ``_log_usage`` reports wall
+clock instead. And a slow request no longer means a slow model: it can now mean queued behind
+other students, a state the single-slot llama.cpp deployment could not be in.
 """
 
 from __future__ import annotations
@@ -37,6 +49,7 @@ import ipaddress
 import json
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Any, TypeVar
 from urllib.parse import urlparse
@@ -64,12 +77,12 @@ def strip_reasoning(text: str) -> str:
 
 
 class LocalModelEndpointError(ValueError):
-    """LLAMACPP_BASE_URL points somewhere that isn't local/self-hosted while
-    llamacpp_local_only is set — a misconfiguration guard, not a security boundary."""
+    """VLLM_BASE_URL points somewhere that isn't local/self-hosted while
+    vllm_local_only is set — a misconfiguration guard, not a security boundary."""
 
 
-class LlamaCppConnectionError(RuntimeError):
-    """Could not reach llama-server at all (down, wrong port, network)."""
+class VllmConnectionError(RuntimeError):
+    """Could not reach the vLLM server at all (down, wrong port, network)."""
 
 
 class ModelResponseError(RuntimeError):
@@ -126,7 +139,7 @@ def _extract_json_object(text: str) -> str:
     return fenced.group(1).strip() if fenced else cleaned
 
 
-class LlamaCppClient:
+class VllmClient:
     def __init__(
         self,
         model: str | None = None,
@@ -136,34 +149,39 @@ class LlamaCppClient:
         max_tokens: int | None = None,
         timeout: float | None = None,
     ):
-        self.base_url = (base_url or settings.llamacpp_base_url).rstrip("/")
-        self.model = model or settings.llamacpp_model
-        self.temperature = temperature if temperature is not None else settings.llamacpp_temperature
-        self.max_tokens = max_tokens or settings.llamacpp_max_tokens
-        self.timeout = timeout if timeout is not None else settings.llamacpp_timeout_s
+        self.base_url = (base_url or settings.vllm_base_url).rstrip("/")
+        self.model = model or settings.vllm_model
+        self.temperature = temperature if temperature is not None else settings.vllm_temperature
+        self.max_tokens = max_tokens or settings.vllm_max_tokens
+        self.timeout = timeout if timeout is not None else settings.vllm_timeout_s
 
-        if settings.llamacpp_local_only and not is_local_model_endpoint(self.base_url):
+        if settings.vllm_local_only and not is_local_model_endpoint(self.base_url):
             raise LocalModelEndpointError(
-                "LLAMACPP_BASE_URL must point to a local or self-hosted model endpoint. "
+                "VLLM_BASE_URL must point to a local or self-hosted model endpoint. "
                 "Allowed examples include localhost, LAN/private IPs, Tailscale IPs, "
                 "host.docker.internal, and local Docker service names. Set "
-                "LLAMACPP_LOCAL_ONLY=false to lift this guard."
+                "VLLM_LOCAL_ONLY=false to lift this guard."
             )
 
     def _log_usage(self, endpoint: str, data: dict[str, Any]) -> None:
-        # The cost/capacity dashboard: a rising prompt_ms on already-warm requests or an
-        # unexpected completion_tokens spike flags a context-builder bug or GPU contention.
+        # The cost/capacity dashboard: an unexpected completion_tokens spike flags a
+        # context-builder bug, and a rising elapsed on already-warm requests flags GPU
+        # contention — which under vLLM now includes "queued behind other students", a state
+        # the single-slot llama.cpp deployment could not be in.
+        #
+        #
+        # NO prompt_ms/predicted_ms. Those were llama.cpp's own counters, returned in a
+        # `timings` block vLLM does not send; reading them here logged None on every request
+        # for a while before this was noticed. Wall-clock elapsed is what is left, and it is
+        # the number that matches what the student experienced anyway.
         usage = data.get("usage") or {}
-        timings = data.get("timings") or {}
         logger.info(
-            "llamacpp %s: model=%s prompt_tokens=%s completion_tokens=%s "
-            "prompt_ms=%s predicted_ms=%s",
+            "vllm %s: model=%s prompt_tokens=%s completion_tokens=%s elapsed_s=%.2f",
             endpoint,
             self.model,
             usage.get("prompt_tokens"),
             usage.get("completion_tokens"),
-            timings.get("prompt_ms"),
-            timings.get("predicted_ms"),
+            data.get("_elapsed_s", float("nan")),
         )
 
     async def _chat_raw(
@@ -187,7 +205,7 @@ class LlamaCppClient:
         }
         # SEED IS WHAT MAKES "REGENERATE" MEAN ANYTHING. At temperature 0.15 an identical
         # request returns a near-identical answer, so a student pressing regenerate on a plan
-        # they dislike would get the same plan back. llama-server takes a per-request seed;
+        # they dislike would get the same plan back. vLLM takes a per-request seed;
         # callers vary it (services/ai_planner.py bumps it per attempt) to resample properly
         # rather than by nudging temperature, which would also change answer quality.
         if seed is not None:
@@ -196,17 +214,18 @@ class LlamaCppClient:
             payload["response_format"] = response_format
 
         timeout = self.timeout
+        started = time.perf_counter()
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
                 resp = await client.post(f"{self.base_url}/v1/chat/completions", json=payload)
         except httpx.ConnectError as exc:
-            raise LlamaCppConnectionError(
-                f"Cannot reach llama.cpp server at {self.base_url} — is llama-server running? "
+            raise VllmConnectionError(
+                f"Cannot reach the vLLM server at {self.base_url} — is it running? "
                 f"(production target: co-located on the same box as this backend)"
             ) from exc
         except httpx.TimeoutException as exc:
-            raise LlamaCppConnectionError(
-                f"llama.cpp server at {self.base_url} timed out after {timeout:g}s "
+            raise VllmConnectionError(
+                f"vLLM server at {self.base_url} timed out after {timeout:g}s "
                 f"(model={self.model})"
             ) from exc
 
@@ -214,10 +233,15 @@ class LlamaCppClient:
             resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
             raise ModelResponseError(
-                f"llama.cpp server at {self.base_url} returned {resp.status_code}: "
+                f"vLLM server at {self.base_url} returned {resp.status_code}: "
                 f"{resp.text[:300]}"
             ) from exc
-        return resp.json()
+        data = resp.json()
+        # Wall clock for this request, carried on the response so `_log_usage` can report it
+        # without every call site threading a timer through. Underscore-prefixed because it is
+        # NOT part of the OpenAI response shape and nothing but the logger should read it.
+        data["_elapsed_s"] = time.perf_counter() - started
+        return data
 
     async def generate(
         self,
@@ -248,9 +272,9 @@ class LlamaCppClient:
     ) -> T:
         """Schema-constrained generation, validated against ``output_type``.
 
-        llama.cpp's ``response_format={"type": "json_schema", ...}`` converts the schema to a
-        GBNF grammar and constrains decoding to it — stricter than Ollama's old format=<schema>
-        (syntax-only), but still no hard guarantee on every schema keyword. One retry with the
+        ``response_format={"type": "json_schema", ...}`` compiles the schema into a decoding
+        constraint server-side (xgrammar under vLLM, GBNF under the llama.cpp client this
+        replaces) — but still no hard guarantee on every schema keyword. One retry with the
         validation error appended (same mitigation validated in model_eval/) before raising.
 
         ``schema`` overrides the one derived from ``output_type``, for callers that can narrow
@@ -304,8 +328,9 @@ class LlamaCppClient:
                 resp.raise_for_status()
         except httpx.ConnectError:
             return False, (
-                f"Cannot reach llama.cpp server at {self.base_url}. Is it running? "
-                f"(`llama-server -m {self.model} ...`, or check the systemd service.)"
+                f"Cannot reach the vLLM server at {self.base_url}. Is it running? "
+                f"(`vllm serve <checkpoint> --served-model-name {self.model} ...`, or check "
+                f"the systemd service.)"
             )
         except Exception as exc:  # noqa: BLE001 - health probe must never raise
             return False, str(exc)
@@ -317,16 +342,20 @@ class LlamaCppClient:
                 data = resp.json()
         except Exception as exc:  # noqa: BLE001 - /health passed; this is best-effort extra info
             return True, (
-                f"llama.cpp reachable at {self.base_url}; could not confirm the loaded model "
+                f"vLLM reachable at {self.base_url}; could not confirm the loaded model "
                 f"({exc})."
             )
 
+        # AN EXACT MATCH ON THE SERVED NAME, not a basename comparison. Under llama.cpp
+        # /v1/models reported the gguf PATH the process was launched with, so the check had to
+        # reduce both sides to a filename. vLLM reports `--served-model-name` verbatim — the
+        # same short name config.py holds — so any difference here is a real mismatch rather
+        # than a path-shape artifact.
         loaded_ids = [m.get("id", "") for m in data.get("data", [])]
-        wanted = Path(self.model).name
-        if not any(Path(loaded_id).name == wanted for loaded_id in loaded_ids):
+        if self.model not in loaded_ids:
             return False, (
-                f"llama.cpp is reachable at {self.base_url} but the loaded model "
+                f"vLLM is reachable at {self.base_url} but the loaded model "
                 f"({loaded_ids or 'unknown'}) doesn't match the configured {self.model!r}. "
-                f"Restart llama-server with `-m {self.model}`."
+                f"Relaunch it with `--served-model-name {self.model}`."
             )
-        return True, f"llama.cpp reachable at {self.base_url}; model {self.model!r} is loaded."
+        return True, f"vLLM reachable at {self.base_url}; model {self.model!r} is loaded."

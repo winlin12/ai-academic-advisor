@@ -1,0 +1,5 @@
+=============== ARM: advising_thinking=false -> results/advising_off/
+[run] 2 model(s), tasks=['explain', 'qa'] -> /home/wylin/ai-academic-advisor/model_eval/results/advising_off/results_nursing/runs_baseline.jsonl (mode=w)
+
+=== qwen3.8-27b (server) ===
+[env] qwen3.8-27b: vram_delta=[22929] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 44877, 'max_concurrency': 2.74, 'per_request_tokens': 16384} n_ctx=16384

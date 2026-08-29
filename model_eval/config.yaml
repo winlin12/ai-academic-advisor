@@ -1,12 +1,195 @@
-llamacpp:
-  server_exe: "/home/wylin/ai-academic-advisor/llama.cpp/build/bin/llama-server"
+# --- HARDWARE, 2026-08-29 ------------------------------------------------------------------
+# THE RTX 3090 Ti IS BACK IN (24,564 MiB, Ampere, compute capability 8.6) and the 8 GB 2060
+# SUPER is out. It was in the box for two days, 2026-08-27 to 2026-08-29; entries that were
+# removed or retuned for it say so where they stand, and their numbers are kept because they
+# are real measurements of what expert offload costs, not because they still bind.
+#
+# ⚠ THE CARD SWAP BREAKS THE BUILD BEFORE IT BREAKS THE FIT, IN BOTH DIRECTIONS, AND IT DOES
+# NOT LOOK LIKE A BUILD PROBLEM. `.llamacpp-src/build` compiles for ONE compute capability. Run
+# a binary built for the other card and every model LOADS FINE and then aborts at the first
+# decode with
+#
+#   CUDA error: no kernel image is available for execution on the device
+#   ggml_cuda_kernel_can_use_pdl at ggml/src/ggml-cuda/common.cuh
+#
+# — which reads like a broken model, because the load succeeded. Rebuilt for 86 on 2026-08-29
+# (it was 86 until 08-27, then 75 for the 2060 SUPER, now 86 again). IF THIS SWAP IS GOING TO
+# KEEP HAPPENING, build `-DCMAKE_CUDA_ARCHITECTURES="75;86"` once and stop paying for it: one
+# binary carries kernels for both cards, at the cost of roughly double the CUDA compile time
+# and a larger `libggml-cuda.so`. See the `llamacpp.server_exe` note.
+#
+# vLLM IS INSTALLABLE AGAIN but `engine: llamacpp` stays, as it has since 2026-08-26. The
+# reason is qwen3.8-flash-next, which has no vLLM-loadable checkpoint that fits — see its entry.
+#
+# WHAT RUNS: qwen3.8-27b and gemma4-26b entirely on the card (21.57 and 21.57 GiB of weights,
+# no offload flags at all), and qwen3.8-flash-next with its experts split between the card and
+# system RAM, which is the only entry `n_cpu_moe` still means anything for.
+
+# --- INFERENCE BACKEND ---------------------------------------------------------------------
+# vLLM SINCE 2026-08-22, replacing llama.cpp. The switch was made when the dual-card rig
+# (RTX 3060 12 GB + RTX 2060 SUPER 8 GB, both power-limited) was replaced by a single
+# RTX 3090 Ti 24 GB. Every llama.cpp knob this file used to carry — `n_gpu_layers`,
+# `n_cpu_moe`, `--tensor-split`, `--mlock`, the whole `speculative:` block — existed to fit a
+# model across two mismatched cards. On one card with headroom they are all no-ops, and what
+# is left to spend is concurrency, which is the thing llama.cpp could not spend: it
+# pre-allocated the context window and DIVIDED it between `--parallel` slots, where vLLM pages
+# KV per block and gives every concurrent request the full `--max-model-len`.
+#
+# READ THIS BEFORE COMPARING ANY NUMBER TO AN OLDER RUN. The weights changed with the engine —
+# W4A16 `compressed-tensors` here, GGUF Q4_K_M/Q6_K before — so quality numbers recorded under
+# this config do NOT pool with anything in `results_full_3060/` or `results_full/`. It is a new
+# series. Throughput is not comparable either, and for a second reason: timings are wall-clock
+# derived now rather than read from the engine (see harness/vllm_client.py).
+vllm:
+  # `vllm serve` from the project venv. The harness only ever talks HTTP to the server, so it
+  # does not need vLLM importable in its own interpreter — this is the one place the two meet.
+  server_exe: "/home/wylin/ai-academic-advisor/.venv/bin/vllm"
   models_root: "/home/wylin/ai-academic-advisor/models"
   host: "auto"
   port: 8099
-  startup_timeout_s: 900
-  cooldown_s: 5 
-  log_verbosity: 5
+  # GENEROUS ON PURPOSE. Loading ~19 GB of weights is the small half; vLLM then profiles a
+  # forward pass to size the KV pool and captures CUDA graphs, and a model's FIRST launch also
+  # populates a compilation cache that later launches reuse. A cold start can be several
+  # minutes longer than a warm one, and timing out mid-compile looks exactly like a broken
+  # model.
+  startup_timeout_s: 1800
+  cooldown_s: 5
   keep_log_lines: 400
+  gpu_memory_utilization: 0.92
+  kv_cache_dtype: "fp8"
+
+# --- ENGINE SELECTION ----------------------------------------------------------------------
+# WHICH INFERENCE SERVER `run.py` LAUNCHES. `run.py --engine {llamacpp,vllm}` overrides this
+# for one invocation (it sets MODEL_EVAL_ENGINE, the same mechanism `--spec` and `--major` use
+# to reach a call chain they do not thread a parameter through).
+#
+# THE TWO ARE NOT INTERCHANGEABLE AND THE DIFFERENCE IS CONCURRENCY. MEASURED on this box
+# 2026-08-26, qwen3.8-27b UD-Q6_K_M fully GPU-resident under llama.cpp:
+#
+#   load                6 s          (vLLM: minutes — it profiles and captures CUDA graphs)
+#   raw prefill       1141 tok/s
+#   raw decode        25.9 tok/s
+#   8.7k prompt+128    13.7 s serial
+#   -c 65536 --parallel 4  ->  CUDA OUT OF MEMORY
+#
+# That last line is the whole tradeoff. llama.cpp pre-allocates ONE KV pool of `-c` and the
+# slots share it (`kv_unified`), so four concurrent 16k requests need `-c 65536`, and 21.49 GiB
+# of weights plus that pool does not fit in 23.55 GiB. vLLM pages KV per block, so `parallel: 4`
+# costs KV but not window. Under llama.cpp `slot_context` therefore goes back to dividing —
+# see harness/server.py.
+#
+# ⚠ RESULTS DO NOT POOL ACROSS ENGINES, and here not across weights either: GGUF Q6_K here
+# against W4A16 compressed-tensors under vLLM. Every `env` record carries `engine` so a file
+# can be told apart. This is a THIRD series after `results_full_3060/` and `results_full/`.
+engine: llamacpp
+
+# --- llama.cpp BACKEND ---------------------------------------------------------------------
+llamacpp:
+  # Built from source 2026-08-26 against PR #27742 (`model: add Qwen3.8-Flash-Next (qwen4exp)`),
+  # which is a DRAFT and the only branch that can load the Flash-Next GGUF — and that entry is
+  # live again as of 2026-08-29, so this checkout is load-bearing once more: rebase it away and
+  # qwen3.8-flash-next stops loading. CUDA came from
+  # pip wheels assembled into `.cudatoolkit` by `.llamacpp-env.sh` — there is no system CUDA and
+  # no sudo on this box. Rebuild: see that script, then
+  #   cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 && cmake --build build
+  #
+  # ⚠ THIS NUMBER HAS TO MATCH THE CARD AND HAS ALREADY BEEN WRONG TWICE. 86 for the 3090 Ti
+  # (Ampere), 75 for the 2060 SUPER (Turing). A binary built for the wrong one LOADS THE MODEL
+  # AND THEN ABORTS ("no kernel image is available for execution on the device"), so this is the
+  # first thing to check when a model that used to work dies in `llama_decode` at startup —
+  # it does not present as a build error. `"75;86"` builds a binary that survives the swap.
+  server_exe: "/home/wylin/ai-academic-advisor/.llamacpp-src/build/bin/llama-server"
+  models_root: "/home/wylin/ai-academic-advisor/models"
+  host: "auto"
+  port: 8098
+  # SECONDS. Nothing like vLLM's 1800 is needed — there is no forward-pass profile and no CUDA
+  # graph capture, so a 21 GiB model is serving in ~6 s. Kept generous anyway because
+  # Flash-Next reads 72.5 GB off disk into page cache on a cold start.
+  startup_timeout_s: 900
+  cooldown_s: 5
+  keep_log_lines: 400
+  # KV QUANTIZATION, the llama.cpp spelling of `kv_cache_dtype: fp8`. q8_0 halves KV bytes per
+  # token, which is what buys concurrency back on a card this full.
+  cache_type_k: "q8_0"
+  cache_type_v: "q8_0"
+  # LAYERS ONTO THE GPU. 99 means "all of them"; a model that does not fit says so at load
+  # rather than silently thrashing. Per-model `n_gpu_layers` overrides it.
+  n_gpu_layers: 99
+  # REQUIRED TO QUANTIZE THE V CACHE, not just a speed knob — `-ctv q8_0` is silently ignored
+  # without it. Per-model override exists because an arch with a custom attention path may not
+  # support it.
+  flash_attn: "on"
+  # HOW WEIGHTS REACH MEMORY (`--mlock`/`--no-mmap` are deprecated in this build). `auto` mmaps
+  # and lets the OS evict; `mmap+mlock` pins. Pinning is right for a model that FITS and fatal
+  # for one that does not — see qwen3.8-flash-next, which must stay evictable.
+  load_mode: "auto"
+  # Verbosity 5 is the only level that logs per-layer device assignment, which is how you tell
+  # a fully-offloaded model from one silently half on the CPU.
+  log_verbosity: 5
+
+  # --- SPECULATIVE DECODING (restored 2026-08-26) -------------------------------------------
+  # MEASURED on the pre-vLLM harness, one ~1841-token plan generation, spec vs --no-spec:
+  #
+  #   qwen3.6-27b   18.65 -> 25.04 tok/s  (+34%)   96.7% of drafted tokens accepted
+  #   qwen3.5-9b    52.44 -> 53.87 tok/s  (+2.7%)  96.0% accepted
+  #
+  # The gain scales with how expensive the TARGET is per token, which is why it was worth 34%
+  # on the 27B and nothing on the 9B — and why it should be worth most on qwen3.8-flash-next,
+  # whose ~22 tok/s decode is bound by reading expert weights over DDR4-2666.
+  #
+  # MEASURED AGAIN ON THIS BOX 2026-08-26, qwen3.8-27b UD-Q6_K_M, 12,255-token prompt, 227
+  # tokens generated, identical seed and sampler:
+  #
+  #   --spec-type none          23.0 tok/s   (baseline)
+  #   --spec-type draft-simple  47.5 tok/s   +107%   179 of 179 drafts accepted
+  #   --spec-type ngram-simple  22.4 tok/s    -3%
+  #   --spec-type ngram-cache   18.6 tok/s   -19%    12 of 243 accepted
+  #
+  # ⚠ THE ngram THEORY DID NOT SURVIVE MEASUREMENT, and the old comment asserting it did is
+  # the reason this block now leads with numbers. The argument was that plan output echoes the
+  # prompt (course codes appear verbatim in the rendered requirement database), so a
+  # prompt-lookup proposer should draft them for free. Acceptance was 4.9%. Free drafting is
+  # not free when it is wrong: every rejected token still costs a verification slot, so
+  # ngram-cache came out 19% SLOWER than not speculating at all. `none` is the default.
+  #
+  # `draft-simple` IS THE ONE THAT PAYS, and by more than it used to (+107% here against +34%
+  # on the old two-card rig) because a 21.5 GiB Q6_K on one 3090 Ti is even more thoroughly
+  # bandwidth-bound — verification of four drafted tokens costs barely more than decoding one.
+  # It needs an IDENTICAL vocabulary; llama.cpp aborts at load on a mismatch, which is why it
+  # is opt-in per model via `draft: true` and why `run.py check` compares tokenizers first.
+  #
+  # ⚠ QUALITY DOES NOT POOL ACROSS THIS SETTING. Acceptance depends on the target's sampler
+  # agreeing with the proposal, so at temperature 0.15 a speculative run is a near — not exact
+  # — reproduction. CONFIRMED on the old stack: two 27B runs, identical prompt and seed,
+  # returned different plans. Override per invocation with `run.py run --spec none|ngram|draft`.
+  speculative:
+    method: "none"
+    draft_gguf: "qwen3.5-0.8b-draft/Qwen3.5-0.8B-Q6_K.gguf"
+    n_max: 4          # tokens drafted per verification pass
+    n_min: 0
+    p_min: 0.75       # stop drafting when the proposer's own confidence drops below this
+    cache_type_k: "f16"
+    cache_type_v: "f16"
+    # ALL 24 DRAFT LAYERS ON THE CARD. A partially-offloaded draft adds CPU-speed latency to
+    # every verification pass, which is the one thing speculation cannot afford.
+    n_gpu_layers_draft: 99
+    device_draft: "CUDA0"
+  # ⚠ `run.parallel` COSTS VRAM AT LOAD HERE, WHICH IT DOES NOT UNDER vLLM. llama.cpp
+  # pre-allocates `num_ctx * parallel` tokens of KV before serving a single request. MEASURED
+  # 2026-08-26, qwen3.8-27b UD-Q6_K_M (21.49 GiB of weights) on the 23.55 GiB card:
+  #
+  #   parallel 1  -c 16384  ->  loads, 22,322 MiB
+  #   parallel 2  -c 32768  ->  loads, 22,630 MiB
+  #   parallel 3  -c 49152  ->  loads, 23,388 MiB   <- the ceiling at this quant
+  #   parallel 4  -c 65536  ->  CUDA error: out of memory
+  #
+  # `run.parallel` STAYS AT 4 — it is a property of the WORKLOAD ("how many students are on
+  # the site at once") and both engines are meant to answer for it. What changes per engine is
+  # what can be BOUGHT, so the cap lives here rather than in `run:`. `harness.server.
+  # effective_parallel` resolves the two, `runner` records the result as `simulated_users` on
+  # every env record, and `start_server` translates the CUDA OOM into the instruction to lower
+  # this if a future quant needs it. Raise it if you move to a smaller gguf.
+  max_parallel: 1
 
 run:
   # ONE SLOT OF 16384. Reverted 2026-08-11 from the 65536/4 multi-user experiment, on measured
@@ -15,27 +198,34 @@ run:
   # scenario) and `max_plan_tokens` is 2048, so a smaller context truncates every plan request
   # and `server.check_slot_context` fails the run rather than let that happen silently.
   num_ctx: 16384
-  # HOW MANY STUDENTS ARE ON THE SITE AT ONCE. The machinery is real — `runner.run_model` keeps
-  # exactly this many requests in flight via `_run_pool` — but it is OFF, because measuring it
-  # showed it does not pay here:
+  # HOW MANY STUDENTS ARE ON THE SITE AT ONCE. `runner._run_pool` keeps exactly this many
+  # DIFFERENT test cases in flight — four distinct scenarios during the plan stages, four
+  # distinct questions during QA. A worker pool, not a batch dump: handing the server every
+  # item at once and letting it drain N at a time would measure a backlog draining, which is a
+  # different question. Within one scenario the stages stay sequential (plan_a, then plan_b,
+  # then explain), because one student does not ask for a plan and its explanation at once.
+  #
+  # THE MEASUREMENT THAT ORIGINALLY PINNED THIS AT 1 NO LONGER APPLIES. Under llama.cpp:
   #
   #   qwen3.5-9b Mode B, parallel 4:  58.6 s per request -> 4/58.6 = 0.068 req/s
   #   qwen3.5-9b Mode B, serial:      ~12 s per request  -> 1/12   = 0.083 req/s
   #
-  # Break-even would be 48 s; at 58.6 s four-way batching is ~18% SLOWER in aggregate than
-  # serving one student at a time. The earlier 1.93x figure was measured with a ~50-token prompt
-  # and does not survive the real ~12k-token one: four simultaneous prefills contend for compute,
-  # and every decode step then reads the KV of all four sequences on a workload that is already
-  # memory-bandwidth-bound.
+  # — four-way batching was ~18% SLOWER in aggregate. That was a result about THAT ENGINE:
+  # `--parallel 4` cut every request's window to `num_ctx / 4`, four ~12k-token prefills
+  # contended on two power-limited cards, and each decode step read the KV of all four over a
+  # bus that was already the bottleneck. None of the three is true on vLLM — paged KV does not
+  # divide the window, prefix caching prefills the shared prompt once, and continuous batching
+  # schedules prefill and decode together. MEASURED at 4 on this card: a 16-program sweep ran
+  # ~6.3 min/program against ~69 min/program serially.
   #
-  # Set it back to 4 (with num_ctx 65536) to re-run that experiment on hardware where it might
-  # pay — a single card with real bandwidth and headroom. Note that latency recorded at
-  # `parallel > 1` includes queue time and is not comparable to a serial run's.
+  # 1 RIGHT NOW, FOR THE THINKING ARM. Speculation and batching compete for the same spare
+  # decode capacity, so an MTP arm measured at 4 reports the leftovers; and a thinking-vs-not
+  # comparison is about output QUALITY, where queue time in the latency columns is noise.
+  #
+  # ⚠ LATENCY AT `parallel > 1` INCLUDES QUEUE TIME and does not pool with a serial run's.
+  # Quality is unaffected — same sampler, prompts, schemas. `simulated_users` on every env
+  # record says which regime a file was written in.
   parallel: 1
-  n_gpu_layers: 999
-  n_cpu_moe: 0
-  cache_type_k: "q8_0"
-  cache_type_v: "q8_0"
   temperature: 0.15
   seed: 67
   top_p: 0.9
@@ -73,11 +263,36 @@ run:
   # advising stages do NOT ride along — see `advising_thinking` below — so this costs nothing
   # outside Mode C.
   reasoning_budget: 1024
-  # Whether QA and explain also request reasoning. Off: at 1024 the QA stage went from ~1.1 s
-  # to ~8.2 s per question on gemma4-e4b for 39 questions x 7 models x 16 programs, with no
-  # evidence yet that the answers improved. Turn it on for a targeted advising experiment,
-  # not for a full sweep.
+  # Whether QA and explain also request reasoning.
+  #
+  # THIS IS THE ONE REASONING SWITCH THAT HAS NEVER BEEN MEASURED FOR QUALITY. It was set to
+  # false on 2026-08-14 purely on WALL CLOCK — "at 1024 the QA stage went from ~1.1 s to ~8.2 s
+  # per question on gemma4-e4b for 39 questions x 7 models x 16 programs, with no evidence yet
+  # that the answers improved" — and the same note said to "turn it on for a targeted advising
+  # experiment, not for a full sweep". That experiment was never run.
+  #
+  # IT IS A DIFFERENT QUESTION FROM THE RETIRED PLAN ARM, and the distinction is the whole
+  # reason this survived that removal. Plan reasoning had two things working against it that do
+  # not apply here: it competed with grammar-constrained JSON for the output budget, and the
+  # repair loop already bought what it was supposed to buy (coverage 0.44 -> 0.89) for less.
+  # QA and explain are free text with no validator behind them.
+  #
+  # WHERE THE HEADROOM IS, on the archived vLLM baseline (`results_full_3090_vllm_serial/`):
+  # qwen3.8-27b scores `behavior_ok` — did it correctly abstain vs answer — on 294 of 546 QA
+  # items (54%), against gemma4-26b's 417 (76%). 18 of the 39 questions are abstain-expected,
+  # so that is a judgment failure rather than a knowledge gap, which is the shape of thing
+  # pre-answer reasoning is most likely to move.
   advising_thinking: false
+  # EXTRA output tokens for QA and explain WHEN `advising_thinking` is on; ignored when it is
+  # off. Not a cap — vLLM has no reasoning cap — but headroom, so the reasoning is not paid for
+  # out of the answer's budget.
+  #
+  # 4096 IS SIZED FROM MEASURED REASONING LENGTH, not guessed: qwen3.8-27b reasoned p50 3409,
+  # p90 4270, max 5384 tokens across 61 generations. Without this, QA would run with
+  # `max_output_tokens` 1048 against ~3400 tokens of reasoning — the answer would be the part
+  # that got truncated, and the experiment would measure the ceiling. That is exactly how the
+  # plan-reasoning arm produced 3 parseable plans out of 65 on 2026-08-23.
+  advising_thinking_headroom: 4096
   max_plan_tokens: 4096
   runs_per_pair: 1            # N replicates per (model x item) — variance, not luck
   warmup_discard: 2           # generations per model discarded before measurement
@@ -129,117 +344,394 @@ run:
 # CONFIRMED, not theoretical: the two 27B runs measured above returned DIFFERENT PLANS from the
 # identical prompt and seed (different electives, a different course in semester 2). Per-record
 # `draft_n`/`draft_n_accepted`/`draft_acceptance` in runs_*.jsonl say what each generation did.
-speculative:
-  enabled: true
 
-  # Qwen3.5-0.8B (Q6_K, 0.64 GiB) — the smallest model that shares the Qwen3.5/3.6 vocabulary
-  # (248320 tokens, identical across 0.8B/2B/4B/9B/27B/35B-A3B; `run.py check` verifies it
-  # rather than trusting this comment). Q6_K, not the Q4_K_M every target here uses: quant
-  # damage costs a 0.8B model proportionally more accuracy, acceptance rate is the entire
-  # source of the speedup, and the 110 MB over Q4_K_M is nothing against 20 GB of VRAM.
-  # NO DRAFT EXISTS for gemma4-* or muse-glimmer-30b — a different vocabulary cannot draft for
-  # them at all (llama.cpp aborts the server at load), which is why `draft:` is per-model below
-  # rather than something applied to every entry.
-  draft_gguf: "qwen3.5-0.8b-draft/Qwen3.5-0.8B-Q6_K.gguf"
-
-  n_max: 4          # tokens drafted per verification pass
-  n_min: 0
-  p_min: 0.75       # stop drafting when the draft model's own confidence drops below this
-  cache_type_k: "f16"
-  cache_type_v: "f16"
-
-  # ALL 24 DRAFT LAYERS ON ONE CARD. The draft is worthless if it is itself slow — a partially
-  # offloaded draft would add CPU-speed latency to every verification pass. Pinned to CUDA0 so
-  # it cannot re-balance the hand-sized `--tensor-split` the big models are tuned around.
-  n_gpu_layers_draft: 99
-  device_draft: "CUDA0"
-
+# `model_path` IS WHATEVER THE ACTIVE ENGINE LOADS — the .gguf FILE under llama.cpp (the
+# default), the Hugging Face checkpoint DIRECTORY under vLLM. Since llama.cpp is the default,
+# `model_path` reads as the gguf and the vLLM checkpoint sits in `model_path_vllm` beside it.
+# An entry with no `model_path_vllm` simply cannot run under `--engine vllm`, and says so.
 models:
-  # ORDER IS RUN ORDER. `runner.run_model` walks this list top to bottom within every program,
-  # so the first entry is the one that produces results soonest — which is what you want for a
-  # model you are actively evaluating, on a sweep that may be cut short.
-  # Qwen 3.8 27B (unsloth GGUF, Q4_K_M). A SEPARATE ENTRY FROM qwen3.6-27b, deliberately — the
-  # two are different weights at the same size and the head-to-head is the point. Nothing in
-  # this harness infers a model's identity from its name, so both simply coexist and every
-  # table gets a row for each.
+  # qwen3.5-9b AND gemma4-e4b REMOVED 2026-08-29, when the 3090 Ti went back in. They were
+  # added on 2026-08-27 for exactly one reason — they were the only models that fit whole on the
+  # 8 GB 2060 SUPER — and that reason is gone. Nothing was wrong with them: measured on that
+  # card at -c 16384 with an ~11.3k-token prompt, gemma4-e4b ran 2,195 tok/s prefill / 65.7
+  # decode in 2,942 MiB and qwen3.5-9b 1,249 / 52.1 in 5,462 MiB. They are simply the wrong
+  # SIZE to spend a sweep on when 24 GiB holds a 27B at full speed.
   #
-  # `draft` is UNSET until the vocabulary is verified. The 3.5/3.6 dense entries share the
-  # qwen3.5-0.8b draft (vocab 248320); if 3.8 kept that vocabulary it can draft too, and
-  # `run.py check` prints the comparison without launching a server. A mismatched draft does
-  # not degrade gracefully — llama.cpp aborts at load — so it is opt-in after the check rather
-  # than assumed from the family name.
+  # ONE FINDING FROM THEM IS WORTH KEEPING, because it is not derivable from a file size:
+  # qwen3.5-9b is a HYBRID, not a dense transformer. Only 8 of its 32 layers keep a KV cache
+  # (272 MiB for a whole 16,384-token pool at q8_0); the other 24 are SSM layers whose recurrent
+  # state is 50.25 MiB and DOES NOT GROW WITH CONTEXT. If a long-context arm is ever wanted,
+  # that is the family to reach for.
+  #
+  # Both GGUFs stay on disk (`models/qwen3.5-9b-gguf/`, `models/gemma4-e4b-gguf/`, 9.3 GiB
+  # together) — re-add by restoring these entries from this file's history.
+
+  # FIRST ON PURPOSE — it is the one entry that can fail in ways the others cannot, so it is
+  # the first thing `run.py check` prints and the first model a sweep loads. Finding out that
+  # the draft branch cannot load it after three other models have already run is the wrong
+  # order to learn that in.
+  #
+  # RESTORED 2026-08-29 with the 3090 Ti. It was quarantined on 2026-08-27 for the two days the
+  # 8 GB card was in the box — not because of anything about the model, but because `n_cpu_moe`
+  # could not save it: only 45.29 GiB of its 76.32 GiB are expert tensors, and no setting of a
+  # flag that moves EXPERTS helps when the other 31.03 GiB is the n-gram/PLE table. That number
+  # is worth keeping in view here, because it is also what makes this entry cheap on the 24 GB
+  # card: the table is a sparse lookup that llama.cpp keeps CPU-mapped anyway.
+  #
+  # WHY IT IS llama.cpp-ONLY. There is no `model_path:` because no vLLM-loadable checkpoint of
+  # this model fits: the FP8 release is 186 GB against a 23.55 GiB card, and no int4
+  # compressed-tensors build exists. `--engine vllm` on this entry fails with a clear message
+  # rather than a KeyError. The GGUF is the only artifact that fits at all, and only barely —
+  # UD-IQ1_S is 72.5 GB against 24 GB VRAM + 61 GB usable RAM ≈ 85 GB.
+  #
+  # WHY IT NEEDS A DRAFT BUILD OF llama.cpp. `general.architecture = qwen4exp`, which upstream
+  # master does not know. Support is PR #27742 (draft), which is what `.llamacpp-src` is
+  # checked out to. If that branch is rebased away this entry stops loading — that is the cost
+  # of carrying it, and the reason it is quarantined in its own bracket.
+  #
+  # THE BET, AND IT IS A REAL ONE. 125B total but only ~6B active per token, so most of what
+  # sits in system RAM is not read on any given step. `n_cpu_moe: 48` moves EVERY layer's
+  # experts to CPU (48 hidden layers) and leaves attention, embeddings and the n-gram table
+  # competing for the card. That is the maximum-offload end of the dial; if it loads with VRAM
+  # to spare, LOWER this number to pull expert layers back onto the GPU until it stops fitting.
+  # Decode should be bandwidth-bound on ~6B of active weights; PREFILL is the number to watch,
+  # because a ~12.3k-token Mode B prompt is a GEMM on 8 AVX2 cores and that is where this will
+  # live or die.
+  - name: "qwen3.8-flash-next"
+    # llama.cpp resolves shards 2 and 3 from the first one's name; do not list them.
+    #
+    # ⚠ IQ3_XXS, NOT THE IQ4_XS THIS LINE POINTED AT UNTIL 2026-08-29 — that path was left over
+    # from an experiment and does not fit this box at all. MEASURED off disk: IQ4_XS is 88 GiB
+    # against 24 GiB VRAM + 60 GiB RAM = 84 GiB, so it has nowhere to live and would page off
+    # the disk on every token. IQ3_XXS is 76.32 GiB and fits that sum with ~8 GiB to spare,
+    # which is the entire reason the quant was chosen on 2026-08-26. Every measurement in this
+    # entry is an IQ3_XXS measurement; the IQ4_XS directory is 88 GiB of disk doing nothing.
+    model_path: "qwen3.8-flash-next-gguf/UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf"
+    # NO `model_path_vllm:` ON PURPOSE — no vLLM-loadable checkpoint of this model fits (the
+    # FP8 release is 186 GB and no int4 build exists), so `--engine vllm` refuses this entry
+    # by name rather than pretending it could load.
+    bracket: experimental
+    think: false
+    # ⚠ f16 KV IS MANDATORY HERE, and this is the one setting that will bite anyone who copies
+    # the Qwen entry's `q8_0`. llama.cpp turns on Hadamard KV rotation whenever the KV type is
+    # quantized (llama-kv-cache.cpp: `attn_rot_k = ... && ggml_is_quantized(type_k) && ...`),
+    # and this arch's sparse-attention path asserts that rotation is absent:
+    #
+    #   qwen4exp.cpp:544: GGML_ASSERT(inp->self_k_rot == nullptr && inp->self_v_rot == nullptr)
+    #
+    # The abort happens AFTER the 72.5 GB load, in graph construction, and reads as a crash
+    # rather than a configuration error — MEASURED 2026-08-26, three failed launches before the
+    # cause was found. `--no-context-shift` does NOT help; only an unquantized KV type does.
+    # (LLAMA_ATTN_ROT_DISABLE=1 also silences it, but that keeps q8_0 KV while removing the
+    # rotation that exists to make quantized KV accurate — the wrong half to drop.)
+    cache_type_k: "f16"
+    cache_type_v: "f16"
+    # HOW MANY LAYERS' EXPERTS LIVE IN SYSTEM RAM, counting from the first. THE tuning knob for
+    # this entry, and the only entry in this file it still means anything for — lower = more
+    # experts on the card = faster prefill AND less pressure on RAM, until it stops fitting.
+    #
+    # RE-MEASURED 2026-08-29 on the 3090 Ti, UD-IQ3_XXS, -c 16384 --parallel 1 --spec-type none,
+    # 11,780-token prompt (48 hidden layers, so 48 = every expert offloaded, the maximum):
+    #
+    #   32   20,822 MiB load / 21,300 peak   193.3 tok/s prefill   15.7 tok/s decode   <- chosen
+    #   28   DOES NOT LOAD — "failed to initialize the context: failed to allocate compute pp
+    #        buffers", 94 s in, i.e. AFTER the whole 76 GiB was read off disk
+    #
+    # 31, 30 and 29 ARE UNMEASURED — a sweep took the card back before they could be tried. The
+    # edge is in there and each step is ~1.0 GiB of experts moved onto the card, so there is
+    # real speed still on the table; 32 is just the lowest value CONFIRMED to load. The `28`
+    # failure is the useful half of that result: the ceiling is close, and finding it costs a
+    # minute and a half of disk read per attempt.
+    #
+    # 48 IS WHAT THIS SAID UNTIL NOW, and it was never a measured value — it was the
+    # maximum-offload starting point written before the model had ever loaded. Every expert over
+    # DDR4-2666: the slowest setting that runs.
+    #
+    # AND THIS IS THE RAM KNOB TOO, WHICH IS EASY TO MISS. The weights are 76.32 GiB against
+    # ~57 GiB of usable RAM, so whatever is NOT on the card comes out of page cache. At 32 the
+    # CPU side is ~56 GiB and measured `cache=56G avail=58G` — it fits with nothing to spare.
+    # Every step DOWN from 32 takes ~1.0 GiB off the RAM side as well as putting it on the GPU;
+    # every step UP pushes the CPU side past what RAM holds, and then experts are read from DISK
+    # per token instead of from cache. That is a cliff, not a slope, and it is why the two
+    # halves of "optimize for the RAM and the GPU" pull in the SAME direction here.
+    n_cpu_moe: 32
+    n_gpu_layers: 99
+    # MUST STAY EVICTABLE. `mmap+mlock` pins weights in RAM, which is right for a model that
+    # fits and fatal for this one: 72.5-82 GB against ~61 GB of RAM plus the card means the OS
+    # has to be free to page. `auto` is already the default; it is stated here because the
+    # obvious "optimization" of pinning would take the box down rather than slow it.
+    load_mode: "auto"
+    # ⚠ UNVERIFIED ON THIS ARCH. Flash attention is required to quantize the V cache, but this
+    # entry runs f16 KV anyway (see above), so it buys speed rather than memory here — and the
+    # hybrid Gated-DeltaNet/sparse-attention path is exactly the shape that may not implement
+    # it. Set to "auto" so llama.cpp decides instead of failing on an unsupported "on".
+    #
+    # ⚠ THIS KEY WAS INERT FROM 2026-08-27 TO 2026-08-29 — the line survived as `#c  flash_attn`
+    # when the entry was un-commented by hand, so YAML never saw it and `server.py` fell back to
+    # `llamacpp.flash_attn`, which is "on". The sweep launched at 14:43 on 08-29 therefore ran
+    # `-fa on` against exactly the architecture this note exists to be careful about. A key that
+    # silently reverts to a global is the failure mode to watch for after any hand-edit here.
+    flash_attn: "auto"
+    # SPECULATION PAYS HERE, MEASURED, and the reasoning that said it would not was wrong.
+    # matched 12,255-token prompt, n_cpu_moe 32:  none 20.4 tok/s  ->  draft-simple 23.7 tok/s
+    # (+16%), 175 of 175 drafts accepted. It shares the Qwen 248320 vocabulary, so the same
+    # 0.8B Q6_K proposer the 27B uses drafts for it.
+    #
+    # PREFILL PAYS FOR IT: 161 -> 137 tok/s, because the draft's weights and KV take ~0.9 GB of
+    # card that would otherwise hold expert layers. On a stage that prefills ~12.3k tokens and
+    # then emits ~1,841, that trade is roughly break-even — re-measure before assuming it wins
+    # on the QA stage, whose prompts are short and whose answers are shorter.
+    #
+    # ⚠ draft-mtp IS NOT AVAILABLE, though the architecture has an MTP head. unsloth's GGUF
+    # does not carry it: 1,224 tensors across the shards, none named mtp/nextn (the PLE n-gram
+    # tensors did survive). Producing one means running convert_hf_to_gguf.py --mtp against the
+    # 186 GB FP8 original, which does not fit on this box.
+    draft: false
+    spec_method: "draft-simple"
+    # DRAFT DEPTH, tuned for THIS target. 16, not the config default of 4 — measured at
+    # n_cpu_moe 32 on the 12,255-token prompt, decode tok/s against a 20.4 unspeculated
+    # baseline:  n_max 4 -> 23.7 (+16%),  8 -> 26.4 (+29%),  16 -> 30.5 (+50%).
+    # Acceptance stayed at 99.5% throughout (206 of 207 at 16), which is why it kept paying:
+    # every token this model decodes costs a read of expert weights over DDR4-2666, so a deep
+    # draft amortises the one expensive thing it does.
+    spec_n_max: 16
+    # SERIAL ONLY. `run.parallel` is 4 and `llamacpp.max_parallel` trims it to 3; this trims it
+    # again to 1 for this entry alone. Every slot costs a full f16 KV window (no q8_0 here, see
+    # above) on a box whose RAM is already holding 56 GB of weights in page cache. Its latency
+    # columns therefore do NOT pool with the other models' — `simulated_users` on each record
+    # says 1 where theirs say 3.
+    max_parallel: 1
+    # ⚠ ITS QUANT IS STILL NOT COMPARABLE TO ANYTHING ELSE HERE. UD-IQ3_XXS is ~3.6 bits/param
+    # averaged over 180B params, against Q6_K's ~6.6 for the other entries — and the average
+    # understates the gap, because unsloth's UD line keeps attention and embeddings near-full
+    # precision and spends the compression on the experts, which is where this model's capacity
+    # lives. Read a bad score as partly the quant.
+    #
+    # UPGRADED FROM UD-IQ1_S 2026-08-26 (that file is deleted). IQ1_S was ~3.2 bits/param and
+    # ran 216 tok/s prefill / 22.7 decode at n_cpu_moe 28; IQ3_XXS costs ~25% of prefill and
+    # ~10% of decode for a materially better expert quantization. Q4_K_XL (111 GB) does not fit
+    # in 24 GB VRAM + 61 GB RAM; IQ4_XS (93.7 GB) does not either. 82 GB is the ceiling here.
+    extra_args_llamacpp: []
+
   - name: "qwen3.8-27b"
-    gguf: "qwen3.8-27b/Qwen3.8-27B-UD-Q6_K_M.gguf"
+    model_path: "qwen3.8-27b-gguf/Qwen3.8-27B-UD-Q6_K_M.gguf"
+    model_path_vllm: "qwen3.8-27b-awq"
     bracket: server
     think: false
-    draft: true
+    tool_call_parser: "hermes"
+    reasoning_parser: "qwen3"
+    draft_model: "qwen3.5-0.8b-draft"          # vLLM speculative source
+    # llama.cpp: use the REAL proposer rather than the free ngram default. This is the pairing
+    # that measured +34% on the 27B at 96.7% acceptance, and `run.py check` verifies the shared
+    # vocabulary (248320) without launching a server — a mismatch aborts llama.cpp at load, so
+    # this stays opt-in rather than inferred from the family name.
+    #
+    # ⚠ STILL `false`, AND THAT IS A DELIBERATE RESTORE, NOT AN OVERSIGHT. It was `false` when
+    # this entry was removed on 2026-08-27 and it is `false` coming back, so the two sides of
+    # the card swap stay comparable. The number arguing the other way is large — 23.0 -> 47.5
+    # tok/s (+107%), 179 of 179 drafts accepted, measured 2026-08-26 on this exact quant — so
+    # flipping it is a one-line, well-evidenced change. It is left to a deliberate decision
+    # because it also splits this model's quality records off from every unspeculated run
+    # (see the ⚠ at the top of `speculative:`), and that is not a side effect to inherit from a
+    # hardware swap.
+    draft: false
+    spec_method: "draft-simple"
+    extra_args: []
 
-
-  - name: "qwen3.6-27b"
-    gguf: "qwen3.6-27b/Qwen3.6-27B-Q4_K_M.gguf"
+  # THE REASONING VARIANT of the entry above — same weights, same everything, `advising_think`
+  # flipped. It exists as a MODEL rather than as a run-wide flag so one `python3 run.py run`
+  # produces both arms and every report table shows them as adjacent rows; before this,
+  # answering "does reasoning help advising" meant two full sweeps compared by hand, which
+  # differed by whatever else drifted between them.
+  #
+  # IT REASONS ON QA AND EXPLAIN ONLY. The plan stages keep `think: false` — pre-plan reasoning
+  # was measured twice and retired (see the `thinking:` note near the bottom of this file).
+  # This is the question that note says was never answered: the advising stages were turned off
+  # on WALL CLOCK, "with no evidence yet that the answers improved".
+  #
+  # ⚠ THE BASELINE ENTRY ABOVE ONLY BECAME A BASELINE ON 2026-08-25. `_stage_thinking` used to
+  # return None when off, the client only sends `enable_thinking` for an explicit True/False,
+  # and None means the TEMPLATE DEFAULT — which for qwen3.8-27b is reasoning ON. So every
+  # sweep before that date ran this model's QA and explain WITH reasoning, invisibly (the
+  # client also discarded the reasoning channel until 2026-08-23). Archived QA numbers for
+  # qwen3.8-27b are therefore closer to this variant than to the baseline it sits next to.
+  - name: "qwen3.8-27b-thinking"
+    model_path: "qwen3.8-27b-gguf/Qwen3.8-27B-UD-Q6_K_M.gguf"
+    model_path_vllm: "qwen3.8-27b-awq"
     bracket: server
     think: false
-    # Draft back ON and the split back to the 16k-context values (2026-08-11). Both were only
-    # ever changed to buy VRAM for the 65536/4 experiment, which is reverted above: at
-    # num_ctx 16384 the KV is 693 MiB instead of 2774, so the 792 MiB draft fits again.
-    # MEASURED here: 18.65 -> 25.04 tok/s (+34%), 96.7% of drafted tokens accepted.
-    draft: true
-    extra_args: ["--tensor-split", "0.60,0.40"]
-  - name: "qwen3.5-9b"
-    gguf: "qwen3.5-9b/Qwen3.5-9B-Q4_K_M.gguf"
-    bracket: 12gb
-    think: false
-    draft: true
-    extra_args: ["--split-mode", "none", "--main-gpu", "0"]
-  - name: "gemma4-12b"
-    gguf: "gemma4-12b/gemma-4-12b-it-IQ4_XS.gguf"
-    bracket: 12gb
-    think: false
-    extra_args: ["--split-mode", "none", "--main-gpu", "0"]
+    advising_think: true
+    tool_call_parser: "hermes"
+    reasoning_parser: "qwen3"
+    draft_model: "qwen3.5-0.8b-draft"          # vLLM speculative source
+    draft: false
+    spec_method: "draft-simple"
+    extra_args: []
+
   - name: "gemma4-26b"
-    gguf: "gemma4-26b/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"
+    model_path: "gemma4-26b-gguf/gemma-4-26B-A4B-it-UD-Q6_K.gguf"
+    model_path_vllm: "gemma4-26b-awq"
     bracket: server
     think: false
-    n_cpu_moe: 0
-    # the model.
-    extra_args: ["--tensor-split", "0.60,0.40"]
-  - name: "qwen3.6-35b-a3b"
-    gguf: "qwen3.6-35b-a3b/Qwen_Qwen3.6-35B-A3B-Q4_K_M.gguf"
+    tool_call_parser: "pythonic"
+    # NO `n_cpu_moe` SINCE 2026-08-29 — all 21.57 GiB are back on the card. For the two days
+    # the 8 GB 2060 SUPER was in the box this entry ran `n_cpu_moe: 25`, which was measured, not
+    # guessed, and is worth keeping if that card ever returns: the dial is 0.639 GiB per step
+    # (30 layers, 19.16 GiB of experts, 2.40 GiB non-expert), 25 peaked at 6,926 MiB with
+    # 316 tok/s prefill / 20.2 decode, and 23 would not load at all ("failed to allocate compute
+    # pp buffers"). Against the 2,195 tok/s prefill that same prompt gets when nothing is
+    # offloaded, that is what expert offload costs: ~7x.
+    # fp16 KV, NOT the fp8 every other model here uses — and not a preference. This model's
+    # shape puts it on vLLM's TRITON attention backend, which rejects an fp8 KV cache on
+    # compute capability 8.6 and fails at engine start rather than falling back:
+    #
+    #   ValueError: FP8 KV cache is not supported by the Triton attention backend on
+    #   NVIDIA GeForce RTX 3090 Ti (compute capability 8.6)
+    #
+    # It costs less than it sounds: `sliding_window: 1024` on all but a handful of its 30
+    # layers means most of them hold KV for a 1k window however long the request is, so
+    # doubling the bytes per token still leaves it the roomier of the two models.
+    kv_cache_dtype: "auto"
+    # QAT WEIGHTS (`-qat-AWQ-INT4`), chosen over the plain AWQ build of the same model at the
+    # same 17.2 GB: quantization-aware training recovers most of what int4 costs, and at equal
+    # size there is nothing to trade off. Note this makes it a slightly different comparison
+    # than the GGUF era, where gemma4-26b ran a plain UD-Q4_K_M — one more reason the two
+    # series do not pool.
+    #
+    # THE FASTER OF THE TWO, AND THE TIGHTER ONE ON CONCURRENCY. MEASURED 2026-08-22 on this
+    # card, both at num_ctx 16384:
+    #
+    #   gemma4-26b   15.55 GiB weights   69,700 KV tokens   4.25x concurrency   ~147-202 tok/s
+    #   qwen3.8-27b  16.92 GiB weights   76,137 KV tokens   4.65x concurrency   ~48 tok/s
+    #
+    # THOSE ARE STEADY-STATE, and the distinction matters: the FIRST launch of a model on a
+    # cold `torch.compile` cache holds ~1.35 GB during the profiling pass that sizes the KV
+    # pool, and permanently shrinks it for that run — measured 33,731 tokens (2.06x) for
+    # qwen against 76,137 (4.65x) on every launch after. Read `kv_cache` out of the run's own
+    # `meta_*.json` rather than trusting a number typed here, and treat the first program of a
+    # sweep on a fresh box as not comparable to the rest.
+    #
+    # THE CONCURRENCY ORDERING IS THE OPPOSITE OF WHAT THE ARCHITECTURE PREDICTS, and it is
+    # worth writing down why, because the architectural reasoning is seductive and wrong here:
+    # 30 layers against Qwen's 64, `sliding_window: 1024` on all but a handful of them, and
+    # ~4B active parameters per token all say this model should hold far more students. What
+    # overrides it is the fp16 KV forced by the Triton backend (above) against Qwen's fp8, plus
+    # `global_head_dim: 512` on this model's full-attention layers against Qwen's 256. Two
+    # bytes instead of one, over twice the head width, is enough to erase the layer-count
+    # advantage — though on the steady-state numbers above the two end up close (4.25x vs
+    # 4.65x), not the wide gap a single cold-cache measurement first suggested.
+    #
+    # It is still much faster per token, which is what the A4B routing buys, and speed is what
+    # the app's default is chosen for. Do not repeat the "roomier under load" claim — it was
+    # written from the architecture before either model had been launched, and measurement
+    # reversed it.
+    extra_args: []
+
+  # Gemma's reasoning variant. Kept for symmetry so the comparison is not qwen-only — but note
+  # gemma4-26b produced ZERO reasoning characters when asked (0 of 78 QA records on 2026-08-25),
+  # so this arm may simply reproduce the baseline. That is itself the finding for this model:
+  # a flat result here means its template opened no reasoning channel, NOT that reasoning was
+  # tried and did not help. `reasoning_chars` in the records is what tells the two apart.
+  - name: "gemma4-26b-thinking"
+    model_path: "gemma4-26b-gguf/gemma-4-26B-A4B-it-UD-Q6_K.gguf"
+    model_path_vllm: "gemma4-26b-awq"
     bracket: server
     think: false
-    n_cpu_moe: 0
-    # Same Qwen3.5/3.6 vocabulary as the dense entries above. This is the model that stands to
-    # gain most from drafting: its experts are split across CPU RAM, so each verified token is
-    # unusually expensive and amortizing four of them over one pass is worth more here.
-    draft: true
-    extra_args: ["--tensor-split", "0.67,0.33"]
-    # ~5.5 GiB of experts live in system RAM here, past RLIMIT_MEMLOCK; --mlock only produces a
-    # failed-to-lock warning on every start. The 23.50 above was measured without it.
-    mlock: false
-  - name: "gemma4-e4b"
-    gguf: "gemma4-e4b/gemma-4-E4B-it-Q4_K_M.gguf"
-    bracket: 12gb
-    think: false
-    extra_args: ["--split-mode", "none", "--main-gpu", "0"]
+    advising_think: true
+    tool_call_parser: "pythonic"
+    kv_cache_dtype: "auto"
+    extra_args: []
+
+  # qwen3.6-35b-a3b REMOVED AGAIN 2026-08-22, hours after being re-added. It is not a
+  # compatibility failure this time — it loaded and served correctly. It is simply far too slow
+  # on this card, and the reason is CPU offload.
+  #
+  # MEASURED, same sweep, same programs, decode throughput and wall clock per plan:
+  #
+  #   gemma4-26b        82.3 tok/s    plan_mode_b   9.7 s    plan_mode_c   29.2 s
+  #   qwen3.8-27b       28.2 tok/s    plan_mode_b  30.1 s    plan_mode_c   80.5 s
+  #   qwen3.6-35b-a3b    3.8 tok/s    plan_mode_b 212.8 s    plan_mode_c  628.5 s
+  #
+  # Over TEN MINUTES per Mode C plan, ~20x slower than gemma. Left in, it would have added
+  # roughly twelve hours to a sixteen-program sweep — and it held the first program alone for
+  # over an hour.
+  #
+  # WHY, AND WHY THE A3B ROUTING DID NOT SAVE IT: its usable quants are ~25 GB against a
+  # 22.1 GB budget, so ~6 GB of weights had to stream from system RAM over PCIe on every
+  # forward pass. Decode is memory-bandwidth-bound, and PCIe is roughly an order of magnitude
+  # slower than VRAM. Only ~3B of its 35B parameters are active per token, which is what made
+  # this worth trying at all — it was not nearly enough.
+  #
+  # WHAT IT WOULD TAKE TO BRING IT BACK: a card with enough VRAM to hold ~25 GB of weights plus
+  # a KV cache, or a compressed-tensors quant small enough to fit natively (none existed as of
+  # this date — the only sub-21 GB option, `mattbucci/Qwen3.6-35B-A3B-AWQ`, failed to load at
+  # all with `AttributeError: 'MergedColumnParallelLinear' object has no attribute 'data'`).
+  # NOTE the mainstream `cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit` loads fine under plain AWQ, so that
+  # loader is not the problem — the small checkpoint itself was.
+  #
+  # ITS ONE FLATTERING NUMBER, for the record: 235,227 KV tokens and 14.36x concurrency, the
+  # highest of any model tried here, because offloading the weights left the card almost
+  # entirely free for KV. Capacity is worthless at 3.8 tok/s.
+
+  # qwen3.8-flash-next NOT ADDED 2026-08-26. Evaluated on request and rejected on ONE number.
+  # Recording the reasoning because the model's headline spec makes it look far more feasible
+  # than it is, and the obvious objections to it are the WRONG objections.
+  #
+  # WHAT IS NOT THE PROBLEM, so nobody re-litigates these:
+  #   - vLLM support. It exists as of 0.28.0 (this venv is 0.27.1; upgrading is one install).
+  #     `Qwen4ExpForConditionalGeneration` is supported, and Qwen publishes a vLLM recipe.
+  #   - The 51B N-GRAM EMBEDDING TABLE. This is a sparse lookup — a few rows gathered per token,
+  #     not a tensor streamed per token — and `VLLM_PLE_CPU_OFFLOAD=1` exists precisely to park
+  #     it in host RAM. That offload genuinely works and is not the a3b PCIe-streaming failure.
+  #     It costs ~51 GB of the box's ~56 GB available RAM, and it buys back its own 51 GB.
+  #
+  # WHAT IS THE PROBLEM: the FP8 checkpoint is 186 GB. Subtract the n-gram table that offload
+  # handles and ~135 GB REMAINS — experts, attention, MTP — and that part has to be resident or
+  # streamed. Against it: 24 GB VRAM plus the ~5 GB of RAM the n-gram table did not take, so
+  # ~29 GB. A 4.6x overrun.
+  #
+  # "125B TOTAL / 6B ACTIVE" DOES NOT RESCUE THIS, and that is the trap in the spec sheet.
+  # Sparse routing means 6B parameters are COMPUTED per token, not that 6B are RESIDENT: the
+  # chosen experts change every token, so the full ~135 GB must be reachable at speed. Active
+  # params predict FLOPs; total params predict what has to fit. Only the second one is the
+  # binding constraint on this box.
+  #
+  # WAITING ON A SMALLER QUANT as of 2026-08-26, but NOT on the obvious one. Only unsloth's
+  # UD-IQ1_S exists today (72.5 GB, ~3.2 bits/param across ~180B params — that ratio is what
+  # the estimates below are anchored to). A Q4_K_M, when it lands, DOES NOT FIT EITHER:
+  #
+  #   n-gram table  51B @ ~4.8 bits -> ~31 GB  -> CPU RAM, fits in ~56 GB, fine
+  #   everything else 129B @ ~4.8 bits -> ~78 GB  -> vs 24 GB VRAM + ~25 GB RAM left = ~49 GB
+  #
+  # ~109 GB total and ~29 GB short — a 1.6x overrun rather than FP8's 4.6x, but short. Fitting
+  # the non-n-gram half into ~49 GB needs it at ~3 BITS/PARAM, so the GGUF worth watching is an
+  # IQ3 / UD-IQ3-class dynamic quant, not Q4_K_M.
+  #
+  # AND A GGUF IS THE WRONG STACK ANYWAY. This harness only speaks HTTP to `vllm serve`, and
+  # vLLM's GGUF path will not carry this arch plus `VLLM_PLE_CPU_OFFLOAD`. Running it would mean
+  # standing llama.cpp back up for one model, and a number produced on a different ENGINE and a
+  # different QUANT pools with nothing else in this series — see the header note. The build that
+  # drops straight in is an int4 AWQ / compressed-tensors, which would still be ~68 GB for the
+  # non-n-gram portion against ~29 GB.
+  #
+  # SO: revisit if an IQ3-class or int4 AWQ build appears AND the arithmetic above is redone
+  # against real file sizes; or on a card that holds ~68 GB; or with 128 GB+ host RAM and the
+  # acceptance that experts stream over PCIe — which the qwen3.6-35b-a3b entry above measured at
+  # 3.8 tok/s and 212.8 s per Mode B plan for a mere ~6 GB of offload.
 
   # muse-glimmer-30b REMOVED 2026-08-12. Its Harmony-style template always opens an analysis
-  # channel that `--reasoning off --reasoning-budget 0` does not suppress, and under that chat
-  # format llama.cpp reports `"grammar": ""` — the JSON schema is never compiled into a
+  # channel that `--reasoning off --reasoning-budget 0` did not suppress, and under that chat
+  # format llama.cpp reported `"grammar": ""` — the JSON schema was never compiled into a
   # decoding grammar, so its structured output was unconstrained while every other model here
-  # was grammar-bound. The token starvation was fixable (a per-model allowance got it writing
-  # real explanations again); the grammar gap is not, and it means its Mode A/B/C numbers were
-  # never comparable to the rest of this table. Dropped rather than reported with an asterisk.
-  # The gguf is still on disk — re-add an entry with `reasoning_overhead_tokens: 1200` to
-  # revisit it if llama.cpp gains grammar support for this chat format.
+  # was grammar-bound. Its Mode A/B/C numbers were therefore never comparable to the rest of
+  # that table. NOTE THAT THE REASON IS NOW STALE: vLLM constrains structured output through
+  # xgrammar/outlines rather than a per-template llama.cpp grammar, so the gap that disqualified
+  # it does not exist on this backend. Re-adding it means finding a compressed-tensors quant.
 
-  # nemotron3.5-lightning-30b-a3b REMOVED 2026-08-14, after one sweep. It loaded and ran
-  # (25.2 GB with `n_cpu_moe: 42`, ~76 tok/s despite most of its expert stack in system RAM —
-  # the A3B design working as advertised), so this is not a compatibility removal. It was
-  # simply last or near-last on the numbers that matter: 11% Mode B viable and 63% requirement
-  # coverage on the fused-prompt sweep, against 34%/86% for the best model in the same run.
-  # Carrying it costs ~25 GB of disk and a model's worth of wall clock per sweep for a row
-  # nobody reads. The gguf stays on disk; re-add an entry with the same `n_cpu_moe`/
-  # `--tensor-split` to revisit it.
+  # nemotron3.5-lightning-30b-a3b REMOVED 2026-08-14, after one sweep. It loaded and ran, so
+  # this is not a compatibility removal. It was simply last or near-last on the numbers that
+  # matter: 11% Mode B viable and 63% requirement coverage on the fused-prompt sweep, against
+  # 34%/86% for the best model in the same run.
 
 paths:
   questions: "questions.yaml"
@@ -443,33 +935,12 @@ convergence:
   repair_stall_patience: 2
   repair_release_max: 3
 
-  # PLATEAU STOP — give up when the progress metric (violations, coverage) has not moved for
-  # this many consecutive attempts. It is recorded as censor_reason "plateau" and is still
-  # CENSORED, not a failure: the model might have converged later, we stopped asking. Saves the
-  # GPU time that was going into re-confirming a stuck case (gemma4-e4b sat at 88.9% for seven
-  # attempts). A deadlock release resets the counter, so the breaker always gets a fair chance.
   plateau_patience: 3
-  # `blind` is deliberately absent: repetition IS its measurement — it samples independently to
-  # estimate how often a good plan appears by luck, so identical draws are expected and
-  # early-stopping on them would truncate the distribution being measured. `repair` dropped
-  # 2026-08-08 with the variant itself — see `enabled_variants` above.
   plateau_variants: [repair]
 
   seed_stride: 1000
   temperature_step: 0.05
   temperature_max: 0.80
-
-  # Known-bad prerequisite edges to exclude from scoring, as "COURSE->PREREQ".
-  # Mode C COMPOUNDS a wrong edge — the same one is re-hit on every attempt, so it costs a
-  # model the whole run rather than one violation. Excluding is loud: the list is printed in
-  # the report header and stored in meta_convergence.json.
-  excluded_prereq_edges: []
-
-  # NO LONGER A CONFIG KEY, as of 2026-08-08 (was a single fixed path here). The active
-  # program changes per `--major`/per sweep entry, so a single hard-coded path stopped making
-  # sense — Mode C looks BY CONVENTION for `locked_slots/<program-slug>.yaml` (see
-  # `harness/convergence.locked_slots_path_for`) and skips the task entirely for a program that
-  # doesn't have one rather than erroring. Those files are the last hand-authored data here.
 
 decision:
   mode_b_viable_floor: 0.90
@@ -499,32 +970,42 @@ decision:
 # reasoning budget can never crowd out the JSON plan that has to follow it — without that, a
 # truncated plan would be an artifact of too-small a token ceiling, not a finding about
 # reasoning itself.
-thinking:
-  # ===========================================================================================
-  # MEASURED 2026-08-21 AT budget_tokens 2048, 4 programs x 7 models x 5 scenarios (140
-  # model-scenarios per arm), thinking ON vs OFF on the identical prompt/schema/scorer.
-  # Every model DID reason (3686-4782 chars average), so none of this is a model ignoring the
-  # instruction. Reverted to 512 and out of `default_tasks` on the result:
-  #
-  #   REASONING DOES NOT PRODUCE A MORE BALANCED SCHEDULE. Mean credit spread got WORSE on 5 of
-  #   7 models. On qwen3.8-27b — the model the hypothesis was about, which front-loads early
-  #   terms and empties the late ones — spread went 7.5 -> 11.0 across 20 scenarios. One
-  #   scenario improved dramatically (fresh-start 12 -> 5) and did not survive aggregation.
-  #   This REPLICATES the earlier finding at a smaller budget (see `runner._run_staged_plan`),
-  #   so it is now measured twice, at 512 and at 2048.
-  #
-  #   WHAT IT DID BUY was viability, 65 -> 86 of 140 — but almost entirely on two models that
-  #   were failing at baseline: qwen3.6-27b (3 -> 16 of 20) and qwen3.6-35b-a3b (7 -> 13).
-  #   The three gemma entries gained exactly ZERO, and no model that was already succeeding
-  #   improved. That is a rescue mechanism for a weak baseline, not a planning improvement,
-  #   and the repair loop already buys more of it for less (0.44 -> 0.89 coverage).
-  #
-  #   COST: 3-4x wall clock, every program, every model.
-  #
-  #   ⚠ CAVEAT ON RE-READING THESE NUMBERS: `credit_spread` is max-min across NON-EMPTY
-  #   semesters, and thinking frequently emptied the final term (semesters_used dropped on 5 of
-  #   the first 10 model-programs). Compressing into fewer terms IMPROVES the spread metric
-  #   while making the tail worse — so the balance numbers above, unflattering as they are,
-  #   still flatter the thinking arm. Fix the metric before re-running this experiment.
-  # ===========================================================================================
-  budget_tokens: 512
+# thinking: REMOVED 2026-08-24, along with the `plan_b_thinking` task, `run_mode_b_thinking`,
+# `run_thinking_experiment` and the `--tasks plan_b_thinking` entry point. Pre-plan reasoning
+# has been tried three times and has never paid.
+#
+# THE MEASUREMENT IT RESTS ON is 2026-08-21, on llama.cpp, at budget_tokens 2048: 4 programs x
+# 7 models x 5 scenarios, 140 model-scenarios per arm, thinking ON vs OFF on the identical
+# prompt/schema/scorer. Every model DID reason (3686-4782 chars average), so none of it was a
+# model ignoring the instruction:
+#
+#   * REASONING DID NOT PRODUCE A MORE BALANCED SCHEDULE. Mean credit spread got WORSE on 5 of
+#     7 models. On qwen3.8-27b — the model the hypothesis was about — spread went 7.5 -> 11.0
+#     across 20 scenarios. This replicated an earlier finding at budget 512, so it was measured
+#     twice.
+#   * WHAT IT BOUGHT was viability, 65 -> 86 of 140, but almost entirely on two models that
+#     were failing at baseline (qwen3.6-27b 3 -> 16, qwen3.6-35b-a3b 7 -> 13). The three gemma
+#     entries gained ZERO and no model that was already succeeding improved. A rescue mechanism
+#     for a weak baseline, not a planning improvement — and the repair loop already buys more
+#     of it for less (coverage 0.44 -> 0.89).
+#   * COST: 3-4x wall clock, every program, every model.
+#
+# ⚠ THE THIRD ATTEMPT (2026-08-23, vLLM) PROVES NOTHING AND MUST NOT BE CITED. Its numbers
+# looked catastrophic — 57 of 65 plans truncated, 3 of 65 parseable — but that was a HARNESS
+# bug, not the model: `budget_tokens` meant a server-side reasoning CAP under llama.cpp
+# (`--reasoning-budget`) and mere output HEADROOM under vLLM, which has no cap at all. Carried
+# across unchanged, it left a 4608-token ceiling for ~3400 tokens of reasoning plus a
+# ~1200-token schedule. A budget failure scored as a planning failure. Reasoning was also being
+# silently discarded for part of that window (the client read llama.cpp's
+# `delta.reasoning_content`; vLLM streams `delta.reasoning`), so `reasoning_chars` read 0 while
+# the model was plainly reasoning.
+#
+# SO: pre-plan reasoning has never had a clean test on vLLM. It is removed on the llama.cpp
+# evidence, which was clean, and on the cost. If it is ever revisited, the two prerequisites
+# are (1) size the ceiling from the observed reasoning distribution — p50 3409, p90 4270, max
+# 5384 tokens on qwen3.8-27b — and (2) note that `credit_spread` was FIXED on 2026-08-23 to
+# count abandoned trailing terms, which the old numbers above did not; they flattered the
+# thinking arm, since reasoning frequently emptied the final term.
+#
+# `run.advising_thinking` is a SEPARATE switch and still exists: it decides whether the QA and
+# explain stages reason, is off by default, and is not what was removed here.

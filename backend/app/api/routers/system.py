@@ -4,7 +4,7 @@ API version advances."""
 
 from fastapi import APIRouter
 
-from app.services.llamacpp_client import LlamaCppClient
+from app.services.vllm_client import VllmClient
 
 router = APIRouter(tags=["system"])
 
@@ -19,6 +19,6 @@ async def llm_health():
     """Verify llama-server is reachable and has the configured model loaded, without
     running inference. Hits ``/health`` and ``/v1/models`` only, never ``/v1/chat/completions``.
     """
-    client = LlamaCppClient()
+    client = VllmClient()
     ok, detail = await client.health()
     return {"ok": ok, "detail": detail, "model": client.model}

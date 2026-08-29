@@ -13,7 +13,7 @@ import pytest
 
 from app.models.schemas import Course, StudentProfile
 from app.services.ai_planner import AiPlanDraft, AiSemester
-from app.services.llamacpp_client import ModelResponseError
+from app.services.vllm_client import ModelResponseError
 from app.services.plan_refine import refine_plan
 from app.services.planner_db import ProgramCatalog, RequirementGroup
 
@@ -274,18 +274,18 @@ def test_start_over_creeps_the_temperature_so_repeated_presses_explore():
     class _Recorder(_StubClient):
         pass
 
-    original = plan_refine.LlamaCppClient
+    original = plan_refine.VllmClient
 
     def _capture(*args, **kwargs):
         seen.append(kwargs.get("temperature"))
         return _Recorder(AiPlanDraft(semesters=[], rationale=""))
 
-    plan_refine.LlamaCppClient = _capture
+    plan_refine.VllmClient = _capture
     try:
         for attempt in (1, 2, 5):
             _run(_profile(), _catalog(), plan, "start-over", _StubClient(), attempt=attempt)
     finally:
-        plan_refine.LlamaCppClient = original
+        plan_refine.VllmClient = original
 
     assert seen == sorted(seen), "temperature never goes down"
     assert seen[0] < seen[-1], "pressing it again samples more widely"

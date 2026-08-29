@@ -144,7 +144,8 @@ class PlanScore:
     missing_requirements: list[str] = field(default_factory=list)
     planned_credits: int = 0
     semester_credits: list[int] = field(default_factory=list)
-    credit_spread: int = 0              # max - min across non-empty semesters (diagnostic)
+    credit_spread: int = 0              # max - min across the WHOLE horizon (diagnostic)
+    credit_spread_nonempty: int = 0     # pre-2026-08-23 definition, for old comparisons
     idle_credits: int = 0               # unused capacity while requirements went unmet
     semesters_used: int = 0              # non-empty semesters, vs profile.semesters_to_plan
     semesters_available: int = 0
@@ -165,6 +166,7 @@ class PlanScore:
             "planned_credits": self.planned_credits,
             "semester_credits": self.semester_credits,
             "credit_spread": self.credit_spread,
+            "credit_spread_nonempty": self.credit_spread_nonempty,
             "idle_credits": self.idle_credits,
             "semesters_used": self.semesters_used,
             "semesters_available": self.semesters_available,
@@ -342,8 +344,36 @@ def score_plan(
     # credit_spread alone.
     score.semesters_available = profile.semesters_to_plan
     score.semesters_used = sum(1 for c in score.semester_credits if c > 0)
+    # CREDIT SPREAD OVER THE WHOLE HORIZON, counting terms the plan abandoned as the zeros they
+    # are. CHANGED 2026-08-23; it used to filter to non-empty semesters, and that made the
+    # metric reward the failure it was supposed to expose.
+    #
+    # THE FLAW, in the words of the experiment it corrupted (see config.yaml's `thinking:`
+    # block): "credit_spread is max-min across NON-EMPTY semesters, and thinking frequently
+    # emptied the final term. Compressing into fewer terms IMPROVES the spread metric while
+    # making the tail worse — so the balance numbers above, unflattering as they are, still
+    # flatter the thinking arm." A model that packs 8 semesters of work into 6 and abandons two
+    # scored BETTER than one that spread the same courses evenly across all 8, because the two
+    # empty terms were deleted before the max-min was taken.
+    #
+    # The question this metric is asked is "is the load even across the terms this student
+    # has", and a term with nothing in it is part of that answer. `semesters_to_plan` is the
+    # denominator, and a plan shorter than the horizon is padded with zeros rather than
+    # truncated to fit.
+    #
+    # `credit_spread_nonempty` KEEPS THE OLD DEFINITION, because every number recorded before
+    # this date used it and a metric that silently changes meaning is worse than one that was
+    # wrong. Anything comparing against `results_full_3060/`, `results_full_3090_llamacpp/` or
+    # `results_full_3090_vllm_parallel4/` must read that field, not this one.
+    #
+    # FINISHING EARLY IS STILL NOT ILLEGAL — nothing here is scored, both fields are
+    # diagnostics, and the `accelerate` scenario is supposed to compress. The point is that the
+    # compression is now visible instead of free.
+    horizon = max(int(profile.semesters_to_plan or 0), len(score.semester_credits))
+    padded = list(score.semester_credits) + [0] * (horizon - len(score.semester_credits))
+    score.credit_spread = (max(padded) - min(padded)) if padded else 0
     nonempty = [c for c in score.semester_credits if c > 0]
-    score.credit_spread = (max(nonempty) - min(nonempty)) if nonempty else 0
+    score.credit_spread_nonempty = (max(nonempty) - min(nonempty)) if nonempty else 0
 
     satisfied = {canon(normalize_code(c)) for c in profile.completed_courses} | seen
     score.requirement_coverage, score.missing_requirements = requirement_coverage(

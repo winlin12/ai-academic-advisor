@@ -390,14 +390,21 @@ def _latency_section(records: list[dict]) -> list[str]:
 
     lines = ["### What a student waits for", "",
              "Wall-clock seconds, measured after warmup so model load is excluded. **TTFT** = "
-             "request sent → first content token.", ""]
+             "request sent → first content token. **Decode tok/s** = completion tokens over "
+             "the time after TTFT.", "",
+             "These do not pool with anything recorded before 2026-08-22: on vLLM the timings "
+             "are split from the wall clock rather than read from the engine, so queue time "
+             "and HTTP land in TTFT where llama.cpp's counters excluded them, and prefix "
+             "caching means a repeated prompt is not re-prefilled at all. Every record "
+             "carries `timings_source` saying which of the two produced it.", ""]
 
     if stages:
         lines += [
             "*Streaming call sites* — the student sees prose appear at TTFT, so this is the "
             "perceived wait.", "",
-            "| Model | Stage | TTFT p50 | TTFT mean | TTFT p95 | Total p50 | n |",
-            "|---|---|---|---|---|---|---|",
+            "| Model | Stage | TTFT p50 | TTFT mean | TTFT p95 | Total p50 | "
+            "Decode tok/s p50 | n |",
+            "|---|---|---|---|---|---|---|---|",
         ]
         for model in sorted({r["model"] for r in records if r.get("stage") in stages}):
             for stage in stages:
@@ -409,7 +416,8 @@ def _latency_section(records: list[dict]) -> list[str]:
                 lines.append(
                     f"| `{model}` | {stage} | {_stat(ttft, 'p50', 2)} "
                     f"| {_stat(ttft, 'mean', 2)} | {_stat(ttft, 'p95', 2)} "
-                    f"| {_stat([r.get('total_s') for r in recs], 'p50')} | {len(recs)} |"
+                    f"| {_stat([r.get('total_s') for r in recs], 'p50')} "
+                    f"| {_stat(_decode_tps(recs), 'p50', 1)} | {len(recs)} |"
                 )
         lines.append("")
 
@@ -421,10 +429,10 @@ def _latency_section(records: list[dict]) -> list[str]:
             "every retry, which is also what the student would sit through.", "",
             "| Model | " + " | ".join(
                 f"{_mode_label(s)} TTFT p50 | {_mode_label(s)} total p50 | "
-                f"{_mode_label(s)} total p95"
+                f"{_mode_label(s)} total p95 | {_mode_label(s)} tok/s p50"
                 for s in plan_stages
             ) + " |",
-            "|---" * (3 * len(plan_stages) + 1) + "|",
+            "|---" * (4 * len(plan_stages) + 1) + "|",
         ]
         for model in sorted({r["model"] for r in records if r.get("stage") in plan_stages}):
             cells = []
@@ -435,6 +443,7 @@ def _latency_section(records: list[dict]) -> list[str]:
                     _stat([r.get("ttft_s") for r in recs], "p50", 2),
                     _stat([r.get("total_s") for r in recs], "p50"),
                     _stat([r.get("total_s") for r in recs], "p95"),
+                    _stat(_decode_tps(recs), "p50", 1),
                 ]
             lines.append(f"| `{model}` | " + " | ".join(cells) + " |")
         lines.append("")
@@ -579,16 +588,27 @@ def _env_section(records: list[dict]) -> list[str]:
     envs = [r for r in records if r.get("stage") == "env"]
     if not envs:
         return []
-    lines = ["### Environment (measured, not assumed)", "",
-             "| Model | VRAM delta MB | GPU offload | Server n_ctx | Matches config? |",
-             "|---|---|---|---|---|"]
+    lines = [
+        "### Environment (measured, not assumed)", "",
+        "**KV tokens** is what the engine had left for the KV cache after this model's weights "
+        "were resident, from vLLM's own startup log. **Max concurrency** is that divided by "
+        "the configured context — the number of full-window requests this model can hold at "
+        "once, and the ceiling the move to vLLM was made to raise. It is a floor on real "
+        "concurrency rather than a cap: it assumes every sequence runs to the full window, and "
+        "prefix caching counts the shared prompt blocks once rather than per sequence.", "",
+        "| Model | VRAM delta MB | KV tokens | Max concurrency | Server n_ctx | "
+        "Matches config? |",
+        "|---|---|---|---|---|---|"]
     for env in envs:
-        offload = env.get("offload") or {}
-        layers = offload.get("layers") or "UNVERIFIED"
+        kv = env.get("kv_cache") or {}
+        tokens = kv.get("kv_cache_tokens")
+        concurrency = kv.get("max_concurrency")
         match = env.get("ctx_matches_config")
         lines.append(
             f"| `{env['model']}` | {env.get('vram_delta_mb')} "
-            f"| {layers} ({offload.get('source', '?')}) | {env.get('server_n_ctx')} "
+            f"| {f'{tokens:,}' if tokens else 'UNVERIFIED'} "
+            f"| {f'{concurrency:.2f}x' if concurrency else '—'} "
+            f"| {env.get('server_n_ctx')} "
             f"| {'yes' if match else ('**NO**' if match is False else '?')} |"
         )
     return lines + [""]
@@ -745,92 +765,137 @@ def _review_queue(records: list[dict], out_path: Path) -> int:
     return len(rows)
 
 
-def spec_sweep_table(root: Path) -> list[str]:
-    """Markdown decode-throughput table across the `run.py spec-sweep` arms, or [] if none ran.
+def _decode_tps(recs: list[dict[str, Any]]) -> list[float]:
+    """Decode throughput per record: completion tokens over the time spent producing them.
 
-    HERE, NOT IN run.py, so `report` and `spec-sweep --compare-only` render one table from one
-    implementation — report.py already owns every other results-to-markdown table, and a second
-    copy in the CLI is how the two drift into disagreeing about the same numbers.
+    WALL-CLOCK DERIVED under vLLM (see `vllm_client.chat`), where llama.cpp reported its own
+    `predicted_ms`. Records are dropped rather than defaulted when either number is missing,
+    and very short generations (<= 20 tokens) are excluded because a handful of tokens divided
+    by a sub-100 ms window is dominated by scheduling noise.
 
-    Reads `results/results_spec_<type>/runs_baseline.jsonl`, one directory per arm, written by
-    `run.py spec-sweep`. Speculative decoding changes only HOW tokens are produced, never which
-    ones, so the plan/QA tables above are the arms' quality check and this one is purely about
-    speed — the two belong in the same report rather than in separate places.
+    COMPUTED FROM `total_s`, NOT FROM `predicted_ms`, and the difference is not cosmetic. For a
+    single-generation record the two are identical by construction — the client derives
+    `predicted_ms` as exactly `(total_s - ttft_s) * 1000`. But a MULTI-ATTEMPT stage breaks that
+    equality: Mode C runs up to `repair_passes` more generations, and the record's `eval_count`
+    is the SUM over all of them while `predicted_ms` describes only the last one. Dividing the
+    sum by the last attempt's window reported ~3x the real rate.
+    MEASURED 2026-08-22 on a 3-attempt Mode C record: 1914 tokens, predicted_ms 14272,
+    total_s 48.7 — the old expression printed 134.1 tok/s for a model whose true rate is 39.8,
+    which is not merely wrong but physically impossible (a dense 27B at 134 tok/s would need
+    ~2.4 TB/s against this card's 1008 GB/s).
+
+    `total_s - ttft_s` pairs the summed tokens with the elapsed window that produced them. It
+    still slightly overstates, because it subtracts only the FIRST attempt's prefill and later
+    attempts prefill again — so read it as an upper bound on decode rate for Mode C.
+
+    ⚠ IT ALSO OVERSTATES WHEREVER THE MODEL EMITS WITHHELD REASONING. vLLM's `qwen3` reasoning
+    parser buffers the think block and releases nothing on the content channel until it closes,
+    so `ttft_s` silently absorbs however long the model spent thinking, while `eval_count`
+    counts those tokens. MEASURED 2026-08-22 on a QA record: eval_count 93, but the visible
+    answer tokenizes to 41 — the other 52 were think tokens generated inside the 1.32 s
+    "ttft" window, and 93/(2.27-1.32) printed 97 tok/s for a model whose ceiling is 56.7.
+    The QA stage is where this bites; the plan stages ask for `enable_thinking: false` and
+    their numbers hold up against the ceiling.
+
+    HOW TO SANITY-CHECK ANY NUMBER THIS PRODUCES: a dense model cannot decode faster than its
+    memory bandwidth allows. qwen3.8-27b reads 17.78 GB of text weights per token (18.70 GB of
+    tensors less a 0.92 GB vision tower it never touches during text decode) against this
+    card's 1008 GB/s, so 56.7 tok/s is a hard ceiling for UNSPECULATED decode. A figure above
+    it means either speculative decoding is on — which legitimately breaks it, by emitting
+    several tokens per weight read — or the token count and the time window do not describe the
+    same work.
+    """
+    out = []
+    for r in recs:
+        ec, tot, ttft = r.get("eval_count") or 0, r.get("total_s") or 0, r.get("ttft_s")
+        if ec > 20 and ttft is not None and tot > ttft:
+            out.append(ec / (tot - ttft))
+    return out
+
+
+def spec_arm_table(root: Path) -> list[str]:
+    """Decode throughput across the `run.py run --spec <method>` arms, or [] if none ran.
+
+    HERE, NOT IN run.py, so the comparison renders from the same implementation as every other
+    results-to-markdown table — a second copy in the CLI is how the two drift into disagreeing
+    about the same numbers.
+
+    Reads `results/results_spec_<method>/runs_baseline.jsonl`, one directory per arm, written by
+    `MODEL_EVAL_RESULTS_DIR=results/results_spec_<m> run.py run --spec <m>`.
+
+    THE `identical output` COLUMN IS THE POINT, not a nicety. Speculative decoding is supposed
+    to be a pure speed optimization: vLLM's rejection sampling is designed to preserve the
+    target model's output distribution exactly, so at a fixed seed a speculative arm should
+    reproduce the plain arm's text. If it does not, the speedup is not free — it is a different
+    sampling path, and its quality numbers must not be pooled with the baseline's. That is
+    exactly the trap the llama.cpp draft-model era fell into: the two 27B runs measured on
+    2026-08-11 returned DIFFERENT PLANS from an identical prompt and seed.
     """
     results = root / "results"
     if not results.is_dir():
         return []
-    arms = [(d.name[len("results_spec_"):].replace("_", "-"), d)
-            for d in sorted(results.iterdir())
+    arms = [(d.name[len("results_spec_"):], d) for d in sorted(results.iterdir())
             if d.is_dir() and d.name.startswith("results_spec_")]
     if not arms:
         return []
-    # "none" is the baseline every other arm is divided by, so it has to come first whatever
-    # the directory sort produced.
+    # "none" is the baseline every other arm is divided by, so it leads whatever the sort did.
     arms.sort(key=lambda a: (a[0] != "none", a[0]))
 
-    def decode_tps(recs: list[dict[str, Any]]) -> float | None:
-        vals = [r["eval_count"] / (r["predicted_ms"] / 1000) for r in recs
-                if (r.get("eval_count") or 0) > 20 and (r.get("predicted_ms") or 0) > 0]
-        return statistics.median(vals) if vals else None
+    loaded = [(name, _by_model_recs(_load(d / "runs_baseline.jsonl"))) for name, d in arms]
+    base_name, base_by_model = loaded[0]
 
-    loaded = [(name, _load(d / "runs_baseline.jsonl")) for name, d in arms]
-    by_arm = [(name, _by_model(recs)) for name, recs in loaded]
-    old = _by_model(_load(root / "results_old/results/runs_baseline.jsonl"))
-    base_name, base_by_model = by_arm[0]
-
-    header = ["Model"] + [f"`{n}` tok/s" for n, _ in by_arm]
-    if len(by_arm) > 1:
-        header += ["Change", "Identical output"]
-    header += ["results_old"]
+    header = ["Model"] + [f"`{n}` tok/s" for n, _ in loaded]
+    if len(loaded) > 1:
+        header += ["Best change", "Identical output"]
     lines = [
-        "## Speculative decoding — `run.py spec-sweep`",
+        "## Speculative decoding — `run.py run --spec <method>`",
         "",
-        "Median decode throughput per model, one column per `--spec-type` arm. Speculative "
-        "decoding drafts cheap tokens and verifies them in one batched pass: it trades spare "
-        "compute for fewer weight reads. Rejected drafts are wasted compute, so an arm CAN "
-        "come out slower than `none` — that is a result, not a bug.",
+        "Median decode throughput per model, one column per arm. Speculation trades spare "
+        "compute for fewer weight reads: it proposes tokens cheaply and verifies them in one "
+        "batched pass. Rejected proposals are wasted compute, so an arm CAN come out slower "
+        "than `none` — that is a result, not a bug.",
+        "",
+        "Measured at `parallel: 1` deliberately. Speculation and batching compete for the same "
+        "spare capacity, so at higher concurrency this comparison understates speculation by "
+        "however much batching already claimed.",
         "",
         "| " + " | ".join(header) + " |",
         "|" + "|".join(["---"] * len(header)) + "|",
     ]
 
-    for model in sorted({m for _, bm in by_arm for m in bm} | set(old)):
-        base = decode_tps(base_by_model.get(model, []))
+    for model in sorted({m for _, bm in loaded for m in bm}):
+        base = _decode_tps(base_by_model.get(model, []))
+        base_med = statistics.median(base) if base else None
         row = [f"`{model}`"]
-        for _, bm in by_arm:
-            tps = decode_tps(bm.get(model, []))
-            row.append(f"{tps:.1f}" if tps else "—")
-        if len(by_arm) > 1:
-            alt = decode_tps(by_arm[1][1].get(model, []))
-            row.append(f"{alt / base:.2f}x" if (base and alt) else "—")
-            # A throughput win on an arm whose TEXT diverged is not comparing like with like:
-            # at a fixed seed the arms should produce nearly the same tokens.
+        best = None
+        for _, bm in loaded:
+            vals = _decode_tps(bm.get(model, []))
+            med = statistics.median(vals) if vals else None
+            row.append(f"{med:.1f}" if med else "—")
+            if med and base_med and med > (best or 0):
+                best = med
+        if len(loaded) > 1:
+            row.append(f"{best / base_med:.2f}x" if (best and base_med) else "—")
+            same, total = 0, 0
             def key(r: dict[str, Any]) -> tuple:
-                return (r.get("stage"), r.get("question_id"), r.get("run_idx"))
+                return (r.get("stage"), r.get("question_id"), r.get("scenario"),
+                        r.get("run_idx"))
             a = {key(r): r.get("output") for r in base_by_model.get(model, [])}
-            b = {key(r): r.get("output") for r in by_arm[1][1].get(model, [])}
-            shared = [k for k in a if k in b]
-            row.append(f"{sum(1 for k in shared if a[k] == b[k])}/{len(shared)}"
-                       if shared else "—")
-        o = decode_tps(old.get(model, []))
-        row.append(f"{o:.1f}" if o else "—")
+            for name, bm in loaded[1:]:
+                b = {key(r): r.get("output") for r in bm.get(model, [])}
+                shared = [k for k in a if k in b]
+                same += sum(1 for k in shared if a[k] == b[k])
+                total += len(shared)
+            row.append(f"{same}/{total}" if total else "—")
         lines.append("| " + " | ".join(row) + " |")
 
-    lines += [
-        "",
-        f"Baseline column is `{base_name}`. `results_old` was recorded on an older llama.cpp "
-        "build (this box was bumped to b10362 for Muse Glimmer support), so it is a drift "
-        "cross-check — not the baseline the speculative-decoding comparison rests on.",
-        "",
-    ]
-    return lines
+    return lines + [""]
 
 
-def _by_model(recs: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+def _by_model_recs(recs: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     out: dict[str, list[dict[str, Any]]] = {}
     for rec in recs:
-        if rec.get("model"):
+        if rec.get("model") and rec.get("stage") != "env":
             out.setdefault(rec["model"], []).append(rec)
     return out
 
@@ -841,7 +906,7 @@ def generate_report(root: Path) -> Path:
     # `MODEL_EVAL_RESULTS_DIR=... run.py report` reads the directory it just wrote instead of
     # config.yaml's default.
     results = root / os.environ.get("MODEL_EVAL_RESULTS_DIR", cfg["paths"]["results_dir"])
-    results.mkdir(exist_ok=True)
+    results.mkdir(parents=True, exist_ok=True)
     baseline = _load(results / "runs_baseline.jsonl")
     mitigated = _load(results / "runs_mitigated.jsonl")
     thinking = _load(results / "runs_thinking.jsonl")
@@ -890,17 +955,16 @@ def generate_report(root: Path) -> Path:
     )
     lines += _scenario_breakdown(baseline, "plan_mode_b")
     if thinking:
-        thinking_budget = (cfg.get("thinking") or {}).get("budget_tokens", "?")
         lines += _plan_section(
             thinking, "plan_mode_b_thinking",
-            "Mode B — thinking variant (`--tasks plan_b_thinking`)",
-            "Same prompt, same schema, same scorer as Mode B above — the only difference is "
-            f"reasoning ON and budget-capped at {thinking_budget} tokens before the plan, "
-            "launched on its own server (see config.yaml's `thinking:` block). Compare this "
-            "table's PLAN_VIABLE/coverage directly against Mode B's own table above — that "
-            "delta is the answer to \"does pre-plan reasoning change anything.\" Not the "
-            "removed post-hoc `rationale` field: that was written after the plan was already "
-            "fixed and could never have changed it.",
+            "Mode B — thinking variant (RETIRED ARM, historical data only)",
+            "Same prompt, same schema, same scorer as Mode B above; the only difference was "
+            "reasoning ON before the plan. THE ARM WAS REMOVED 2026-08-24 and can no longer be "
+            "produced — see config.yaml's `thinking:` note for the measurements that retired "
+            "it. This table renders whatever `runs_thinking.jsonl` a results directory already "
+            "holds, so archived runs keep their arm instead of silently vanishing from the "
+            "report. Compare its PLAN_VIABLE/coverage against Mode B's table above — that "
+            "delta is the answer to \"did pre-plan reasoning change anything.\"",
         )
         avg_chars = _mean([r.get("reasoning_chars") for r in thinking
                            if r.get("stage") == "plan_mode_b_thinking"])
@@ -908,9 +972,12 @@ def generate_report(root: Path) -> Path:
             lines += [f"Average reasoning length: {avg_chars:.0f} characters. Full reasoning "
                       "text is in each run's transcript (`transcripts/<model>/"
                       "plan_mode_b_thinking/`) under the `## Reasoning` heading. A model "
-                      "whose average is 0 has no reasoning channel its template will open — "
-                      "its rows here ARE Mode B, and a flat score against Mode B means "
-                      "nothing happened, not that thinking failed to help.", ""]
+                      "whose average is 0 EITHER has no reasoning channel its template will "
+                      "open, or was recorded against a client that could not read the one it "
+                      "had — vLLM streams reasoning as `delta.reasoning`, and this harness "
+                      "read only llama.cpp's `delta.reasoning_content` between the 2026-08-22 "
+                      "migration and 2026-08-23. Either way a flat score against Mode B means "
+                      "nothing was measured, not that thinking failed to help.", ""]
     lines += _plan_section(
         baseline, "plan_mode_a", "Mode A — the app's real revise-plan path",
         "This is `advisor_agent.revise_plan` as shipped: the model emits a `PlanEditProposal` "
@@ -963,8 +1030,6 @@ def generate_report(root: Path) -> Path:
         "",
     ]
 
-    lines += spec_sweep_table(root)
-
     report_path = results / "report.md"
     report_path.write_text("\n".join(lines))
     print(f"Wrote {report_path} ({count} items in the review queue)")
@@ -982,10 +1047,11 @@ def _discover_school_dirs(root: Path) -> list[tuple[str, Path]]:
         return []
     out = []
     for d in sorted(base.iterdir()):
-        # `results_spec_<type>/` are spec-sweep ARMS, not schools — same school for every one
-        # of them, differing only by --spec-type. Pooling them here would double-count the one
-        # school they ran and invent slugs like "spec_none" in the per-school grid. They are
-        # reported by `spec_sweep_table` instead.
+        # `results_spec_<method>/` are SPECULATIVE-DECODING ARMS, not schools — the same
+        # program every time, differing only in how tokens are proposed. Pooling them here
+        # would double-count that program and invent schools called "spec_mtp" in the
+        # per-school grid. Restored 2026-08-22 alongside `--spec`; the guard predates the vLLM
+        # migration and was briefly dropped with the llama.cpp draft-model plumbing.
         if d.is_dir() and d.name.startswith("results_") \
                 and not d.name.startswith("results_spec_"):
             out.append((d.name[len("results_"):], d))
@@ -1081,16 +1147,15 @@ def generate_summary(root: Path) -> Path:
         "own single-school report suggests — that gap IS the finding.",
     )
     if pooled_thinking:
-        thinking_budget = (yaml.safe_load((root / "config.yaml").read_text())
-                           .get("thinking") or {}).get("budget_tokens", "?")
         lines += _plan_section(
             pooled_thinking, "plan_mode_b_thinking",
-            "Mode B — thinking variant, pooled across every school",
-            "The same select-then-schedule task as the table above, with reasoning ON and "
-            f"capped at {thinking_budget} tokens before the plan starts. Read this table "
-            "against Mode B's directly above it: same prompt, same schema, same scorer, one "
-            "difference. Credit spread is the column to watch if the question is whether "
-            "reasoning produces a more evenly balanced schedule.",
+            "Mode B — thinking variant, pooled (RETIRED ARM, historical data only)",
+            "The same select-then-schedule task as the table above, with reasoning ON before "
+            "the plan. THE ARM WAS REMOVED 2026-08-24 and can no longer be produced — see "
+            "config.yaml's `thinking:` note for why. This renders whatever "
+            "`runs_thinking.jsonl` the archived directories already hold, so an old arm does "
+            "not silently vanish from the report. Read it against Mode B's table directly "
+            "above: same prompt, same schema, same scorer, one difference.",
         )
         avg_chars = _mean([r.get("reasoning_chars") for r in pooled_thinking
                            if r.get("stage") == "plan_mode_b_thinking"])
@@ -1191,9 +1256,14 @@ def generate_summary(root: Path) -> Path:
 
     lines += ["## 4. Mode C — what the repair passes bought, across schools", ""]
     lines += mode_c_cross_school_lines(school_dirs)
+    # SPECULATIVE-DECODING ARMS go in the aggregate report, not a per-school one: they are the
+    # same program under different proposers, so they belong beside the cross-school tables
+    # rather than inside any single school's. `_discover_school_dirs` excludes their
+    # directories from the school grid for the same reason.
+    lines += spec_arm_table(root)
 
     summary_path = root / "results" / "summary.md"
-    summary_path.parent.mkdir(exist_ok=True)
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.write_text("\n".join(lines))
     print(f"Wrote {summary_path} ({len(per_school)} school(s), {len(pooled)} pooled records)")
     return summary_path

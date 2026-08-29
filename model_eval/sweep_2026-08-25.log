@@ -1,0 +1,365 @@
+<frozen site>:107: RuntimeWarning: Unexpected value in sys.prefix, expected /home/wylin/ai-academic-advisor/.venv, got /home/wylin/ai-academic-advisor/model_eval/../.venv
+<frozen site>:107: RuntimeWarning: Unexpected value in sys.exec_prefix, expected /home/wylin/ai-academic-advisor/.venv, got /home/wylin/ai-academic-advisor/model_eval/../.venv
+
+[sweep] 16 program(s):
+  - agriculture    Animal Sciences: Pre-Veterinary Medicine Concentration  [animal-sciences-pre-veterinary-medicine] (curated)
+  - agriculture    Agricultural Economics: Applied Agricultural Economics Concentration  [agricultural-economics-applied-agricultural] (curated)
+  - business       Accounting  [accounting] (curated)
+  - business       Finance  [finance] (curated)
+  - education      Elementary Education  [elementary-education] (curated)
+  - education      English Education  [english-education] (curated)
+  - engineering    Electrical Engineering  [electrical-engineering] (curated)
+  - engineering    Mechanical Engineering  [mechanical-engineering] (curated)
+  - health_human_sciences Nursing  [nursing] (curated)
+  - health_human_sciences Psychological Sciences  [psychological-sciences] (curated)
+  - liberal_arts   Communication: General Communication Concentration  [communication-general-communication] (curated)
+  - liberal_arts   Political Science: American Politics Concentration  [political-science-american-politics] (curated)
+  - polytechnic    Computer and Information Technology  [computer-and-information-technology] (curated)
+  - polytechnic    Construction Management  [construction-management] (curated)
+  - science        Computer Science: Machine Intelligence  [computer-science-machine-intelligence] (curated)
+  - science        Biology  [biology] (curated)
+
+======================================================================
+PROGRAM: animal-sciences-pre-veterinary-medicine — Animal Sciences: Pre-Veterinary Medicine Concentration (agriculture, curated)
+======================================================================
+real_db: dropping 7 requirement_options course(s) not in the current PurdueIO catalog (stale department listing, not a crawl bug): AGR 49500, ASEC 43110, ASEC 53100, FS 48400, HORT 45000, LA 45000, POL 23200
+[real-db] loaded program 91c22dfd-8a19-4a79-b500-513d0871fbc5 from postgresql://catalog:catalog@localhost:5433/catalog_ingestion (2 required + 9 elective requirement group(s), 226 courses in the maximal universe)
+[fixture] Animal Sciences: Pre-Veterinary Medicine Concentration [animal-sciences-pre-veterinary-medicine] — 96 courses, 11 requirement groups, 5 synthesized students
+[run] 4 model(s), tasks=['explain', 'plan_a', 'plan_b', 'qa'] -> /home/wylin/ai-academic-advisor/model_eval/results/results_animal-sciences-pre-veterinary-medicine/runs_baseline.jsonl (mode=w)
+
+=== qwen3.8-27b (server) ===
+[env] qwen3.8-27b: vram_delta=[22199] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 76137, 'max_concurrency': 4.65, 'per_request_tokens': 16384} n_ctx=16384
+  [qwen3.8-27b] replicate 1/1 done (concurrency 4)
+
+=== qwen3.8-27b-thinking (server) ===
+[env] qwen3.8-27b-thinking: vram_delta=[22199] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 76137, 'max_concurrency': 4.65, 'per_request_tokens': 16384} n_ctx=16384
+  [qwen3.8-27b-thinking] replicate 1/1 done (concurrency 4)
+
+=== gemma4-26b (server) ===
+[env] gemma4-26b: vram_delta=[22371] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 69645, 'max_concurrency': 4.25, 'per_request_tokens': 16384} n_ctx=16384
+  [gemma4-26b] replicate 1/1 done (concurrency 4)
+
+=== gemma4-26b-thinking (server) ===
+[env] gemma4-26b-thinking: vram_delta=[22371] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 69707, 'max_concurrency': 4.25, 'per_request_tokens': 16384} n_ctx=16384
+  [gemma4-26b-thinking] replicate 1/1 done (concurrency 4)
+
+======================================================================
+PROGRAM: agricultural-economics-applied-agricultural — Agricultural Economics: Applied Agricultural Economics Concentration (agriculture, curated)
+======================================================================
+real_db: dropping 7 requirement_options course(s) not in the current PurdueIO catalog (stale department listing, not a crawl bug): AGR 49500, ASEC 43110, ASEC 53100, FS 48400, HORT 45000, LA 45000, POL 23200
+[real-db] loaded program 1d3ef99f-03de-4a61-8278-fa3cee3ae2fe from postgresql://catalog:catalog@localhost:5433/catalog_ingestion (3 required + 8 elective requirement group(s), 175 courses in the maximal universe)
+[fixture] Agricultural Economics: Applied Agricultural Economics Concentration [agricultural-economics-applied-agricultural] — 96 courses, 11 requirement groups, 5 synthesized students
+[run] 4 model(s), tasks=['explain', 'plan_a', 'plan_b', 'qa'] -> /home/wylin/ai-academic-advisor/model_eval/results/results_agricultural-economics-applied-agricultural/runs_baseline.jsonl (mode=w)
+
+=== qwen3.8-27b (server) ===
+[env] qwen3.8-27b: vram_delta=[22199] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 76137, 'max_concurrency': 4.65, 'per_request_tokens': 16384} n_ctx=16384
+  [qwen3.8-27b] replicate 1/1 done (concurrency 4)
+
+=== qwen3.8-27b-thinking (server) ===
+[env] qwen3.8-27b-thinking: vram_delta=[22199] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 76137, 'max_concurrency': 4.65, 'per_request_tokens': 16384} n_ctx=16384
+  [qwen3.8-27b-thinking] replicate 1/1 done (concurrency 4)
+
+=== gemma4-26b (server) ===
+[env] gemma4-26b: vram_delta=[22371] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 69645, 'max_concurrency': 4.25, 'per_request_tokens': 16384} n_ctx=16384
+  [gemma4-26b] replicate 1/1 done (concurrency 4)
+
+=== gemma4-26b-thinking (server) ===
+[env] gemma4-26b-thinking: vram_delta=[22371] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 69645, 'max_concurrency': 4.25, 'per_request_tokens': 16384} n_ctx=16384
+  [gemma4-26b-thinking] replicate 1/1 done (concurrency 4)
+
+======================================================================
+PROGRAM: accounting — Accounting (business, curated)
+======================================================================
+real_db: dropping 8 requirement_options course(s) not in the current PurdueIO catalog (stale department listing, not a crawl bug): ACCT 24900, ACCT 51400, ACCT 55700, DSB 23500, FIN 25800, FIN 41500, FIN 41601, MKTG 22300
+  [FAILED] accounting: LookupError: requirement_options names 3 required course(s) not in `courses`: DSB 23500, FIN 25800, MKTG 22300
+
+======================================================================
+PROGRAM: finance — Finance (business, curated)
+======================================================================
+real_db: dropping 7 requirement_options course(s) not in the current PurdueIO catalog (stale department listing, not a crawl bug): ACCT 24900, DSB 23500, FIN 25800, FIN 41250, FIN 41500, FIN 41601, FIN 41650
+  [FAILED] finance: LookupError: requirement_options names 2 required course(s) not in `courses`: DSB 23500, FIN 25800
+
+======================================================================
+PROGRAM: elementary-education — Elementary Education (education, curated)
+======================================================================
+real_db: dropping 1 requirement_options course(s) not in the current PurdueIO catalog (stale department listing, not a crawl bug): EDCI 23451
+[real-db] loaded program 5ef340e5-4771-4725-bfdd-13f40bcdc90e from postgresql://catalog:catalog@localhost:5433/catalog_ingestion (4 required + 8 elective requirement group(s), 111 courses in the maximal universe)
+[fixture] Elementary Education [elementary-education] — 107 courses, 12 requirement groups, 5 synthesized students
+[run] 4 model(s), tasks=['explain', 'plan_a', 'plan_b', 'qa'] -> /home/wylin/ai-academic-advisor/model_eval/results/results_elementary-education/runs_baseline.jsonl (mode=w)
+
+=== qwen3.8-27b (server) ===
+[env] qwen3.8-27b: vram_delta=[22199] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 76137, 'max_concurrency': 4.65, 'per_request_tokens': 16384} n_ctx=16384
+  [qwen3.8-27b] replicate 1/1 done (concurrency 4)
+
+=== qwen3.8-27b-thinking (server) ===
+[env] qwen3.8-27b-thinking: vram_delta=[22199] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 76137, 'max_concurrency': 4.65, 'per_request_tokens': 16384} n_ctx=16384
+  [qwen3.8-27b-thinking] replicate 1/1 done (concurrency 4)
+
+=== gemma4-26b (server) ===
+[env] gemma4-26b: vram_delta=[22371] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 69668, 'max_concurrency': 4.25, 'per_request_tokens': 16384} n_ctx=16384
+  [gemma4-26b] replicate 1/1 done (concurrency 4)
+
+=== gemma4-26b-thinking (server) ===
+[env] gemma4-26b-thinking: vram_delta=[22371] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 69645, 'max_concurrency': 4.25, 'per_request_tokens': 16384} n_ctx=16384
+  [gemma4-26b-thinking] replicate 1/1 done (concurrency 4)
+
+======================================================================
+PROGRAM: english-education — English Education (education, curated)
+======================================================================
+real_db: dropping 1 requirement_options course(s) not in the current PurdueIO catalog (stale department listing, not a crawl bug): EDCI 33300
+[real-db] loaded program 4568beea-375b-477b-a53c-4ef703d83a1f from postgresql://catalog:catalog@localhost:5433/catalog_ingestion (6 required + 8 elective requirement group(s), 154 courses in the maximal universe)
+[fixture] English Education [english-education] — 112 courses, 14 requirement groups, 5 synthesized students
+[run] 4 model(s), tasks=['explain', 'plan_a', 'plan_b', 'qa'] -> /home/wylin/ai-academic-advisor/model_eval/results/results_english-education/runs_baseline.jsonl (mode=w)
+
+=== qwen3.8-27b (server) ===
+[env] qwen3.8-27b: vram_delta=[22199] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 76137, 'max_concurrency': 4.65, 'per_request_tokens': 16384} n_ctx=16384
+  [qwen3.8-27b] replicate 1/1 done (concurrency 4)
+
+=== qwen3.8-27b-thinking (server) ===
+[env] qwen3.8-27b-thinking: vram_delta=[22199] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 76137, 'max_concurrency': 4.65, 'per_request_tokens': 16384} n_ctx=16384
+  [qwen3.8-27b-thinking] replicate 1/1 done (concurrency 4)
+
+=== gemma4-26b (server) ===
+[env] gemma4-26b: vram_delta=[22371] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 69668, 'max_concurrency': 4.25, 'per_request_tokens': 16384} n_ctx=16384
+  [gemma4-26b] replicate 1/1 done (concurrency 4)
+
+=== gemma4-26b-thinking (server) ===
+[env] gemma4-26b-thinking: vram_delta=[22371] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 69668, 'max_concurrency': 4.25, 'per_request_tokens': 16384} n_ctx=16384
+  [gemma4-26b-thinking] replicate 1/1 done (concurrency 4)
+
+======================================================================
+PROGRAM: electrical-engineering — Electrical Engineering (engineering, curated)
+======================================================================
+[real-db] loaded program 20d35bdf-0450-4e8e-8253-c8c2cd2dbad9 from postgresql://catalog:catalog@localhost:5433/catalog_ingestion (2 required + 6 elective requirement group(s), 145 courses in the maximal universe)
+[fixture] Electrical Engineering [electrical-engineering] — 119 courses, 8 requirement groups, 5 synthesized students
+[run] 4 model(s), tasks=['explain', 'plan_a', 'plan_b', 'qa'] -> /home/wylin/ai-academic-advisor/model_eval/results/results_electrical-engineering/runs_baseline.jsonl (mode=w)
+
+=== qwen3.8-27b (server) ===
+[env] qwen3.8-27b: vram_delta=[22199] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 76137, 'max_concurrency': 4.65, 'per_request_tokens': 16384} n_ctx=16384
+  [qwen3.8-27b] replicate 1/1 done (concurrency 4)
+
+=== qwen3.8-27b-thinking (server) ===
+[env] qwen3.8-27b-thinking: vram_delta=[22199] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 76137, 'max_concurrency': 4.65, 'per_request_tokens': 16384} n_ctx=16384
+  [qwen3.8-27b-thinking] replicate 1/1 done (concurrency 4)
+
+=== gemma4-26b (server) ===
+[env] gemma4-26b: vram_delta=[22371] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 69668, 'max_concurrency': 4.25, 'per_request_tokens': 16384} n_ctx=16384
+  [gemma4-26b] replicate 1/1 done (concurrency 4)
+
+=== gemma4-26b-thinking (server) ===
+[env] gemma4-26b-thinking: vram_delta=[22371] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 69707, 'max_concurrency': 4.25, 'per_request_tokens': 16384} n_ctx=16384
+  [gemma4-26b-thinking] replicate 1/1 done (concurrency 4)
+
+======================================================================
+PROGRAM: mechanical-engineering — Mechanical Engineering (engineering, curated)
+======================================================================
+[real-db] loaded program 2b0d3e40-9b24-4f33-a845-21f315586397 from postgresql://catalog:catalog@localhost:5433/catalog_ingestion (1 required + 6 elective requirement group(s), 129 courses in the maximal universe)
+[fixture] Mechanical Engineering [mechanical-engineering] — 114 courses, 7 requirement groups, 5 synthesized students
+[run] 4 model(s), tasks=['explain', 'plan_a', 'plan_b', 'qa'] -> /home/wylin/ai-academic-advisor/model_eval/results/results_mechanical-engineering/runs_baseline.jsonl (mode=w)
+
+=== qwen3.8-27b (server) ===
+[env] qwen3.8-27b: vram_delta=[22199] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 76137, 'max_concurrency': 4.65, 'per_request_tokens': 16384} n_ctx=16384
+  [qwen3.8-27b] replicate 1/1 done (concurrency 4)
+
+=== qwen3.8-27b-thinking (server) ===
+[env] qwen3.8-27b-thinking: vram_delta=[22199] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 76137, 'max_concurrency': 4.65, 'per_request_tokens': 16384} n_ctx=16384
+  [qwen3.8-27b-thinking] replicate 1/1 done (concurrency 4)
+
+=== gemma4-26b (server) ===
+[env] gemma4-26b: vram_delta=[22371] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 69668, 'max_concurrency': 4.25, 'per_request_tokens': 16384} n_ctx=16384
+  [gemma4-26b] replicate 1/1 done (concurrency 4)
+
+=== gemma4-26b-thinking (server) ===
+[env] gemma4-26b-thinking: vram_delta=[22381] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 69730, 'max_concurrency': 4.26, 'per_request_tokens': 16384} n_ctx=16384
+  [gemma4-26b-thinking] replicate 1/1 done (concurrency 4)
+
+======================================================================
+PROGRAM: nursing — Nursing (health_human_sciences, curated)
+======================================================================
+[real-db] loaded program 912c4a09-14c1-4571-9827-68202283b661 from postgresql://catalog:catalog@localhost:5433/catalog_ingestion (4 required + 5 elective requirement group(s), 85 courses in the maximal universe)
+[fixture] Nursing [nursing] — 85 courses, 9 requirement groups, 5 synthesized students
+[run] 4 model(s), tasks=['explain', 'plan_a', 'plan_b', 'qa'] -> /home/wylin/ai-academic-advisor/model_eval/results/results_nursing/runs_baseline.jsonl (mode=w)
+
+=== qwen3.8-27b (server) ===
+[env] qwen3.8-27b: vram_delta=[22199] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 76137, 'max_concurrency': 4.65, 'per_request_tokens': 16384} n_ctx=16384
+  [qwen3.8-27b] replicate 1/1 done (concurrency 4)
+
+=== qwen3.8-27b-thinking (server) ===
+[env] qwen3.8-27b-thinking: vram_delta=[22199] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 76137, 'max_concurrency': 4.65, 'per_request_tokens': 16384} n_ctx=16384
+  [qwen3.8-27b-thinking] replicate 1/1 done (concurrency 4)
+
+=== gemma4-26b (server) ===
+[env] gemma4-26b: vram_delta=[22371] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 69645, 'max_concurrency': 4.25, 'per_request_tokens': 16384} n_ctx=16384
+  [gemma4-26b] replicate 1/1 done (concurrency 4)
+
+=== gemma4-26b-thinking (server) ===
+[env] gemma4-26b-thinking: vram_delta=[22371] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 69668, 'max_concurrency': 4.25, 'per_request_tokens': 16384} n_ctx=16384
+  [gemma4-26b-thinking] replicate 1/1 done (concurrency 4)
+
+======================================================================
+PROGRAM: psychological-sciences — Psychological Sciences (health_human_sciences, curated)
+======================================================================
+[real-db] loaded program 064bc0a8-eb64-47cb-a2d0-97dafcbff67f from postgresql://catalog:catalog@localhost:5433/catalog_ingestion (2 required + 5 elective requirement group(s), 111 courses in the maximal universe)
+[fixture] Psychological Sciences [psychological-sciences] — 111 courses, 7 requirement groups, 5 synthesized students
+[run] 4 model(s), tasks=['explain', 'plan_a', 'plan_b', 'qa'] -> /home/wylin/ai-academic-advisor/model_eval/results/results_psychological-sciences/runs_baseline.jsonl (mode=w)
+
+=== qwen3.8-27b (server) ===
+[env] qwen3.8-27b: vram_delta=[22199] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 76137, 'max_concurrency': 4.65, 'per_request_tokens': 16384} n_ctx=16384
+  [qwen3.8-27b] replicate 1/1 done (concurrency 4)
+
+=== qwen3.8-27b-thinking (server) ===
+[env] qwen3.8-27b-thinking: vram_delta=[22199] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 76137, 'max_concurrency': 4.65, 'per_request_tokens': 16384} n_ctx=16384
+  [qwen3.8-27b-thinking] replicate 1/1 done (concurrency 4)
+
+=== gemma4-26b (server) ===
+[env] gemma4-26b: vram_delta=[22381] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 69730, 'max_concurrency': 4.26, 'per_request_tokens': 16384} n_ctx=16384
+  [gemma4-26b] replicate 1/1 done (concurrency 4)
+
+=== gemma4-26b-thinking (server) ===
+[env] gemma4-26b-thinking: vram_delta=[22371] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 69668, 'max_concurrency': 4.25, 'per_request_tokens': 16384} n_ctx=16384
+  [gemma4-26b-thinking] replicate 1/1 done (concurrency 4)
+
+======================================================================
+PROGRAM: communication-general-communication — Communication: General Communication Concentration (liberal_arts, curated)
+======================================================================
+real_db: dropping 2 requirement_options course(s) not in the current PurdueIO catalog (stale department listing, not a crawl bug): COM 49503, COM 49702
+[real-db] loaded program 96f21961-d6b1-4afb-89f1-279c8056aeb5 from postgresql://catalog:catalog@localhost:5433/catalog_ingestion (3 required + 7 elective requirement group(s), 111 courses in the maximal universe)
+[fixture] Communication: General Communication Concentration [communication-general-communication] — 111 courses, 10 requirement groups, 5 synthesized students
+[run] 4 model(s), tasks=['explain', 'plan_a', 'plan_b', 'qa'] -> /home/wylin/ai-academic-advisor/model_eval/results/results_communication-general-communication/runs_baseline.jsonl (mode=w)
+
+=== qwen3.8-27b (server) ===
+[env] qwen3.8-27b: vram_delta=[22199] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 76137, 'max_concurrency': 4.65, 'per_request_tokens': 16384} n_ctx=16384
+  [qwen3.8-27b] replicate 1/1 done (concurrency 4)
+
+=== qwen3.8-27b-thinking (server) ===
+[env] qwen3.8-27b-thinking: vram_delta=[22199] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 76137, 'max_concurrency': 4.65, 'per_request_tokens': 16384} n_ctx=16384
+  [qwen3.8-27b-thinking] replicate 1/1 done (concurrency 4)
+
+=== gemma4-26b (server) ===
+[env] gemma4-26b: vram_delta=[22371] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 69668, 'max_concurrency': 4.25, 'per_request_tokens': 16384} n_ctx=16384
+  [gemma4-26b] replicate 1/1 done (concurrency 4)
+
+=== gemma4-26b-thinking (server) ===
+[env] gemma4-26b-thinking: vram_delta=[22371] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 69707, 'max_concurrency': 4.25, 'per_request_tokens': 16384} n_ctx=16384
+  [gemma4-26b-thinking] replicate 1/1 done (concurrency 4)
+
+======================================================================
+PROGRAM: political-science-american-politics — Political Science: American Politics Concentration (liberal_arts, curated)
+======================================================================
+[real-db] loaded program c2ad4c09-930a-4807-929b-3a40590c2d42 from postgresql://catalog:catalog@localhost:5433/catalog_ingestion (1 required + 7 elective requirement group(s), 67 courses in the maximal universe)
+[fixture] Political Science: American Politics Concentration [political-science-american-politics] — 67 courses, 8 requirement groups, 5 synthesized students
+[run] 4 model(s), tasks=['explain', 'plan_a', 'plan_b', 'qa'] -> /home/wylin/ai-academic-advisor/model_eval/results/results_political-science-american-politics/runs_baseline.jsonl (mode=w)
+
+=== qwen3.8-27b (server) ===
+[env] qwen3.8-27b: vram_delta=[22199] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 76137, 'max_concurrency': 4.65, 'per_request_tokens': 16384} n_ctx=16384
+  [qwen3.8-27b] replicate 1/1 done (concurrency 4)
+
+=== qwen3.8-27b-thinking (server) ===
+[env] qwen3.8-27b-thinking: vram_delta=[22199] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 76137, 'max_concurrency': 4.65, 'per_request_tokens': 16384} n_ctx=16384
+  [qwen3.8-27b-thinking] replicate 1/1 done (concurrency 4)
+
+=== gemma4-26b (server) ===
+[env] gemma4-26b: vram_delta=[22381] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 69730, 'max_concurrency': 4.26, 'per_request_tokens': 16384} n_ctx=16384
+  [gemma4-26b] replicate 1/1 done (concurrency 4)
+
+=== gemma4-26b-thinking (server) ===
+[env] gemma4-26b-thinking: vram_delta=[22371] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 69668, 'max_concurrency': 4.25, 'per_request_tokens': 16384} n_ctx=16384
+  [gemma4-26b-thinking] replicate 1/1 done (concurrency 4)
+
+======================================================================
+PROGRAM: computer-and-information-technology — Computer and Information Technology (polytechnic, curated)
+======================================================================
+[real-db] loaded program e048c082-8356-4d29-ac97-600e4cca963d from postgresql://catalog:catalog@localhost:5433/catalog_ingestion (0 required + 7 elective requirement group(s), 69 courses in the maximal universe)
+[fixture] Computer and Information Technology [computer-and-information-technology] — 69 courses, 7 requirement groups, 5 synthesized students
+[run] 4 model(s), tasks=['explain', 'plan_a', 'plan_b', 'qa'] -> /home/wylin/ai-academic-advisor/model_eval/results/results_computer-and-information-technology/runs_baseline.jsonl (mode=w)
+
+=== qwen3.8-27b (server) ===
+[env] qwen3.8-27b: vram_delta=[22199] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 76137, 'max_concurrency': 4.65, 'per_request_tokens': 16384} n_ctx=16384
+  [qwen3.8-27b] replicate 1/1 done (concurrency 4)
+
+=== qwen3.8-27b-thinking (server) ===
+[env] qwen3.8-27b-thinking: vram_delta=[22199] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 76137, 'max_concurrency': 4.65, 'per_request_tokens': 16384} n_ctx=16384
+  [qwen3.8-27b-thinking] replicate 1/1 done (concurrency 4)
+
+=== gemma4-26b (server) ===
+[env] gemma4-26b: vram_delta=[22381] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 69730, 'max_concurrency': 4.26, 'per_request_tokens': 16384} n_ctx=16384
+  [gemma4-26b] replicate 1/1 done (concurrency 4)
+
+=== gemma4-26b-thinking (server) ===
+[env] gemma4-26b-thinking: vram_delta=[22371] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 69668, 'max_concurrency': 4.25, 'per_request_tokens': 16384} n_ctx=16384
+  [gemma4-26b-thinking] replicate 1/1 done (concurrency 4)
+
+======================================================================
+PROGRAM: construction-management — Construction Management (polytechnic, curated)
+======================================================================
+[real-db] loaded program 42d36b02-4956-42df-afb9-c97f7e92e64d from postgresql://catalog:catalog@localhost:5433/catalog_ingestion (1 required + 8 elective requirement group(s), 82 courses in the maximal universe)
+[fixture] Construction Management [construction-management] — 82 courses, 9 requirement groups, 5 synthesized students
+[run] 4 model(s), tasks=['explain', 'plan_a', 'plan_b', 'qa'] -> /home/wylin/ai-academic-advisor/model_eval/results/results_construction-management/runs_baseline.jsonl (mode=w)
+
+=== qwen3.8-27b (server) ===
+[env] qwen3.8-27b: vram_delta=[22199] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 76137, 'max_concurrency': 4.65, 'per_request_tokens': 16384} n_ctx=16384
+  [qwen3.8-27b] replicate 1/1 done (concurrency 4)
+
+=== qwen3.8-27b-thinking (server) ===
+[env] qwen3.8-27b-thinking: vram_delta=[22199] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 76137, 'max_concurrency': 4.65, 'per_request_tokens': 16384} n_ctx=16384
+  [qwen3.8-27b-thinking] replicate 1/1 done (concurrency 4)
+
+=== gemma4-26b (server) ===
+[env] gemma4-26b: vram_delta=[22371] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 69707, 'max_concurrency': 4.25, 'per_request_tokens': 16384} n_ctx=16384
+  [gemma4-26b] replicate 1/1 done (concurrency 4)
+
+=== gemma4-26b-thinking (server) ===
+[env] gemma4-26b-thinking: vram_delta=[22381] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 69730, 'max_concurrency': 4.26, 'per_request_tokens': 16384} n_ctx=16384
+  [gemma4-26b-thinking] replicate 1/1 done (concurrency 4)
+
+======================================================================
+PROGRAM: computer-science-machine-intelligence — Computer Science: Machine Intelligence (science, curated)
+======================================================================
+real_db: dropping 20 requirement_options course(s) not in the current PurdueIO catalog (stale department listing, not a crawl bug): ARAB 22400, ARAB 33000, DSB 24200, EDCI 35003, EDCI 35004, ENGT 29900, FLM 29100, FLM 33000, HIST 38105, JPNS 23000, LALS 26000, LALS 34700, LING 36800, MKTG 42210, OBHR 29300, OBHR 44310, PTGS 23500, SOC 26700, SOC 40900, STRT 33100
+[real-db] loaded program fc72500c-2942-497c-b5bf-411a33700333 from postgresql://catalog:catalog@localhost:5433/catalog_ingestion (3 required + 19 elective requirement group(s), 1044 courses in the maximal universe)
+[fixture] Computer Science: Machine Intelligence [computer-science-machine-intelligence] — 88 courses, 22 requirement groups, 5 synthesized students
+[run] 4 model(s), tasks=['explain', 'plan_a', 'plan_b', 'qa'] -> /home/wylin/ai-academic-advisor/model_eval/results/results_computer-science-machine-intelligence/runs_baseline.jsonl (mode=w)
+
+=== qwen3.8-27b (server) ===
+[env] qwen3.8-27b: vram_delta=[22199] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 76137, 'max_concurrency': 4.65, 'per_request_tokens': 16384} n_ctx=16384
+  [qwen3.8-27b] replicate 1/1 done (concurrency 4)
+
+=== qwen3.8-27b-thinking (server) ===
+[env] qwen3.8-27b-thinking: vram_delta=[22199] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 76137, 'max_concurrency': 4.65, 'per_request_tokens': 16384} n_ctx=16384
+  [qwen3.8-27b-thinking] replicate 1/1 done (concurrency 4)
+
+=== gemma4-26b (server) ===
+[env] gemma4-26b: vram_delta=[22371] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 69707, 'max_concurrency': 4.25, 'per_request_tokens': 16384} n_ctx=16384
+  [gemma4-26b] replicate 1/1 done (concurrency 4)
+
+=== gemma4-26b-thinking (server) ===
+[env] gemma4-26b-thinking: vram_delta=[22371] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 69668, 'max_concurrency': 4.25, 'per_request_tokens': 16384} n_ctx=16384
+  [gemma4-26b-thinking] replicate 1/1 done (concurrency 4)
+
+======================================================================
+PROGRAM: biology — Biology (science, curated)
+======================================================================
+real_db: dropping 22 requirement_options course(s) not in the current PurdueIO catalog (stale department listing, not a crawl bug): ARAB 22400, ARAB 33000, BIOL 52701, BIOL 58215, DSB 24200, EDCI 35003, EDCI 35004, ENGT 29900, FLM 29100, FLM 33000, HIST 38105, JPNS 23000, LALS 26000, LALS 34700, LING 36800, MKTG 42210, OBHR 29300, OBHR 44310, PTGS 23500, SOC 26700, SOC 40900, STRT 33100
+[real-db] loaded program 7c04f98f-189a-4ebd-827e-a32ac0ee36c7 from postgresql://catalog:catalog@localhost:5433/catalog_ingestion (9 required + 26 elective requirement group(s), 1082 courses in the maximal universe)
+[fixture] Biology [biology] — 78 courses, 35 requirement groups, 5 synthesized students
+[run] 4 model(s), tasks=['explain', 'plan_a', 'plan_b', 'qa'] -> /home/wylin/ai-academic-advisor/model_eval/results/results_biology/runs_baseline.jsonl (mode=w)
+
+=== qwen3.8-27b (server) ===
+[env] qwen3.8-27b: vram_delta=[22199] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 76137, 'max_concurrency': 4.65, 'per_request_tokens': 16384} n_ctx=16384
+  [qwen3.8-27b] replicate 1/1 done (concurrency 4)
+
+=== qwen3.8-27b-thinking (server) ===
+[env] qwen3.8-27b-thinking: vram_delta=[22199] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 76137, 'max_concurrency': 4.65, 'per_request_tokens': 16384} n_ctx=16384
+  [qwen3.8-27b-thinking] replicate 1/1 done (concurrency 4)
+
+=== gemma4-26b (server) ===
+[env] gemma4-26b: vram_delta=[22371] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 69668, 'max_concurrency': 4.25, 'per_request_tokens': 16384} n_ctx=16384
+  [gemma4-26b] replicate 1/1 done (concurrency 4)
+
+=== gemma4-26b-thinking (server) ===
+[env] gemma4-26b-thinking: vram_delta=[22371] kv_cache={'source': 'vllm_startup_log', 'kv_cache_tokens': 69668, 'max_concurrency': 4.25, 'per_request_tokens': 16384} n_ctx=16384
+  [gemma4-26b-thinking] replicate 1/1 done (concurrency 4)
+
+======================================================================
+SWEEP DONE — failures: accounting, finance
+======================================================================

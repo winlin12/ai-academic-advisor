@@ -19,7 +19,7 @@ from app.services.ai_planner import (
     generate_ai_plan,
     plan_schema,
 )
-from app.services.llamacpp_client import ModelResponseError
+from app.services.vllm_client import ModelResponseError
 from app.services.planner_db import ProgramCatalog, RequirementGroup
 
 
@@ -280,12 +280,12 @@ def test_the_output_budget_is_what_the_context_window_leaves_over(monkeypatch):
 
     # A window barely larger than the prompt must not ask for a 2048-token plan; a request that
     # overflows is truncated mid-JSON, not rejected, and reads as "the planner was unavailable".
-    monkeypatch.setattr(ai_planner.settings, "llamacpp_context_tokens", 100_000)
+    monkeypatch.setattr(ai_planner.settings, "vllm_context_tokens", 100_000)
     client = _StubClient(AiPlanDraft(semesters=[], rationale=""))
     asyncio.run(generate_ai_plan(_profile(), _catalog(), client=client))
-    assert client.max_tokens == [ai_planner.settings.llamacpp_plan_max_tokens]
+    assert client.max_tokens == [ai_planner.settings.vllm_plan_max_tokens]
 
-    monkeypatch.setattr(ai_planner.settings, "llamacpp_context_tokens", 1_000)
+    monkeypatch.setattr(ai_planner.settings, "vllm_context_tokens", 1_000)
     client = _StubClient(AiPlanDraft(semesters=[], rationale=""))
     result = asyncio.run(generate_ai_plan(_profile(), _catalog(), client=client))
     assert client.max_tokens == [], "the model should not have been called at all"

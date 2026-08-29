@@ -1,14 +1,15 @@
 """Run orchestration.
 
 Measurement discipline enforced here:
-  * one llama-server command line, built once from config, applied identically to every model
-    (context size, KV type, GPU layers, flash-attn, reasoning-off) — under llama.cpp these are
+  * one `vllm serve` command line, built once from config, applied identically to every model
+    (context length, KV dtype, memory fraction, max concurrent sequences) — these are
     LAUNCH flags, so the harness owns the process rather than trusting whoever started one
   * /props is read back after launch and the SERVER's reported context size is recorded, so
     "every model ran at num_ctx" is verified rather than assumed
   * per model: warmup generations (discarded) before anything is measured
   * VRAM = nvidia-smi delta (baseline before launch vs. after warmup)
-  * GPU offload parsed from llama-server's own stderr ("offloaded X/Y layers to GPU")
+  * KV-cache capacity parsed from vLLM's own startup log ("GPU KV cache size: N tokens"),
+    which is what bounds concurrency once the weights are resident
   * the server is stopped between models, so the next model starts from a clean card
   * every record carries the static-prompt hash, the fixture hash, and a config snapshot;
     records whose hashes disagree must never be compared
@@ -42,7 +43,7 @@ import yaml
 from . import plan_scorers, real_scoring, scorers
 from .catalog_export import CatalogDatabase
 from .fixtures import Fixture, Scenario, with_prereq_closure
-from .llamacpp_client import GenerationResult, LlamaCppClient, LlamaCppError
+from .vllm_client import GenerationResult, VllmClient, VllmError
 from .real_db import (
     RealDatabaseBase, build_scenario_database, fetch_real_db_base, fixture_from_database,
     merge_real_db_bases, resolve_poid, retrieve_context,
@@ -57,8 +58,9 @@ from .prompts import (
     selection_schema,
 )
 from .server import (
-    ServerHandle, gpu_memory_used_mb, resolve_draft, resolve_host, slot_context,
-    speculative_enabled, start_server,
+    ServerHandle, backend_cfg, effective_parallel, engine, gpu_memory_used_mb,
+    resolve_host,
+    slot_context, start_server,
 )
 
 # WHAT THE PROMPT COSTS BESIDES THE DATABASE. `build_scenario_database`'s `budget_tokens` sizes
@@ -150,19 +152,19 @@ class EvalContext:
     @property
     def results_dir(self) -> Path:
         d = self.root / self.cfg["paths"]["results_dir"]
-        d.mkdir(exist_ok=True)
+        d.mkdir(parents=True, exist_ok=True)
         return d
 
     @property
     def log_dir(self) -> Path:
         d = self.results_dir / "server_logs"
-        d.mkdir(exist_ok=True)
+        d.mkdir(parents=True, exist_ok=True)
         return d
 
     @property
     def transcript_dir(self) -> Path:
         d = self.results_dir / "transcripts"
-        d.mkdir(exist_ok=True)
+        d.mkdir(parents=True, exist_ok=True)
         return d
 
     def write_transcript(
@@ -190,7 +192,7 @@ class EvalContext:
             + (detail + "\n" if detail else "")
             + f"## System prompt\n\n```\n{system}\n```\n\n"
             f"## User prompt\n\n```\n{user}\n```\n\n"
-            # REASONING IS A SEPARATE CHANNEL, not part of `output` — llama-server streams it
+            # REASONING IS A SEPARATE CHANNEL, not part of `output` — vLLM streams it
             # as `delta.reasoning_content`, so without this it was recorded nowhere and the
             # one question the thinking arm exists to answer ("what did it actually consider
             # before scheduling?") could not be read back. Empty for every reasoning-off stage,
@@ -407,8 +409,7 @@ def load_context(root: Path) -> EvalContext:
         fixture=fixture,
         prompts=PromptBuilder(fixture, default_database),
         questions=questions or [],
-        host=resolve_host(cfg["llamacpp"].get("host", "auto"),
-                          cfg["llamacpp"].get("server_exe")),
+        host=resolve_host(backend_cfg(cfg).get("host", "auto")),
         real_db_base=real_db_base,
         budget_tokens=budget_tokens,
     )
@@ -451,7 +452,7 @@ def sampling_options(
 # --- per-model lifecycle --------------------------------------------------------------------
 
 
-def _warmup(ctx: EvalContext, client: LlamaCppClient, model_cfg: dict) -> None:
+def _warmup(ctx: EvalContext, client: VllmClient, model_cfg: dict) -> None:
     for _ in range(ctx.cfg["run"]["warmup_discard"]):
         client.chat(
             WARMUP_SYSTEM, WARMUP_USER,
@@ -461,7 +462,7 @@ def _warmup(ctx: EvalContext, client: LlamaCppClient, model_cfg: dict) -> None:
 
 
 def _env_record(
-    ctx: EvalContext, handle: ServerHandle, client: LlamaCppClient,
+    ctx: EvalContext, handle: ServerHandle, client: VllmClient,
     model_cfg: dict, vram_baseline: list[int] | None,
 ) -> dict[str, Any]:
     props = client.props()
@@ -472,42 +473,34 @@ def _env_record(
     # The server's own answer to "what context am I running?" — the check Ollama made
     # impossible. A mismatch here means this model was NOT compared at the configured size.
     server_ctx = props.get("default_generation_settings", {}).get("n_ctx") or props.get("n_ctx")
-    # SPECULATIVE DECODING, recorded per model because it is per model: only the entries with a
-    # `draft:` speculate (see `server.resolve_draft`), so one sweep's records legitimately mix
-    # drafted and undrafted models and nothing else in the file would say which is which.
-    # WHETHER IT PAID OFF is answered per generation instead, by `_base_record`'s
-    # `draft_accepted`/`draft_n` — an acceptance rate is a property of what was generated, not
-    # of the launch, and averaging it over a model's real workload is the only honest read.
-    draft_path = resolve_draft(ctx.cfg, model_cfg)
-    speculative = {
-        "enabled": draft_path is not None,
-        "draft_gguf": str(draft_path) if draft_path else None,
-        **({k: v for k, v in (ctx.cfg.get("speculative") or {}).items()
-            if k in ("n_max", "n_min", "p_min")} if draft_path else {}),
-    }
     return {
         "model": model_cfg["name"],
         "stage": "env",
-        "gguf": model_cfg["gguf"],
+        "model_path": model_cfg["model_path"],
         "bracket": model_cfg.get("bracket"),
         "think_setting": model_cfg.get("think"),
-        "speculative": speculative,
         "argv": handle.argv,
         "vram_baseline_mb": vram_baseline,
         "vram_after_warmup_mb": after,
         "vram_delta_mb": delta,
-        "offload": handle.offload(),
+        # WHAT THE ENGINE HAD LEFT FOR KV after the weights loaded, and how many full-context
+        # requests that is. The direct replacement for the llama.cpp-era `offload` field: on
+        # one card a model is fully resident or it does not start, so "how many layers made it
+        # onto the GPU" is no longer a question that can have a bad answer — but a checkpoint
+        # that eats more of the card than expected silently shrinks the KV pool instead, which
+        # caps concurrency without erroring. See `ServerHandle.kv_cache`.
+        "kv_cache": handle.kv_cache(),
         "server_n_ctx": server_ctx,
         "configured_num_ctx": ctx.cfg["run"]["num_ctx"],
-        # Compared against the SLOT context, not num_ctx: llama.cpp reports what one request
-        # gets, which is num_ctx/parallel. Comparing to num_ctx would flag every model as
-        # incomparable the moment `parallel` went above 1.
+        # `max_num_seqs` under vLLM. It no longer divides the context — that is the whole
+        # reason this harness moved engines — so unlike the llama.cpp era, raising it cannot
+        # make a model incomparable on context.
         "configured_parallel": ctx.cfg["run"].get("parallel", 1),
         # HOW MANY REQUESTS WERE IN FLIGHT alongside every generation in this run. The single
         # field that says whether this file's `ttft_s`/`total_s` are one student's latency or
         # four students queueing — above 1 they include time spent waiting for a slot, which is
         # the point, but it makes them incomparable to any `parallel: 1` run.
-        "simulated_users": max(1, int(ctx.cfg["run"].get("parallel", 1))),
+        "simulated_users": effective_parallel(ctx.cfg),
         "expected_slot_ctx": slot_context(ctx.cfg["run"]),
         "ctx_matches_config": (
             server_ctx == slot_context(ctx.cfg["run"]) if server_ctx else None),
@@ -516,21 +509,66 @@ def _env_record(
     }
 
 
-def _stage_thinking(cfg: dict[str, Any]) -> bool | None:
-    """Should QA and explain ask the model to reason first?
+def _stage_thinking(cfg: dict[str, Any], model_cfg: dict[str, Any] | None = None) -> bool:
+    """Should QA and explain ask the model to reason first? `run.advising_thinking` decides.
 
-    Two conditions, and both are needed. The server must have been launched with a reasoning
-    budget (`run.reasoning_budget`), because a per-request `enable_thinking` cannot undo a
-    `--reasoning off` launch — see `server.build_argv`. And the advising stages must be opted
-    in separately (`run.advising_thinking`), because Mode C requires the launch budget for its
-    own reasons and the advising stages should not silently inherit its cost.
+    ONE CONDITION NOW, NOT TWO. This used to also require `run.reasoning_budget > 0`, because
+    under llama.cpp reasoning had to be enabled at LAUNCH (`--reasoning off` could not be undone
+    by a per-request kwarg) and that setting was the launch switch. vLLM has no launch-time
+    reasoning switch at all — whether a model reasons is decided entirely by the per-request
+    `chat_template_kwargs`, and `run.reasoning_budget` reaches nothing. Gating on it meant
+    advising reasoning could never actually be turned on, since `build_argv` stopped reading it
+    at the migration.
 
-    None rather than False when off, so the model's own template default stands instead of the
-    harness forcing a switch it may not honour.
+    THIS IS NOT THE RETIRED PLAN-REASONING ARM. `plan_b_thinking` was removed 2026-08-24 (see
+    config.yaml's `thinking:` note); this switch is about the ADVISING stages, is off by
+    default, and stays because it is one line and answers a different question.
+
+    FALSE, NOT None, WHEN OFF — CHANGED 2026-08-25, and the old behaviour was hiding a fact
+    about every sweep ever recorded. This used to return None when off, on the reasoning that
+    "the model's own template default stands instead of the harness forcing a switch it may not
+    honour". But `vllm_client.chat` only sends `enable_thinking` for an explicit True or False;
+    None sends nothing, so the TEMPLATE DEFAULT applied — and qwen3.8-27b's template defaults
+    to reasoning ON.
+    So QA and explain have been running qwen3.8-27b WITH reasoning in every sweep, while the
+    plan stages forced it off via `model_cfg["think"]`. Nobody could see it: the client
+    discarded the reasoning channel entirely until 2026-08-23 (it read llama.cpp's
+    `delta.reasoning_content`, not vLLM's `delta.reasoning`), so `reasoning_chars` read 0
+    throughout. MEASURED once the channel worked: an off-arm and an on-arm produced IDENTICAL
+    behaviour — 78 of 78 qwen QA records reasoned in both, 0 of 78 gemma records reasoned in
+    either — which is an experiment that measured nothing.
+    Forcing False costs the deference the old comment wanted, and buys an advising baseline
+    that is actually a baseline. A model that ignores `enable_thinking: false` will show it in
+    `reasoning_chars`, which is now readable.
+
+    PER MODEL FIRST, 2026-08-25. `advising_think` on a model entry wins over the run-wide
+    `advising_thinking`, which is what lets the SAME sweep carry a reasoning and a
+    non-reasoning variant of one model and put them side by side in every report table as two
+    rows. Before this the switch was global, so answering "does reasoning help advising" meant
+    two whole runs into two directories, compared by hand — and the two runs differed by
+    whatever else drifted between them.
     """
-    if not cfg["run"].get("advising_thinking"):
-        return None
-    return True if int(cfg["run"].get("reasoning_budget") or 0) > 0 else None
+    if model_cfg is not None and model_cfg.get("advising_think") is not None:
+        return bool(model_cfg["advising_think"])
+    return bool(cfg["run"].get("advising_thinking"))
+
+
+def _advising_headroom(cfg: dict[str, Any], model_cfg: dict[str, Any] | None = None) -> int:
+    """Extra output tokens for QA/explain when `advising_thinking` is on. 0 when it is off.
+
+    WITHOUT THIS THE EXPERIMENT MEASURES THE BUDGET, NOT THE MODEL — and that is not a
+    hypothetical, it is what happened to the plan-reasoning arm on 2026-08-23. vLLM has no
+    server-side reasoning cap (llama.cpp's `--reasoning-budget` has no equivalent), so a model
+    asked to reason simply reasons until it is done and then answers. If the ceiling does not
+    cover BOTH, the answer is the half that gets cut off: 57 of 65 plans came back
+    `finish_reason: length` and 3 of 65 parsed, which reads as "reasoning destroyed the model"
+    and is really "the harness gave it 4608 tokens for a 4600-token job".
+    QA is the tighter case here — `max_output_tokens` is 1048, and qwen3.8-27b's reasoning ran
+    p50 3409 / p90 4270 / max 5384 tokens, so the reasoning alone is FOUR TIMES the whole
+    answer budget. Explain has 2048 and is no better off.
+    """
+    return (int(cfg["run"].get("advising_thinking_headroom") or 0)
+            if _stage_thinking(cfg, model_cfg) else 0)
 
 
 def _stage_tools(cfg: dict[str, Any]) -> list[dict[str, Any]] | None:
@@ -538,16 +576,38 @@ def _stage_tools(cfg: dict[str, Any]) -> list[dict[str, Any]] | None:
     web = (cfg.get("tools") or {}).get("web_search") or {}
     if not web.get("enabled"):
         return None
-    return [LlamaCppClient.WEB_SEARCH_TOOL]
+    return [VllmClient.WEB_SEARCH_TOOL]
 
 
-def _base_record(model: str, res: GenerationResult, static_hash: str, **extra) -> dict[str, Any]:
-    # llama-server reports the draft counters in its own `timings` block, and ONLY when it
-    # actually drafted (`draft_n > 0`) — so these keys are absent, not zero, for a model with no
-    # draft, and the difference is worth preserving: "did not speculate" and "speculated and
-    # every token was rejected" are opposite findings that a 0 would merge.
-    timings = res.raw_final.get("timings") or {}
-    drafted = timings.get("draft_n")
+def _base_record(model: str, res: GenerationResult | None, static_hash: str,
+                 **extra) -> dict[str, Any]:
+    # `res` MAY BE None, and the harness must survive it. A staged plan that never completed a
+    # single attempt — the model's very first generation raised, so `attempts` is empty — still
+    # emits a record, and it used to pass this function a None it then dereferenced:
+    #
+    #   AttributeError: 'NoneType' object has no attribute 'ttft_s'
+    #
+    # That exception escaped `run_model` and was caught by `_run_sweep`, which catches per
+    # PROGRAM. So one failed generation cost the whole program — including every OTHER model's
+    # results for it, because the models are walked inside that same try. MEASURED 2026-08-22:
+    # a 16-program sweep lost 12 programs this way, and gemma4-26b (second in run order) ran on
+    # only 2 of 14 because qwen3.8-27b crashed the program before gemma ever launched. The
+    # symptom in the report was gemma showing 100% PLAN_VIABLE on a tenth of the records — a
+    # number that looked like an improvement and was really a survivorship artifact.
+    #
+    # A record with null timings and `no_generation: True` is the honest thing to write: the
+    # stage was attempted and produced nothing, which is a finding, not an absence.
+    if res is None:
+        rec = {
+            "model": model, "static_hash": static_hash,
+            "ttft_s": None, "total_s": None, "eval_count": None,
+            "prompt_eval_count": None, "prompt_ms": None, "predicted_ms": None,
+            "finish_reason": None, "truncated": False, "output": "",
+            "reasoning_chars": 0, "timings_source": None,
+            "no_generation": True,
+        }
+        rec.update(extra)
+        return rec
     rec = {
         "model": model,
         "static_hash": static_hash,
@@ -560,7 +620,7 @@ def _base_record(model: str, res: GenerationResult, static_hash: str, **extra) -
         "finish_reason": res.finish_reason,
         "truncated": res.truncated,
         "output": res.text,
-        # DID THE MODEL ACTUALLY THINK? llama-server streams reasoning on its own channel
+        # DID THE MODEL ACTUALLY THINK? vLLM streams reasoning on its own channel
         # (`delta.reasoning_content`), so it never appears in `output` and nothing downstream
         # could see it. 0 on every stage that runs with reasoning off, which is the point: in
         # the thinking arm a 0 means the template has no reasoning channel and the row is a
@@ -568,12 +628,13 @@ def _base_record(model: str, res: GenerationResult, static_hash: str, **extra) -
         # thought and did no better. Those are opposite findings that look identical in a
         # score column.
         "reasoning_chars": len(res.reasoning_text or ""),
+        # WHERE `prompt_ms`/`predicted_ms` CAME FROM. llama.cpp reported its own counters;
+        # vLLM reports none, so they are split from the wall clock at first token (see
+        # `vllm_client.chat`). Stamped on every record because throughput computed from the
+        # two sources is not the same measurement, and a mixed directory would otherwise be
+        # impossible to tell apart after the fact.
+        "timings_source": res.raw_final.get("timings_source"),
     }
-    if drafted:
-        accepted = timings.get("draft_n_accepted") or 0
-        rec["draft_n"] = drafted
-        rec["draft_n_accepted"] = accepted
-        rec["draft_acceptance"] = round(accepted / drafted, 4)
     rec.update(extra)
     return rec
 
@@ -597,7 +658,7 @@ def _base_record(model: str, res: GenerationResult, static_hash: str, **extra) -
 
 
 def _selection_stage(
-    ctx: EvalContext, client: LlamaCppClient, model_cfg: dict, scenario: Scenario,
+    ctx: EvalContext, client: VllmClient, model_cfg: dict, scenario: Scenario,
 ) -> tuple[list[str], dict[str, Any], GenerationResult | None, tuple[str, str, str] | None]:
     """Which courses does this student still need? Answered by SQL, not by a model.
 
@@ -645,10 +706,10 @@ def _selection_coverage(database, scenario: Scenario, chosen: list[str]) -> floa
 
 
 def _order_stage(
-    ctx: EvalContext, client: LlamaCppClient, model_cfg: dict, scenario: Scenario,
+    ctx: EvalContext, client: VllmClient, model_cfg: dict, scenario: Scenario,
     courses: list[str], *, existing: list[list[str]] | None = None,
     findings: list[str] | None = None, repair: bool = False,
-    think_override: bool | None = None, extra_max_tokens: int = 0,
+    extra_max_tokens: int = 0,
     context_by_code: dict[str, str] | None = None,
 ) -> tuple[list[list[str]], dict[str, Any], GenerationResult, tuple[str, str, str]]:
     """Ask the model to place `courses` into semesters and report what is wrong.
@@ -674,7 +735,7 @@ def _order_stage(
         options=sampling_options(
             ctx.cfg, max_tokens=ctx.cfg["run"]["max_plan_tokens"] + extra_max_tokens,
             model_cfg=model_cfg),
-        think=think_override if think_override is not None else model_cfg.get("think"),
+        think=model_cfg.get("think"),
         response_format=json_response_format(
             "ScheduleAudit",
             audit_schema(ctx.cfg["run"]["planning_terms"], sorted(enum_codes))),
@@ -801,7 +862,7 @@ def _audit_findings(score: RealScore, profile: Profile, *,
 
 
 def run_mode_a(
-    ctx: EvalContext, client: LlamaCppClient, model_cfg: dict,
+    ctx: EvalContext, client: VllmClient, model_cfg: dict,
     scenario: Scenario, run_idx: int, out, *, mitigate: bool,
 ) -> None:
     """Port of ``advisor_agent.revise_plan``: propose -> apply -> re-plan -> re-validate.
@@ -864,7 +925,7 @@ def run_mode_a(
                     proposal_schema(scenario.profile.remaining_courses,
                                     catalog_tags(ctx.fixture.catalog))),
             )
-        except LlamaCppError as exc:
+        except VllmError as exc:
             out.write(json.dumps({
                 "model": model_cfg["name"], "stage": "plan_mode_a", "scenario": scenario.id,
                 "run_idx": run_idx, "mitigated": mitigate, "error": str(exc)}) + "\n")
@@ -974,7 +1035,7 @@ def run_mode_a(
 
 
 def run_mode_b(
-    ctx: EvalContext, client: LlamaCppClient, model_cfg: dict,
+    ctx: EvalContext, client: VllmClient, model_cfg: dict,
     scenario: Scenario, run_idx: int, out, *, mitigate: bool,
 ) -> None:
     """Select, schedule, then repair — and write both Mode B and Mode C. See
@@ -985,9 +1046,9 @@ def run_mode_b(
 
 
 def _run_staged_plan(
-    ctx: EvalContext, client: LlamaCppClient, model_cfg: dict, scenario: Scenario,
+    ctx: EvalContext, client: VllmClient, model_cfg: dict, scenario: Scenario,
     run_idx: int, out, *, mitigate: bool, stage: str, repair_passes: int,
-    think_override: bool | None = None, extra_max_tokens: int = 0,
+    extra_max_tokens: int = 0,
     variant: str | None = None,
 ) -> None:
     """SELECT -> ORDER -> repair, writing MODE B AND MODE C FROM ONE PASS (2026-08-17).
@@ -1097,9 +1158,9 @@ def _run_staged_plan(
             raw, order_fields, res, prompt = _order_stage(
                 ctx, client, model_cfg, scenario, chosen,
                 existing=semesters or None, findings=findings, repair=attempt > 1,
-                think_override=think_override, extra_max_tokens=extra_max_tokens,
+                extra_max_tokens=extra_max_tokens,
                 context_by_code=context_by_code)
-        except LlamaCppError as exc:
+        except VllmError as exc:
             order_fields = {"structure_ok": False, "parse_failure_reason": str(exc)}
             break
         total_s += res.total_s
@@ -1212,7 +1273,7 @@ def _run_staged_plan(
 
 
 # Which stage each first-attempt stage graduates into once the repair loop has run.
-_REPAIRED_STAGE = {"plan_mode_b": "plan_mode_c", "plan_mode_b_thinking": "plan_mode_c_thinking"}
+_REPAIRED_STAGE = {"plan_mode_b": "plan_mode_c"}
 
 
 def _term_labels_ok(semesters: list[dict], profile: Profile) -> bool:
@@ -1236,7 +1297,7 @@ def _term_labels_ok(semesters: list[dict], profile: Profile) -> bool:
 
 
 def run_qa(
-    ctx: EvalContext, client: LlamaCppClient, model_cfg: dict,
+    ctx: EvalContext, client: VllmClient, model_cfg: dict,
     question: dict, run_idx: int, out, *, mitigate: bool,
 ) -> None:
     chunks = question.get("context") or []
@@ -1244,20 +1305,24 @@ def run_qa(
     try:
         res = client.chat(
             system, user,
-            options=sampling_options(ctx.cfg, model_cfg=model_cfg),
+            options=sampling_options(
+                ctx.cfg,
+                max_tokens=(ctx.cfg["run"]["max_output_tokens"]
+                            + _advising_headroom(ctx.cfg, model_cfg)),
+                model_cfg=model_cfg),
             # FULL REIGN ON THE ADVISING STAGES (2026-08-13): reasoning on, and the web-search
             # tool offered. A student's question is exactly the case where what to fetch depends
-            # on what was asked — see `llamacpp_client`'s tools section — and the abstention
+            # on what was asked — see `vllm_client`'s tools section — and the abstention
             # policy the prompt now carries wants the model to have tried before it says it
             # cannot answer. Both are no-ops where unavailable: reasoning needs a server
             # launched with a budget (`run.reasoning_budget`), and the search tool reports
             # itself unavailable until a provider is configured.
-            think=_stage_thinking(ctx.cfg),
+            think=_stage_thinking(ctx.cfg, model_cfg),
             tools=_stage_tools(ctx.cfg),
             max_tool_calls=int(((ctx.cfg.get("tools") or {}).get("web_search")
                                 or {}).get("max_calls", 3)),
         )
-    except LlamaCppError as exc:
+    except VllmError as exc:
         out.write(json.dumps({
             "model": model_cfg["name"], "stage": "qa", "question_id": question["id"],
             "run_idx": run_idx, "mitigated": mitigate, "error": str(exc)}) + "\n")
@@ -1286,7 +1351,7 @@ def run_qa(
 
 
 def run_explain(
-    ctx: EvalContext, client: LlamaCppClient, model_cfg: dict,
+    ctx: EvalContext, client: VllmClient, model_cfg: dict,
     scenario: Scenario, run_idx: int, out, *, mitigate: bool,
 ) -> None:
     """Explain the deterministic baseline plan. Every model explains the SAME plan — feeding
@@ -1326,13 +1391,15 @@ def run_explain(
         res = client.chat(
             system, user,
             options=sampling_options(
-                ctx.cfg, max_tokens=ctx.cfg["run"].get("max_explain_tokens"),
+                ctx.cfg,
+                max_tokens=(ctx.cfg["run"].get("max_explain_tokens")
+                            + _advising_headroom(ctx.cfg, model_cfg)),
                 model_cfg=model_cfg),
             # Same allowance as QA — see `run_qa`'s comment.
-            think=_stage_thinking(ctx.cfg),
+            think=_stage_thinking(ctx.cfg, model_cfg),
             tools=_stage_tools(ctx.cfg),
         )
-    except LlamaCppError as exc:
+    except VllmError as exc:
         out.write(json.dumps({
             "model": model_cfg["name"], "stage": "explain", "scenario": scenario.id,
             "run_idx": run_idx, "mitigated": mitigate, "error": str(exc)}) + "\n")
@@ -1429,12 +1496,12 @@ def _run_pool(items: list, work, *, concurrency: int, label: str) -> None:
 
 
 def _ensure_server_alive(
-    ctx: EvalContext, handle: ServerHandle, client: LlamaCppClient, model_cfg: dict,
+    ctx: EvalContext, handle: ServerHandle, client: VllmClient, model_cfg: dict,
     vram_baseline: list[int] | None,
-) -> tuple[ServerHandle, LlamaCppClient, dict[str, Any] | None]:
+) -> tuple[ServerHandle, VllmClient, dict[str, Any] | None]:
     """Cheap health check before every scenario; if the server died, restart it and warm it
     back up so the REST of this model's scenarios still run instead of every one after the
-    crash failing identically. Real incident 2026-08-06: llama-server hit the same SIGABRT
+    crash failing identically. Real incident 2026-08-06: the server hit the same SIGABRT
     (confirmed via `dmesg`, not a harness bug — the crash address was identical across three
     occurrences over two full restarts) partway through a model's run, at a different scenario
     each time, always with the GPU near its VRAM ceiling. Nothing before this checked the
@@ -1451,17 +1518,17 @@ def _ensure_server_alive(
     try:
         client.props()
         return handle, client, None
-    except LlamaCppError:
+    except VllmError:
         pass
     print(f"[recover] {model_cfg['name']}: server unresponsive — restarting")
     try:
-        handle.stop(trim_log_lines=ctx.cfg["llamacpp"].get("keep_log_lines", 400))
+        handle.stop(trim_log_lines=backend_cfg(ctx.cfg).get("keep_log_lines", 400))
     except Exception:  # noqa: BLE001 — the old process is already gone; nothing to salvage
         pass
-    time.sleep(ctx.cfg["llamacpp"].get("cooldown_s", 5))
+    time.sleep(backend_cfg(ctx.cfg).get("cooldown_s", 5))
     try:
         new_handle = start_server(ctx.cfg, model_cfg, ctx.log_dir, host=ctx.host)
-        new_client = LlamaCppClient(new_handle.base_url,
+        new_client = VllmClient(new_handle.base_url,
                                     timeout_s=ctx.cfg["run"]["request_timeout_s"])
         _warmup(ctx, new_client, model_cfg)
     except (RuntimeError, TimeoutError) as exc:
@@ -1482,13 +1549,13 @@ def run_model(ctx: EvalContext, model_cfg: dict, out, *, tasks: set[str], mitiga
         out.flush()
         return
 
-    client = LlamaCppClient(handle.base_url, timeout_s=ctx.cfg["run"]["request_timeout_s"])
+    client = VllmClient(handle.base_url, timeout_s=ctx.cfg["run"]["request_timeout_s"])
     try:
         _warmup(ctx, client, model_cfg)
         env = _env_record(ctx, handle, client, model_cfg, vram_baseline)
         out.write(json.dumps(env, default=str) + "\n")
         out.flush()
-        print(f"[env] {name}: vram_delta={env['vram_delta_mb']} offload={env['offload']} "
+        print(f"[env] {name}: vram_delta={env['vram_delta_mb']} kv_cache={env['kv_cache']} "
               f"n_ctx={env['server_n_ctx']}")
         if env["ctx_matches_config"] is False:
             print(f"[WARN] {name}: server reports n_ctx={env['server_n_ctx']} per slot, config "
@@ -1500,7 +1567,7 @@ def run_model(ctx: EvalContext, model_cfg: dict, out, *, tasks: set[str], mitiga
         # two would either leave paid-for slots idle (concurrency < parallel) or queue requests
         # behind a full server, which measures a backlog rather than concurrent users
         # (concurrency > parallel). See config.yaml's `run.parallel`.
-        concurrency = max(1, int(ctx.cfg["run"].get("parallel", 1)))
+        concurrency = effective_parallel(ctx.cfg)
         out = _LockedWriter(out)
 
         # BUILT BEFORE ANY WORKER STARTS. `database_for`/`prompts_for` memoize per scenario, and
@@ -1573,8 +1640,8 @@ def run_model(ctx: EvalContext, model_cfg: dict, out, *, tasks: set[str], mitiga
             print(f"  [{name}] replicate {run_idx + 1}/{runs} done "
                   f"(concurrency {concurrency})")
     finally:
-        handle.stop(trim_log_lines=ctx.cfg["llamacpp"].get("keep_log_lines", 400))
-        time.sleep(ctx.cfg["llamacpp"].get("cooldown_s", 5))
+        handle.stop(trim_log_lines=backend_cfg(ctx.cfg).get("keep_log_lines", 400))
+        time.sleep(backend_cfg(ctx.cfg).get("cooldown_s", 5))
 
 
 class ConcurrentRunError(RuntimeError):
@@ -1586,7 +1653,7 @@ def _run_lock(results_dir: Path, tag: str):
     """Refuse to start a second run against the same results file.
 
     Two runs appending to one JSONL interleave mid-line and corrupt it, and — worse — they
-    fight over the GPU and over llama-server's port, so both sets of latency numbers become
+    fight over the GPU and over the vLLM server's port, so both sets of latency numbers become
     garbage while still looking plausible. This was not hypothetical: it happened during
     development, and the only visible symptom was a results file containing a model nobody
     had asked for. A stale lock (previous run killed) is reported with the PID so it can be
@@ -1645,99 +1712,31 @@ def run_eval(
         with out_path.open(mode) as out:
             for model_cfg in selected:
                 print(f"\n=== {model_cfg['name']} ({model_cfg.get('bracket')}) ===")
-                run_model(ctx, model_cfg, out, tasks=task_set, mitigate=mitigate)
-    return out_path
-
-
-def run_model_thinking(
-    ctx: EvalContext, model_cfg: dict, out, *, thinking_budget: int,
-) -> None:
-    """One model, Mode B only, reasoning ON — the thinking-experiment analogue of `run_model`.
-
-    DELIBERATELY NARROWER than `run_model`: no plan_a/qa/explain (this experiment is about
-    Mode B specifically — see `run_mode_b_thinking`'s own docstring for why), and no
-    `_ensure_server_alive` recovery loop, since this pass is short enough (one task, one
-    scenario list) that a crash mid-run is better surfaced as a failure than silently patched
-    over with a fresh warmup — an experimental result should not quietly absorb a restart the
-    way a multi-hour baseline sweep has to.
-    """
-    name = model_cfg["name"]
-    vram_baseline = gpu_memory_used_mb()
-    try:
-        handle = start_server(ctx.cfg, model_cfg, ctx.log_dir, host=ctx.host,
-                              thinking_budget=thinking_budget)
-    except (RuntimeError, TimeoutError) as exc:
-        print(f"[SKIP] {name}: {exc}")
-        out.write(json.dumps({"model": name, "stage": "error", "error": str(exc)}) + "\n")
-        out.flush()
-        return
-
-    client = LlamaCppClient(handle.base_url, timeout_s=ctx.cfg["run"]["request_timeout_s"])
-    try:
-        _warmup(ctx, client, model_cfg)
-        env = _env_record(ctx, handle, client, model_cfg, vram_baseline)
-        env["thinking_budget"] = thinking_budget
-        out.write(json.dumps(env, default=str) + "\n")
-        out.flush()
-        print(f"[env] {name}: vram_delta={env['vram_delta_mb']} offload={env['offload']} "
-              f"n_ctx={env['server_n_ctx']} thinking_budget={thinking_budget}")
-
-        runs = ctx.cfg["run"]["runs_per_pair"]
-        for run_idx in range(runs):
-            for scenario in ctx.fixture.scenarios:
-                run_mode_b_thinking(ctx, client, model_cfg, scenario, run_idx, out,
-                                    thinking_budget=thinking_budget)
-                out.flush()
-            print(f"  [{name}] replicate {run_idx + 1}/{runs} done")
-    finally:
-        handle.stop(trim_log_lines=ctx.cfg["llamacpp"].get("keep_log_lines", 400))
-        time.sleep(ctx.cfg["llamacpp"].get("cooldown_s", 5))
-
-
-def run_thinking_experiment(
-    root: Path, *, models: list[str] | None = None, brackets: list[str] | None = None,
-) -> Path:
-    """Top level for the Mode B pre-plan-reasoning experiment (`--tasks plan_b_thinking`).
-
-    OWN SERVER, OWN RESULTS FILE (`runs_thinking.jsonl`), OWN LOCK — never `run_eval`'s
-    `runs_baseline.jsonl`. The baseline launches every model with `--reasoning off
-    --reasoning-budget 0`; this launches with reasoning ON and `thinking.budget_tokens` (see
-    config.yaml). Those are two different `argv`s for two different server processes, so
-    keeping the results apart is what makes "reasoning on vs. off, same prompt, same schema,
-    same scorer" a comparison that means something, rather than one file mixing two settings.
-
-    OPT-IN AGAIN AS OF 2026-08-21. It spent a day in `run.default_tasks` to settle whether
-    pre-plan reasoning produces a more balanced schedule. It does not — spread got worse on 5
-    of 7 models, and the viability it did buy landed almost entirely on two models that were
-    failing without it, at 3-4x wall clock. config.yaml's `thinking:` block carries the full
-    numbers. Kept runnable by name for a targeted re-test; not worth a sweep's time by default.
-    """
-    ctx = load_context(root)
-    thinking_cfg = ctx.cfg.get("thinking") or {}
-    if not thinking_cfg:
-        raise SystemExit(
-            "config.yaml has no `thinking:` block — add `thinking: {budget_tokens: N}` to use "
-            "--tasks plan_b_thinking."
-        )
-    budget = int(thinking_cfg.get("budget_tokens", 512))
-
-    selected = [
-        m for m in ctx.cfg["models"]
-        if (not models or m["name"] in models) and (not brackets or m.get("bracket") in brackets)
-    ]
-    if not selected:
-        raise SystemExit("No models matched the filter.")
-
-    out_path = ctx.results_dir / "runs_thinking.jsonl"
-    with _run_lock(ctx.results_dir, "thinking"):
-        write_meta(ctx, "thinking", selected, {"plan_b_thinking"})
-        mode = "a" if out_path.exists() else "w"
-        print(f"[run] {len(selected)} model(s), thinking_budget={budget} -> {out_path} "
-              f"(mode={mode})")
-        with out_path.open(mode) as out:
-            for model_cfg in selected:
-                print(f"\n=== {model_cfg['name']} (thinking, budget={budget}) ===")
-                run_model_thinking(ctx, model_cfg, out, thinking_budget=budget)
+                # ONE MODEL'S FAILURE IS ONE MODEL'S FAILURE — the same rule `_run_pool`
+                # already applies per request, applied here per model.
+                #
+                # WITHOUT THIS, ANYTHING ESCAPING `run_model` COSTS EVERY OTHER MODEL its
+                # results for this program, because the only catch above is `_run_sweep`'s and
+                # that one wraps the whole program. MEASURED 2026-08-22: a sweep where
+                # qwen3.8-27b (first in run order) crashed on 12 of 14 programs left
+                # gemma4-26b with data for TWO — and gemma then reported 100% PLAN_VIABLE off
+                # ten surviving plans, a number that looked like an improvement and was
+                # survivorship. The trigger that day is fixed (`_base_record` tolerates a null
+                # result now), but the coupling was the reason one bug cost a whole sweep, and
+                # the coupling is what this removes.
+                #
+                # A server that will not start is the other live case: qwen3.6-35b-a3b is
+                # ~20.5 GB of weights against a ~22.1 GB budget, so it may fail to size a KV
+                # cache at all. That must cost its own row, not the other two models'.
+                try:
+                    run_model(ctx, model_cfg, out, tasks=task_set, mitigate=mitigate)
+                except Exception as exc:  # noqa: BLE001 - one model must not sink the program
+                    print(f"  [MODEL FAILED] {model_cfg['name']}: "
+                          f"{type(exc).__name__}: {exc}")
+                    out.write(json.dumps({
+                        "model": model_cfg["name"], "stage": "error",
+                        "scope": "model", "error": f"{type(exc).__name__}: {exc}"}) + "\n")
+                    out.flush()
     return out_path
 
 
@@ -1752,79 +1751,25 @@ def write_meta(ctx: EvalContext, tag: str, selected: list[dict], tasks: set[str]
         # See `_env_record`'s `simulated_users`. Hoisted to the top level of the meta too,
         # because "is this a load-test run or a solo run?" is the first thing that has to be
         # true before any latency number in the matching JSONL means anything.
-        "simulated_users": max(1, int(ctx.cfg["run"].get("parallel", 1))),
+        "simulated_users": effective_parallel(ctx.cfg),
         "run": ctx.cfg["run"],
-        "llamacpp": ctx.cfg["llamacpp"],
-        # WHICH SAMPLING PATH THIS FILE'S RECORDS CAME OFF. A speculative run reproduces the
-        # unspeculated one only approximately (see `server.py`'s speculative section), so this
-        # is the field that says whether two results directories may be pooled — `enabled` here
-        # is the effective value after `--spec`/`--no-spec`, not just what config.yaml says.
-        "speculative": {
-            **(ctx.cfg.get("speculative") or {}),
-            "enabled": speculative_enabled(ctx.cfg),
-            "models": {m["name"]: (str(d) if (d := resolve_draft(ctx.cfg, m)) else None)
-                       for m in selected},
-        },
-        # THE PROGRAM this run evaluated. Still keyed "fixture" so every reader written
-        # against older meta files keeps working; there is no fixture FILE any more (see
-        # `fixtures.py`), so `path` is the database's own identity and `hash` its db_hash.
-        "fixture": {
-            "path": str(ctx.fixture.path.name),
-            "name": ctx.fixture.name,
-            "slug": ctx.fixture.slug,
-            "program_id": ctx.fixture.real_db_program_id,
-            "hash": ctx.fixture.fixture_hash,
-            "verified": ctx.fixture.verified,
-            "scenarios": [s.id for s in ctx.fixture.scenarios],
-            "courses": len(ctx.fixture.catalog),
-            "requirement_groups": len(ctx.fixture.requirement_groups),
-        },
-        # Mode B's whole context — ONE PER SCENARIO now that each scenario's own
-        # gen_ed_preference/world_language narrows the real database differently (see
-        # `harness/real_db.py`'s module docstring). Recorded per table, not just as one hash:
-        # when an export changes, "which table moved" is the first question, and a single
-        # digest cannot answer it. Its bytes are already inside that scenario's plan_mode_b
-        # static hash below — this is the readable copy.
-        "database_by_scenario": {
-            s.id: {
-                "path": (db := ctx.database_for(s)).path.name,
-                "hash": db.db_hash,
-                "program_name": next((r.get("name") for r in db.rows("programs")), None),
-                "gen_ed_preference": s.gen_ed_preference,
-                "world_language": (list(s.world_language) if s.world_language else None),
-                # WHAT FRACTION OF THE FIXTURE'S OWN COURSE UNIVERSE this scenario was shown.
-                # Mode B is scored against its own `database_for(s)` now (`real_scoring.py`), so
-                # this is no longer a scorer-correctness signal — it is a "did
-                # `real_db.program_id`/`--major` point at the program the fixture's scenarios
-                # (student names, completed courses, credit targets) were actually written for"
-                # signal. `report._guards` reads it back and flags a run where they diverge as
-                # probably testing the wrong program, not as producing meaningless numbers.
-                "fixture_overlap": (
-                    round(len(db.course_codes & set(ctx.fixture.by_code))
-                          / len(ctx.fixture.by_code), 3)
-                    if ctx.fixture.by_code else None
-                ),
-                # Iterate `files`, not `tables`: `files` is keyed to exactly
-                # `catalog_export.TABLES` (every table `render_context` prints), while
-                # `tables` could in principle
-                # hold something wider that never got hashed.
-                "tables": {t: {"rows": len(db.rows(t)), "hash": h} for t, h in db.files.items()},
-            }
-            for s in ctx.fixture.scenarios
-        },
-        "static_hashes": {
-            # Mode A/QA/Explain never read the database (see `PromptBuilder`), so one
-            # representative scenario's hash stands in for all of them here — their prompts
-            # still individually vary by scenario feedback/profile, exactly as before this
-            # refactor; only Mode B's hash is genuinely per-scenario now.
-            "plan_mode_a": ctx.prompts.plan_proposal(scenario, generate_plan(
-                scenario.profile, ctx.fixture.catalog))[2],
-            "plan_mode_b_by_scenario": {
-                s.id: ctx.prompts_for(s).plan_freeform(s)[2] for s in ctx.fixture.scenarios
-            },
-            "qa": ctx.prompts.grounded_qa("x", [])[2],
-            "explain": ctx.prompts.explain_plan("x", "{}")[2],
-        },
+        # WHICH ENGINE WROTE THIS FILE. Results do not pool across engines — different
+        # weights (GGUF vs compressed-tensors) and a different timing source — so every
+        # record carries it rather than leaving the reader to infer it from a date.
+        "engine": engine(ctx.cfg),
+        "vllm": ctx.cfg.get("vllm"),
+        "llamacpp": ctx.cfg.get("llamacpp"),
+        # WHICH ENGINE AND WEIGHTS THIS FILE'S RECORDS CAME OFF. Not a formality: the
+        # 2026-08-22 move from llama.cpp/GGUF to vLLM/compressed-tensors changed both the
+        # sampling path and the quantization, so a directory written before it and one written
+        # after it cannot be pooled on any quality number. Recorded per file so that is
+        # decidable from the results rather than from a directory name.
+        "backend": {
+            "engine": "vllm",
+            "kv_cache_dtype": ctx.cfg["vllm"].get("kv_cache_dtype"),
+            "gpu_memory_utilization": ctx.cfg["vllm"].get("gpu_memory_utilization"),
+            "models": {m["name"]: m["model_path"] for m in ctx.cfg["models"]},
+        }
     }
     (ctx.results_dir / f"meta_{tag}.json").write_text(json.dumps(meta, indent=2))
     if not ctx.fixture.verified:

@@ -42,7 +42,7 @@ from app.models.schemas import (
     SemesterPlan,
     StudentProfile,
 )
-from app.services.llamacpp_client import LlamaCppClient, ModelResponseError
+from app.services.vllm_client import VllmClient, ModelResponseError
 from app.services.plan_context import approx_tokens, render_program_context
 from app.services.plan_validation import (
     PlanValidation,
@@ -401,7 +401,7 @@ async def generate_ai_plan(
     profile: StudentProfile,
     catalog: ProgramCatalog,
     *,
-    client: LlamaCppClient,
+    client: VllmClient,
     request: str = "",
     seed: int | None = None,
 ) -> AiPlanResult:
@@ -423,8 +423,8 @@ async def generate_ai_plan(
     # plan is cut off mid-JSON and arrives unparseable, which reads to the student as "the AI
     # planner was unavailable". Ask for what actually fits.
     prompt_tokens = approx_tokens(system) + approx_tokens(user)
-    room = settings.llamacpp_context_tokens - prompt_tokens - _WINDOW_SAFETY_TOKENS
-    max_tokens = min(settings.llamacpp_plan_max_tokens, max(room, 0))
+    room = settings.vllm_context_tokens - prompt_tokens - _WINDOW_SAFETY_TOKENS
+    max_tokens = min(settings.vllm_plan_max_tokens, max(room, 0))
     if max_tokens < _MIN_USEFUL_PLAN_TOKENS:
         # Not enough window for even a short plan. The deterministic planner does not read the
         # export at all, so it is unaffected by whatever made this program's catalog so large.
@@ -432,7 +432,7 @@ async def generate_ai_plan(
             "Mode B prompt is ~%d tokens against a %d-token window, leaving %d for the plan; "
             "using the deterministic planner instead. Lower plan_context_token_budget or "
             "relaunch llama-server with a bigger --ctx-size.",
-            prompt_tokens, settings.llamacpp_context_tokens, max_tokens,
+            prompt_tokens, settings.vllm_context_tokens, max_tokens,
         )
         return _deterministic_result(
             profile, catalog, client.model, seed,
@@ -643,8 +643,8 @@ def context_size(catalog: ProgramCatalog) -> dict[str, int]:
         "rules_chars": len(PLAN_SYSTEM),
         "export_chars": len(export),
         "approx_prompt_tokens": (len(PLAN_SYSTEM) + len(export)) // 4,
-        "context_tokens": settings.llamacpp_context_tokens,
-        "plan_max_tokens": settings.llamacpp_plan_max_tokens,
+        "context_tokens": settings.vllm_context_tokens,
+        "plan_max_tokens": settings.vllm_plan_max_tokens,
     }
 
 
