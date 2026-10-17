@@ -205,11 +205,18 @@ def main() -> None:
 # evaluated at all — are gone.
 
 
-def _llamacpp_env(cfg: dict) -> dict:
+def _llamacpp_env(cfg: dict, *, all_devices: bool = False) -> dict:
     """`llama-server`'s environment for a one-shot probe — the CUDA libs from the pip-wheel
-    toolkit, which are not on the system linker path. Mirrors `harness.server._server_env`."""
+    toolkit, which are not on the system linker path. Mirrors `harness.server._server_env`.
+
+    `all_devices` lifts the `gpus:` pin — only `doctor`'s device listing wants that, since a
+    listing that inherited the pin would hide the card the operator is checking for.
+    """
     from harness.server import _server_env  # noqa: PLC0415
-    return _server_env(cfg)
+    env = _server_env(cfg)
+    if all_devices:
+        env.pop("CUDA_VISIBLE_DEVICES", None)
+    return env
 
 
 def _pg_url() -> str:
@@ -592,7 +599,8 @@ def doctor() -> None:
     print(f"{eng} launcher: {'found' if exe.exists() else 'NOT FOUND at ' + str(exe)}")
     if not exe.exists() and eng == "llamacpp":
         print("  Build it: source .llamacpp-env.sh && cmake -B build -DGGML_CUDA=ON \\")
-        print("              -DCMAKE_CUDA_ARCHITECTURES=86 && cmake --build build -j 6")
+        # "75;86" covers both cards in the box (3090 Ti sm_86, 2060 SUPER sm_75).
+        print('              -DCMAKE_CUDA_ARCHITECTURES="75;86" && cmake --build build -j 6')
     elif not exe.exists():
         print("  Install it into the project venv: .venv/bin/pip install vllm==0.27.1")
     elif eng == "llamacpp":
@@ -603,8 +611,9 @@ def doctor() -> None:
                                timeout=60, env=_llamacpp_env(cfg))
         out = (probe.stdout + probe.stderr).strip().splitlines()
         print(f"  {out[0] if out else 'no output'}")
+        # EVERY card, pin lifted — see `_llamacpp_env`. The pin is reported separately below.
         dev = subprocess.run([str(exe), "--list-devices"], capture_output=True, text=True,
-                             timeout=60, env=_llamacpp_env(cfg))
+                             timeout=60, env=_llamacpp_env(cfg, all_devices=True))
         for line in (dev.stdout + dev.stderr).splitlines():
             if "CUDA" in line or "no devices" in line.lower():
                 print(f"  {line.strip()}")
@@ -631,6 +640,17 @@ def doctor() -> None:
 
     gpu = gpu_memory_used_mb()
     print(f"nvidia-smi: {'available, ' + str(gpu) + ' MB used' if gpu else 'NOT available'}")
+
+    # WHICH CARDS EACH MODEL MAY TOUCH. Worth printing because the pin is an env var, not a
+    # flag — it does not show up in the launch command line.
+    from harness.server import visible_devices  # noqa: PLC0415
+    default_gpus = visible_devices(cfg)
+    print(f"\nGPU pin (CUDA_VISIBLE_DEVICES, PCI bus order): "
+          f"default {default_gpus or 'unrestricted'}")
+    for model in cfg["models"]:
+        pinned = visible_devices(cfg, model)
+        if pinned != default_gpus:
+            print(f"  {model['name']}: {pinned or 'unrestricted'}")
 
     listening = _port_open(host, port, timeout=2)
     print(f"\n{host}:{port} -> {'OPEN' if listening else 'closed'}")

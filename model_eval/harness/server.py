@@ -94,6 +94,10 @@ def gpu_total_mb() -> int | None:
 
     `run.py check` uses it to answer "will these weights leave room for a KV cache?" without
     spending the several minutes a real launch costs to find out.
+
+    The first card is the right one now that two are installed: it is the 3090 Ti, which is
+    what the default `gpus: "0"` pin gives every model. The one entry that sees both cards
+    carries `n_cpu_moe`, and `run.py check` skips offloaded models.
     """
     exe = shutil.which("nvidia-smi")
     if not exe:
@@ -106,6 +110,26 @@ def gpu_total_mb() -> int | None:
         return int(out.split()[0])
     except (OSError, subprocess.SubprocessError, ValueError, IndexError):
         return None
+
+
+def visible_devices(cfg: dict[str, Any], model_cfg: dict[str, Any] | None = None) -> str | None:
+    """Which cards this launch may see — a `CUDA_VISIBLE_DEVICES` string, or None for all.
+
+    Hiding rather than selecting (`-dev CUDA0`, vLLM's device flags) because both engines still
+    initialise every visible card, and this is the one mechanism that means the same to both.
+    Paired with `CUDA_DEVICE_ORDER=PCI_BUS_ID` in `_server_env`: `gpus` is written in
+    nvidia-smi's numbering, and CUDA's own default is FASTEST_FIRST.
+    """
+    if model_cfg is not None and model_cfg.get("gpus") is not None:
+        value = model_cfg["gpus"]
+    else:
+        value = cfg.get("gpus")
+    if value is None or value == "":
+        return None
+    # A YAML author may reasonably write `gpus: 0` or `gpus: [0, 1]`; CUDA wants "0" / "0,1".
+    if isinstance(value, (list, tuple)):
+        return ",".join(str(v) for v in value)
+    return str(value)
 
 
 def resolve_host(configured: str, _server_exe: str | Path | None = None) -> str:
@@ -545,6 +569,16 @@ def _build_argv_llamacpp(cfg: dict[str, Any], model_cfg: dict[str, Any],
     if n_cpu_moe:
         argv += ["-ncmoe", str(n_cpu_moe)]
 
+    # HOW THE GPU-RESIDENT LAYERS DIVIDE BETWEEN CARDS, in the order of `gpus`. Only means
+    # anything for a model shown more than one card. A named key rather than `extra_args`
+    # because that is the vLLM key — written there, the flag reaches nothing and llama.cpp
+    # splits at its own default ratio without complaining.
+    tensor_split = model_cfg.get("tensor_split")
+    if tensor_split:
+        if isinstance(tensor_split, (list, tuple)):
+            tensor_split = ",".join(str(v) for v in tensor_split)
+        argv += ["--tensor-split", str(tensor_split).replace(" ", "")]
+
     # PER-TENSOR PLACEMENT, the escape hatch `-ncmoe` is a shorthand for. `-ncmoe N` moves the
     # first N layers' experts wholesale; a regex here can put, say, only the `ffn_down_exps` of
     # every layer on the CPU and keep the rest resident. Unset by default because it is easy to
@@ -781,7 +815,8 @@ def _speculative_config(cfg: dict[str, Any], model_cfg: dict[str, Any]) -> dict[
     return out
 
 
-def _server_env(cfg: dict[str, Any]) -> dict[str, str]:
+def _server_env(cfg: dict[str, Any],
+                model_cfg: dict[str, Any] | None = None) -> dict[str, str]:
     """The environment vLLM is launched into: this process's, plus the venv's `bin/` on PATH.
 
     THE VENV IS NOT ACTIVATED, deliberately — the harness invokes `vllm` by absolute path so it
@@ -817,6 +852,13 @@ def _server_env(cfg: dict[str, Any]) -> dict[str, str]:
             Path("/home/wylin/ai-academic-advisor/.cudatoolkit/lib64"))
         if Path(libdir).is_dir():
             env["LD_LIBRARY_PATH"] = libdir + os.pathsep + env.get("LD_LIBRARY_PATH", "")
+
+    # WHICH CARDS THIS LAUNCH MAY SEE. The ordering is pinned too — `gpus` is written in
+    # nvidia-smi's numbering, CUDA's default is FASTEST_FIRST. See `visible_devices`.
+    env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    devices = visible_devices(cfg, model_cfg)
+    if devices is not None:
+        env["CUDA_VISIBLE_DEVICES"] = devices
     return env
 
 
@@ -851,7 +893,7 @@ def start_server(
     log_path = log_dir / f"{eng}_{model_cfg['name']}.log"
     log_file = log_path.open("w")
     process = subprocess.Popen(argv, stdout=log_file, stderr=subprocess.STDOUT,
-                               env=_server_env(cfg))
+                               env=_server_env(cfg, model_cfg))
     handle = ServerHandle(process=process, log_path=log_path, argv=argv, base_url=base_url)
 
     client = VllmClient(base_url)

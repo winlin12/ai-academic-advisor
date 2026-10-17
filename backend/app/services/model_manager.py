@@ -187,6 +187,13 @@ def _server_env(settings: Settings) -> dict[str, str]:
     env = dict(os.environ)
     bin_dir = str(Path(settings.vllm_server_exe).resolve().parent)
     env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+
+    # ONE CARD, THE BIG ONE. An RTX 2060 SUPER (8 GB) sits alongside the 3090 Ti as of
+    # 2026-09-06 and every model this app serves fits on the 3090 Ti alone. Left unpinned it is
+    # not spare capacity: vLLM sizes its KV pool against the smallest card it can see, and adds
+    # a PCIe hop per token. `PCI_BUS_ID` is what makes "0" mean the card nvidia-smi calls 0.
+    env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    env["CUDA_VISIBLE_DEVICES"] = "0"
     return env
 
 

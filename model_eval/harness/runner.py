@@ -60,7 +60,7 @@ from .prompts import (
 from .server import (
     ServerHandle, backend_cfg, effective_parallel, engine, gpu_memory_used_mb,
     resolve_host,
-    slot_context, start_server,
+    slot_context, start_server, visible_devices,
 )
 
 # WHAT THE PROMPT COSTS BESIDES THE DATABASE. `build_scenario_database`'s `budget_tokens` sizes
@@ -501,6 +501,9 @@ def _env_record(
         # four students queueing — above 1 they include time spent waiting for a slot, which is
         # the point, but it makes them incomparable to any `parallel: 1` run.
         "simulated_users": effective_parallel(ctx.cfg),
+        # WHICH CARDS THIS RUN COULD SEE. The two are not equals (24 GB Ampere, 8 GB Turing),
+        # and the pin is an env var rather than a flag, so it is not recoverable from `argv`.
+        "gpus": visible_devices(ctx.cfg, model_cfg),
         "expected_slot_ctx": slot_context(ctx.cfg["run"]),
         "ctx_matches_config": (
             server_ctx == slot_context(ctx.cfg["run"]) if server_ctx else None),
@@ -1757,6 +1760,8 @@ def write_meta(ctx: EvalContext, tag: str, selected: list[dict], tasks: set[str]
         # weights (GGUF vs compressed-tensors) and a different timing source — so every
         # record carries it rather than leaving the reader to infer it from a date.
         "engine": engine(ctx.cfg),
+        # The box-level default pin; per-model overrides ride on the env records.
+        "gpus": visible_devices(ctx.cfg),
         "vllm": ctx.cfg.get("vllm"),
         "llamacpp": ctx.cfg.get("llamacpp"),
         # WHICH ENGINE AND WEIGHTS THIS FILE'S RECORDS CAME OFF. Not a formality: the
